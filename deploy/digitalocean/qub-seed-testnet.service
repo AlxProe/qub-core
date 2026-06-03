@@ -1,0 +1,21 @@
+[Unit]
+Description=Qubit Coin testnet seed node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/qub/testnet
+ExecStart=/opt/qub/bin/qubd --config /opt/qub/testnet/testnet-seed.toml node
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/qub/testnet
+
+[Install]
+WantedBy=multi-user.target

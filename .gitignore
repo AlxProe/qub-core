@@ -1,0 +1,59 @@
+﻿# Rust
+/target/
+**/*.rs.bk
+
+# Build / release artifacts
+/dist/
+/release/
+/installer-output/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.msi
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# Runtime data
+/data/
+**/data/
+chain.json
+peers.json
+mempool.json
+wallet.json
+ethereum-wallets.json
+
+# Local configs / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.secrets
+id_rsa
+id_ed25519
+*_ed25519
+*_rsa
+
+# Logs
+*.log
+logs/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Assets are currently not part of the open-source repo
+/assets/*
+!/assets/README.md
+
+# Foundry / Solidity
+broadcast/
+cache/
+out/

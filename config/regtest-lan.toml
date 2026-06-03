@@ -1,0 +1,126 @@
+[network]
+name = "regtest-lan"
+magic = "0x51424c4e"
+default_port = 19444
+address_prefix = "rqub"
+
+[node]
+data_dir = "./data/regtest-lan"
+
+[p2p]
+enabled = true
+bind = "0.0.0.0:19444"
+advertise_addr = ""
+max_inbound_peers = 64
+max_outbound_peers = 16
+max_message_bytes = 67108864
+max_blocks_per_message = 20000
+max_peer_errors = 10
+connect_interval_secs = 3
+peer_file = "peers.json"
+bootnodes = []
+
+[rpc]
+enabled = true
+bind = "127.0.0.1:19445"
+auth_token = "regtest-lan-local-only-change-me"
+
+[mempool]
+max_transactions = 50000
+min_relay_fee_atoms = 100
+
+[mining]
+enabled = false
+threads = 1
+duty_cycle_percent = 100
+miner_address = ""
+auto_mine_mempool = false
+
+[wallet]
+plaintext_keys_allowed = true
+
+[consensus]
+version = 1
+max_money_atoms = 2100000000000000
+subsidy_halving_interval = 2100000
+initial_subsidy_atoms = 500000000
+coinbase_maturity = 2
+target_spacing_secs = 60
+difficulty_adjustment_interval = 10
+difficulty_max_adjustment_factor = 4
+max_future_time_secs = 7200
+max_block_transactions = 10000
+pow_bits = "0x1e00ffff"
+genesis_time = 1710000000
+genesis_bits = "0x1e00ffff"
+genesis_nonce = 0
+
+[features]
+pooled_mining_enabled = true
+jin_native_coin_enabled = true
+
+[qns]
+enabled = true
+activation_height = 10
+max_label_chars = 32
+marker_output_atoms = 1
+base_registration_atoms = 100000000
+price_coefficient_atoms = 100000000
+protocol_address = "rqub16d5b5cb5cc8db1ea40e4ac5a3b432ee9fce8db14674e3026"
+protocol_name = "qns.qub"
+
+miner_split_activation_height = 1
+[pools]
+enabled = true
+activation_height = 1
+protocol_name = "pools.qub"
+protocol_address = "rqub163ce4e5546c6c02e878cc7250ff8215379470afa13d161cc"
+max_name_chars = 32
+max_name_bytes = 128
+marker_output_atoms = 1
+base_create_atoms = 2500000000
+base_capacity_slots = 8
+capacity_step_atoms = 1000000000
+capacity_step_slots = 8
+max_capacity_slots = 128
+max_active_pools = 1024
+max_commission_bps = 2000
+share_window_blocks = 360
+share_target_bits = "0x1e00ffff"
+max_share_txs_per_block = 128
+share_stale_blocks = 6
+
+[jin]
+enabled = true
+activation_height = 1
+conversion_activation_height = 1
+decimals = 18
+total_supply_units = "105000000000000000000000000"
+protocol_address = "rqub1ed9a71dfb6aedd0ca99e49ed93e33d6d32f1fc47df6e522a"
+marker_output_atoms = 1
+default_fee_units = "1000000000000000"
+allow_fee_in_jin = true
+bridge_name = "jin.bridge"
+
+[jin_swap]
+enabled = true
+activation_height = 1
+marker_output_atoms = 1
+sale_total_units = "85000000000000000000000000"
+sale_batch_units = "1000000000000000000000000"
+sale_start_price_atoms_per_jin = 1000000
+sale_step_price_atoms_per_jin = 100000
+protocol_fee_bps = 10
+
+[library]
+enabled = true
+activation_height = 1
+marker_output_atoms = 1
+base_post_fee_atoms = 10000
+byte_fee_atoms = 100
+max_title_bytes = 120
+max_category_bytes = 48
+max_page_bytes = 2048
+max_pages_per_post = 16
+max_comment_bytes = 1024
+max_comment_depth = 16

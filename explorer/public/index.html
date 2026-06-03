@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Qubit Coin Explorer</title>
+  <meta name="description" content="Qubit Coin live block explorer" />
+  <link rel="icon" href="/favicon.png" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <span class="logo">⛏</span>
+      <span><strong>Qubit Coin Explorer</strong><em id="networkLabel">loading…</em></span>
+    </a>
+    <form id="searchForm" class="search" autocomplete="off">
+      <input id="searchInput" placeholder="Search block height / hash / txid / address / name.qub" />
+      <button type="submit">Search</button>
+    </form>
+    <button id="themeToggle" class="ghost" type="button">Dark</button>
+  </header>
+
+  <main>
+    <section id="status" class="status-grid"></section>
+    <section id="view" class="view-card"></section>
+  </main>
+
+  <footer>
+    <span>QUB Explorer v1.1.0</span>
+    <span id="apiStatus">API: checking…</span>
+    <span>Read-only, no database index. Data is loaded from the node chain state.</span>
+  </footer>
+
+  <script src="/config.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

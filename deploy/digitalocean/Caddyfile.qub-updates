@@ -1,0 +1,11 @@
+download.qubit-coin.io {
+    encode zstd gzip
+    root * /srv/qub-updates
+    header {
+        X-Content-Type-Options "nosniff"
+        Cache-Control "public, max-age=60"
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
+    }
+    file_server
+}

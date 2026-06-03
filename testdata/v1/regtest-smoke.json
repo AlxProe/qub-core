@@ -1,0 +1,14 @@
+{
+  "network": "regtest",
+  "target_spacing_secs": 60,
+  "initial_block_reward_qub": "5",
+  "subsidy_halving_interval_blocks": 2100000,
+  "max_supply_qub": "21000000",
+  "difficulty_adjustment_interval_blocks": 10,
+  "p2p_enabled": true,
+  "mine_blocks_before_spend": 3,
+  "send_amount_qub": "1.25",
+  "fee_qub": "0.00001",
+  "expected_recipient_qub_after_confirm": "1.25",
+  "disabled_v1_features": ["pooled_mining", "jin_native_coin"]
+}

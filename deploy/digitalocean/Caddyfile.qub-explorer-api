@@ -1,0 +1,20 @@
+# Qubit Coin Explorer API through Caddy
+# Copy into your existing Caddyfile or import from it.
+#
+# Cloudflare DNS:
+#   api.qubit-coin.io -> 159.223.222.103 (proxied/orange cloud is OK for HTTPS web API)
+#   seed.qubit-coin.io -> 159.223.222.103 (DNS-only/gray cloud for raw P2P TCP)
+#
+api.qubit-coin.io {
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "no-referrer"
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, OPTIONS"
+        Access-Control-Allow-Headers "Content-Type"
+    }
+
+    reverse_proxy 127.0.0.1:18765
+}

@@ -1,0 +1,125 @@
+[network]
+name = "testnet"
+magic = "0x54425542"
+default_port = 18444
+address_prefix = "tqub"
+
+[node]
+data_dir = "./data/testnet"
+
+[p2p]
+enabled = true
+bind = "0.0.0.0:18444"
+advertise_addr = ""
+max_inbound_peers = 64
+max_outbound_peers = 16
+max_message_bytes = 67108864
+max_blocks_per_message = 20000
+max_peer_errors = 10
+connect_interval_secs = 3
+peer_file = "peers.json"
+bootnodes = ["seed.qubit-coin.io:18444", "seed-ams3.qubit-coin.io:18444"]
+[rpc]
+enabled = true
+bind = "127.0.0.1:18445"
+auth_token = "CHANGE_THIS_TESTNET_RPC_TOKEN"
+
+[mempool]
+max_transactions = 100000
+min_relay_fee_atoms = 1000
+
+[mining]
+enabled = false
+threads = 1
+duty_cycle_percent = 70
+miner_address = ""
+auto_mine_mempool = false
+
+[wallet]
+plaintext_keys_allowed = true
+
+[consensus]
+version = 1
+max_money_atoms = 2100000000000000
+subsidy_halving_interval = 2100000
+initial_subsidy_atoms = 500000000
+coinbase_maturity = 20
+target_spacing_secs = 60
+difficulty_adjustment_interval = 30
+difficulty_max_adjustment_factor = 4
+max_future_time_secs = 7200
+max_block_transactions = 10000
+pow_bits = "0x1f00ffff"
+genesis_time = 1710000000
+genesis_bits = "0x1f00ffff"
+genesis_nonce = 0
+
+[features]
+pooled_mining_enabled = true
+jin_native_coin_enabled = true
+
+[qns]
+enabled = true
+activation_height = 50
+miner_split_activation_height = 4294967295
+max_label_chars = 32
+marker_output_atoms = 1
+base_registration_atoms = 100000000
+price_coefficient_atoms = 100000000
+protocol_address = "tqub1804be2b0c7b4cc250e75705d8e265eeee96422b81bf13729"
+protocol_name = "qns.qub"
+
+[pools]
+enabled = true
+activation_height = 3285
+protocol_name = "pools.qub"
+protocol_address = "tqub150920982b98e297ec5f3739d79299df85fc56eacbdba17f2"
+max_name_chars = 32
+max_name_bytes = 128
+marker_output_atoms = 1
+base_create_atoms = 2500000000
+base_capacity_slots = 8
+capacity_step_atoms = 1000000000
+capacity_step_slots = 8
+max_capacity_slots = 128
+max_active_pools = 1024
+max_commission_bps = 2000
+share_window_blocks = 360
+share_target_bits = "0x1f00ffff"
+max_share_txs_per_block = 128
+share_stale_blocks = 6
+
+[jin]
+enabled = true
+activation_height = 3365
+conversion_activation_height = 4294967295
+decimals = 18
+total_supply_units = "105000000000000000000000000"
+protocol_address = "tqub175276ed4eb15b444cf98c4cac5ae8e66a6847226da697acf"
+marker_output_atoms = 1
+default_fee_units = "1000000000000000"
+allow_fee_in_jin = true
+bridge_name = "jin.bridge"
+
+[jin_swap]
+enabled = true
+activation_height = 3520
+marker_output_atoms = 1
+sale_total_units = "85000000000000000000000000"
+sale_batch_units = "1000000000000000000000000"
+sale_start_price_atoms_per_jin = 1000000
+sale_step_price_atoms_per_jin = 100000
+protocol_fee_bps = 10
+
+[library]
+enabled = true
+activation_height = 3440
+marker_output_atoms = 1
+base_post_fee_atoms = 10000
+byte_fee_atoms = 100
+max_title_bytes = 120
+max_category_bytes = 48
+max_page_bytes = 2048
+max_pages_per_post = 16
+max_comment_bytes = 1024
+max_comment_depth = 16

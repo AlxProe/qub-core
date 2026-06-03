@@ -1,0 +1,7 @@
+# QUB Core Windows release builds should not require VCRUNTIME140.dll on clean machines.
+# This statically links the MSVC C runtime for x86_64 Windows builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
