@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.0";
+const APP_VERSION: &str = "v1.7.1";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -87,16 +87,24 @@ const JIN_TOKEN_NFT_IO_URL: &str = "https://nft.io/asset/4423-1";
 const USDJ_ETH_BACKING_NOTE: &str = "USDJ is designed as Jinex USD on QUB Chain, backed by USDT + USDC smart contracts on Ethereum through the future bridge.";
 const USDJ_BRIDGE_DISABLED_NOTE: &str = "Bridge contracts are not live yet. QUB-chain USDJ/EURJ mint/burn is shown as roadmap UI only.";
 const EURJ_ETH_BACKING_NOTE: &str = "EURJ is designed as Jinex EUR, backed by EURC + EURS smart contracts on Ethereum through the same pooled-reserve model as USDJ.";
+const XAUJ_ETH_BACKING_NOTE: &str = "XAUJ is designed as Jinex Gold, backed by PAXG + XAUt smart contracts on Ethereum through the same pooled-reserve model as USDJ/EURJ.";
 const ETHEREUM_WALLETS_FILE: &str = "data/ethereum-wallets.json";
 const ETHEREUM_CHAIN_ID: u64 = 1;
 const ETHEREUM_USDC_ADDRESS: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
 const ETHEREUM_USDT_ADDRESS: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 const ETHEREUM_EURC_ADDRESS: &str = "0x1aBaEA1f7C830bD89Acc67eC4Af516284b1bC33c";
 const ETHEREUM_EURS_ADDRESS: &str = "0xdB25f211AB05b1c97D595516F45794528a807ad8";
-const ETHEREUM_USDJ_ADDRESS_DEFAULT: &str = ""; // Filled after official USDJ mainnet deployment.
-const ETHEREUM_USDJ_VAULT_ADDRESS_DEFAULT: &str = ""; // Filled after official USDJ vault deployment.
-const ETHEREUM_EURJ_ADDRESS_DEFAULT: &str = ""; // Filled after official EURJ mainnet deployment.
-const ETHEREUM_EURJ_VAULT_ADDRESS_DEFAULT: &str = ""; // Filled after official EURJ vault deployment.
+const ETHEREUM_PAXG_ADDRESS: &str = "0x45804880De22913dAFE09f4980848ECE6EcbAf78";
+const ETHEREUM_XAUT_ADDRESS: &str = "0x68749665FF8D2d112Fa859AA293F07A622782F38";
+const ETHEREUM_USDJ_ADDRESS_DEFAULT: &str = "0x458E9D99a1B79EB23819023BBEd39c59098FFE66"; // Official USDJ mainnet token.
+const ETHEREUM_USDJ_VAULT_ADDRESS_DEFAULT: &str = "0xf9d43BF71d7bc86baeB0fD3bd09e0151e19460CF"; // Official USDJ ReserveVault.
+const ETHEREUM_EURJ_ADDRESS_DEFAULT: &str = "0x8AF433799acc1452eF5582d9423f8162306Fa091"; // Official EURJ mainnet token.
+const ETHEREUM_EURJ_VAULT_ADDRESS_DEFAULT: &str = "0x81ca538FF5BfB24b1B228C9039b1EC56643fE5B2"; // Official EURJ ReserveVault.
+const ETHEREUM_XAUJ_ADDRESS_DEFAULT: &str = "0xe4F7fd0cC31F215d8Ac1ccb75AA1b166EA49aC6b"; // Official XAUJ mainnet token.
+const ETHEREUM_XAUJ_VAULT_ADDRESS_DEFAULT: &str = "0x0761dd9969007dC7A1A9b4F79c9FA3d0FaA84Beb"; // Official XAUJ ReserveVault.
+const ETHEREUM_USDJ_BRIDGE_ADDRESS_DEFAULT: &str = ""; // Filled after official USDJ bridge gateway deployment.
+const USDJ_BRIDGE_TOLL_BPS: u32 = 100; // 1% QUB-side protocol toll.
+const QUB_USDJ_BRIDGE_PROTOCOL_ADDRESS: &str = "qub1a229a209ca3fc2b3066f6f31d4b27c9d663c46959346d1";
 const ETHEREUM_DEFAULT_RPC_URLS: &[&str] = &[
     "https://ethereum-rpc.publicnode.com",
     "https://eth.llamarpc.com",
@@ -105,6 +113,7 @@ const ETHEREUM_DEFAULT_RPC_URLS: &[&str] = &[
 const ETHEREUM_ERC20_TRANSFER_SELECTOR: &str = "a9059cbb";
 const ETHEREUM_ERC20_BALANCE_OF_SELECTOR: &str = "70a08231";
 const FIATJ_DECIMALS: u32 = 6;
+const GOLDJ_DECIMALS: u32 = 18;
 const FIATJ_INFUSE_GAS_LIMIT: u64 = 220_000;
 const FIATJ_MELT_GAS_LIMIT: u64 = 190_000;
 const FIATJ_APPROVE_GAS_LIMIT: u64 = 70_000;
@@ -170,7 +179,7 @@ fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
                 let settings = load_gui_settings(&config_path)?;
                 if settings.p2p.enabled && matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
                     if force {
-                        // HF110/v1.7.0: force/manual/auto-heal repairs use a
+                        // HF111/v1.7.1: force/manual/auto-heal repairs use a
                         // deeper official-only chain repair path. This replaces
                         // the user workaround of deleting local data while keeping
                         // wallet.json safe.
@@ -237,7 +246,7 @@ const UI_ICON_NAMES: &[&str] = &[
     "your-pending-mined-block", "your-confirmed-mined-block", "updates-available", "check-now", "install-and-restart",
     "online", "offline", "verified", "qr", "qr-scan", "i",
     "address-balances", "crypto", "stablecoins", "import-private-key", "buy", "sell", "offer",
-    "melt", "infuse", "convert", "jin-token", "usd", "eur", "usdj", "usdt", "usdc", "eurj", "eurc", "eurs", "eth", "enj", "subscan-logo", "nft-io-logo", "auction", "list-asset",
+    "melt", "infuse", "convert", "jin-token", "usd", "eur", "gold", "usdj", "usdt", "usdc", "eurj", "eurc", "eurs", "xauj", "paxg", "xaut", "eth", "enj", "subscan-logo", "nft-io-logo", "auction", "list-asset",
     "pools", "create-pool", "join-pool", "pool-capacity", "pool-commission",
     "to-right", "to-left", "full-to-right", "full-to-left",
 ];
@@ -515,12 +524,17 @@ enum EurjBalanceSubTab { Eurj, Eurc, Eurs }
 impl Default for EurjBalanceSubTab { fn default() -> Self { Self::Eurj } }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum StablecoinFamily { Usd, Eur }
+enum XaujBalanceSubTab { Xauj, Paxg, Xaut }
+impl Default for XaujBalanceSubTab { fn default() -> Self { Self::Xauj } }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum StablecoinFamily { Usd, Eur, Gold }
 impl StablecoinFamily {
-    fn icon(&self) -> &'static str { match self { Self::Usd => "usd", Self::Eur => "eur" } }
-    fn label(&self) -> &'static str { match self { Self::Usd => "USD", Self::Eur => "EUR" } }
-    fn token_symbol(&self) -> &'static str { match self { Self::Usd => "USDJ", Self::Eur => "EURJ" } }
-    fn token_icon(&self) -> &'static str { match self { Self::Usd => "usdj", Self::Eur => "eurj" } }
+    fn icon(&self) -> &'static str { match self { Self::Usd => "usd", Self::Eur => "eur", Self::Gold => "gold" } }
+    fn label(&self) -> &'static str { match self { Self::Usd => "USD", Self::Eur => "EUR", Self::Gold => "Gold" } }
+    fn token_symbol(&self) -> &'static str { match self { Self::Usd => "USDJ", Self::Eur => "EURJ", Self::Gold => "XAUJ" } }
+    fn token_icon(&self) -> &'static str { match self { Self::Usd => "usdj", Self::Eur => "eurj", Self::Gold => "xauj" } }
+    fn token_decimals(&self) -> u32 { match self { Self::Gold => GOLDJ_DECIMALS, Self::Usd | Self::Eur => FIATJ_DECIMALS } }
 }
 fn default_stablecoin_family() -> StablecoinFamily {
     match default_ui_language() {
@@ -530,14 +544,14 @@ fn default_stablecoin_family() -> StablecoinFamily {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum EthereumAsset { Eth, Usdt, Usdc, Usdj, Eurc, Eurs, Eurj }
+enum EthereumAsset { Eth, Usdt, Usdc, Usdj, Eurc, Eurs, Eurj, Paxg, Xaut, Xauj }
 impl EthereumAsset {
-    fn symbol(&self) -> &'static str { match self { Self::Eth => "ETH", Self::Usdt => "USDT", Self::Usdc => "USDC", Self::Usdj => "USDJ", Self::Eurc => "EURC", Self::Eurs => "EURS", Self::Eurj => "EURJ" } }
-    fn icon(&self) -> &'static str { match self { Self::Eth => "eth", Self::Usdt => "usdt", Self::Usdc => "usdc", Self::Usdj => "usdj", Self::Eurc => "eurc", Self::Eurs => "eurs", Self::Eurj => "eurj" } }
-    fn decimals(&self) -> u32 { match self { Self::Eth => 18, Self::Eurs => 2, Self::Usdt | Self::Usdc | Self::Usdj | Self::Eurc | Self::Eurj => 6 } }
+    fn symbol(&self) -> &'static str { match self { Self::Eth => "ETH", Self::Usdt => "USDT", Self::Usdc => "USDC", Self::Usdj => "USDJ", Self::Eurc => "EURC", Self::Eurs => "EURS", Self::Eurj => "EURJ", Self::Paxg => "PAXG", Self::Xaut => "XAUt", Self::Xauj => "XAUJ" } }
+    fn icon(&self) -> &'static str { match self { Self::Eth => "eth", Self::Usdt => "usdt", Self::Usdc => "usdc", Self::Usdj => "usdj", Self::Eurc => "eurc", Self::Eurs => "eurs", Self::Eurj => "eurj", Self::Paxg => "paxg", Self::Xaut => "xaut", Self::Xauj => "xauj" } }
+    fn decimals(&self) -> u32 { match self { Self::Eth => 18, Self::Eurs => 2, Self::Paxg | Self::Xauj => 18, Self::Usdt | Self::Usdc | Self::Usdj | Self::Eurc | Self::Eurj | Self::Xaut => 6 } }
     fn gas_limit(&self) -> u64 { match self { Self::Eth => 21_000, _ => 75_000 } }
-    fn family(&self) -> Option<StablecoinFamily> { match self { Self::Usdt | Self::Usdc | Self::Usdj => Some(StablecoinFamily::Usd), Self::Eurc | Self::Eurs | Self::Eurj => Some(StablecoinFamily::Eur), Self::Eth => None } }
-    fn reserve_asset_id(&self) -> u8 { match self { Self::Usdc | Self::Eurs => 1, _ => 0 } }
+    fn family(&self) -> Option<StablecoinFamily> { match self { Self::Usdt | Self::Usdc | Self::Usdj => Some(StablecoinFamily::Usd), Self::Eurc | Self::Eurs | Self::Eurj => Some(StablecoinFamily::Eur), Self::Paxg | Self::Xaut | Self::Xauj => Some(StablecoinFamily::Gold), Self::Eth => None } }
+    fn reserve_asset_id(&self) -> u8 { match self { Self::Usdc | Self::Eurs | Self::Xaut => 1, _ => 0 } }
 }
 impl Default for EthereumAsset { fn default() -> Self { Self::Eth } }
 
@@ -581,8 +595,14 @@ struct EthereumBalanceState {
     eurj_eth: String,
     eurc_reserve: String,
     eurs_reserve: String,
+    paxg: String,
+    xaut: String,
+    xauj_eth: String,
+    paxg_reserve: String,
+    xaut_reserve: String,
     reserve_status: String,
     eur_reserve_status: String,
+    gold_reserve_status: String,
     status: String,
     updated_at: Option<Instant>,
 }
@@ -600,8 +620,14 @@ impl Default for EthereumBalanceState {
             eurj_eth: "-".to_string(),
             eurc_reserve: "-".to_string(),
             eurs_reserve: "-".to_string(),
+            paxg: "-".to_string(),
+            xaut: "-".to_string(),
+            xauj_eth: "-".to_string(),
+            paxg_reserve: "-".to_string(),
+            xaut_reserve: "-".to_string(),
             reserve_status: "USDJ contracts not configured".to_string(),
             eur_reserve_status: "EURJ contracts not configured".to_string(),
+            gold_reserve_status: "XAUJ contracts not configured".to_string(),
             status: "Not fetched yet".to_string(),
             updated_at: None,
         }
@@ -672,7 +698,7 @@ impl Default for UsdjVaultDialog {
 
 #[derive(Debug)]
 enum EthereumWalletEvent {
-    Balance { eth: String, usdt: String, usdc: String, usdj_eth: String, usdt_reserve: String, usdc_reserve: String, eurc: String, eurs: String, eurj_eth: String, eurc_reserve: String, eurs_reserve: String, reserve_status: String, eur_reserve_status: String, status: String },
+    Balance { eth: String, usdt: String, usdc: String, usdj_eth: String, usdt_reserve: String, usdc_reserve: String, eurc: String, eurs: String, eurj_eth: String, eurc_reserve: String, eurs_reserve: String, paxg: String, xaut: String, xauj_eth: String, paxg_reserve: String, xaut_reserve: String, reserve_status: String, eur_reserve_status: String, gold_reserve_status: String, status: String },
     SendCreated { txids: Vec<String>, message: String },
     UsdjActionCreated { txids: Vec<String>, message: String },
     Failed(String),
@@ -780,6 +806,7 @@ struct GuiPrefs {
     jin_balance_tab: JinBalanceSubTab,
     usdj_balance_tab: UsdjBalanceSubTab,
     eurj_balance_tab: EurjBalanceSubTab,
+    xauj_balance_tab: XaujBalanceSubTab,
     stablecoin_family: StablecoinFamily,
     last_pool_id: String,
     setup_complete: bool,
@@ -802,6 +829,10 @@ struct GuiPrefs {
     eth_eurs_contract_override: String,
     eth_eurj_token_contract: String,
     eth_eurj_vault_contract: String,
+    eth_paxg_contract_override: String,
+    eth_xaut_contract_override: String,
+    eth_xauj_token_contract: String,
+    eth_xauj_vault_contract: String,
 }
 
 
@@ -849,6 +880,7 @@ impl Default for GuiPrefs {
             jin_balance_tab: JinBalanceSubTab::Coin,
             usdj_balance_tab: UsdjBalanceSubTab::Usdj,
             eurj_balance_tab: EurjBalanceSubTab::Eurj,
+            xauj_balance_tab: XaujBalanceSubTab::Xauj,
             stablecoin_family: default_stablecoin_family(),
             last_pool_id: String::new(),
             setup_complete: false,
@@ -871,6 +903,10 @@ impl Default for GuiPrefs {
             eth_eurs_contract_override: String::new(),
             eth_eurj_token_contract: String::new(),
             eth_eurj_vault_contract: String::new(),
+            eth_paxg_contract_override: String::new(),
+            eth_xaut_contract_override: String::new(),
+            eth_xauj_token_contract: String::new(),
+            eth_xauj_vault_contract: String::new(),
         }
     }
 }
@@ -1386,6 +1422,7 @@ struct QubCoreApp {
     qr_cache_address: String,
     qr_cache_texture: Option<egui::TextureHandle>,
     qr_hover_until: Option<Instant>,
+    qr_hover_address: String,
     qr_scan_dialog_open: bool,
     qr_scan_message: String,
     qr_camera_devices: Vec<String>,
@@ -1790,6 +1827,7 @@ impl QubCoreApp {
             qr_cache_address: String::new(),
             qr_cache_texture: None,
             qr_hover_until: None,
+            qr_hover_address: String::new(),
             qr_scan_dialog_open: false,
             qr_scan_message: String::new(),
             qr_camera_devices: detect_camera_devices(),
@@ -2072,7 +2110,7 @@ impl QubCoreApp {
     }
 
     fn ui_disclosure_glyph(&self, ui: &mut egui::Ui, open: bool) {
-        let glyph = if open { "▾" } else { "▸" };
+        let glyph = if open { "v" } else { ">" };
         ui.label(egui::RichText::new(glyph).strong().weak());
     }
 
@@ -2265,17 +2303,17 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 let bpm = self.sync_progress_rate_bps * 60.0;
                 let eta_secs = (remaining as f32 / self.sync_progress_rate_bps).max(1.0);
                 let eta = if eta_secs < 90.0 { format!("{:.0}s", eta_secs) } else { format!("{:.1}m", eta_secs / 60.0) };
-                format!(" • live rate {:.1} block(s)/min • ETA {eta}", bpm)
+                format!(" | live rate {:.1} block(s)/min | ETA {eta}", bpm)
             } else {
-                " • measuring live catch-up rate".to_string()
+                " | measuring live catch-up rate".to_string()
             };
-            format!("local #{local} → {source} #{known} • {remaining} block(s) remaining{rate_extra}")
+            format!("local #{local} -> {source} #{known} | {remaining} block(s) remaining{rate_extra}")
         } else if known > 0 {
-            format!("local #{local} is at known tip #{known} • verifying balances/activity")
+            format!("local #{local} is at known tip #{known} | verifying balances/activity")
         } else {
-            "discovering official/peer tip • waiting for first height sample".to_string()
+            "discovering official/peer tip | waiting for first height sample".to_string()
         };
-        let meta = format!("{elapsed}s elapsed • QUB Core strong catch-up runs detached; UI stays live");
+        let meta = format!("{elapsed}s elapsed | QUB Core strong catch-up runs detached; UI stays live");
         (label.to_string(), detail, meta)
     }
 
@@ -2286,7 +2324,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             ui.small(detail);
             ui.small(meta);
         } else {
-            ui.small(format!("{} • {}", detail, meta));
+            ui.small(format!("{} | {}", detail, meta));
         }
     }
 
@@ -2406,7 +2444,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         let stalled_for = self.hf85_auto_catchup_stale_since.elapsed();
         let mining_or_waiting = self.miner.is_some() || matches!(self.mining_phase, MiningPhase::Preparing | MiningPhase::Mining);
 
-        // HF110/v1.7.0: if mining/preparing is present while official/direct
+        // HF111/v1.7.1: if mining/preparing is present while official/direct
         // chain stays ahead, pause hashing entirely and let a chain-only repair
         // own disk/network resources. Users were fixing this manually by Stop ->
         // restart -> Sync/Repair -> Start; do it automatically and resume after
@@ -2424,7 +2462,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         if self.hf85_last_auto_catchup_sync.elapsed() >= interval {
             self.hf85_last_auto_catchup_sync = Instant::now();
             self.status_line = format!(
-                "QUB Core strong detached catch-up: local #{} → live #{} ({} block(s) behind, stalled {}s). Wallet stays responsive; mining waits for green-light.",
+                "QUB Core strong detached catch-up: local #{} -> live #{} ({} block(s) behind, stalled {}s). Wallet stays responsive; mining waits for green-light.",
                 local,
                 known,
                 gap,
@@ -2501,9 +2539,9 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                         let local = self.snapshot.height;
                         let known = self.best_known_network_height();
                         if hf85_catchup_running() && known > local {
-                            self.status_line = format!("QUB Core catch-up writer active: local #{local} → network #{known} ({} block(s) remaining). Snapshot waits; UI stays live... {}s elapsed", known.saturating_sub(local), hf85_catchup_elapsed_secs());
+                            self.status_line = format!("QUB Core catch-up writer active: local #{local} -> network #{known} ({} block(s) remaining). Snapshot waits; UI stays live... {}s elapsed", known.saturating_sub(local), hf85_catchup_elapsed_secs());
                         } else if known > local {
-                            self.status_line = format!("Startup/background chain refresh: local #{local} → network #{known} ({} block(s) remaining)... {elapsed}s elapsed", known.saturating_sub(local));
+                            self.status_line = format!("Startup/background chain refresh: local #{local} -> network #{known} ({} block(s) remaining)... {elapsed}s elapsed", known.saturating_sub(local));
                         } else {
                             self.status_line = format!("Startup/background chain refresh: verifying latest tip and wallet state... {elapsed}s elapsed");
                         }
@@ -2535,7 +2573,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             let elapsed = hf85_catchup_elapsed_secs();
             if known > local {
                 self.status_line = format!(
-                    "QUB Core catch-up writer active: local #{local} → network #{known} ({} block(s) remaining). UI stays live; next snapshot waits for the writer. {elapsed}s elapsed",
+                    "QUB Core catch-up writer active: local #{local} -> network #{known} ({} block(s) remaining). UI stays live; next snapshot waits for the writer. {elapsed}s elapsed",
                     known.saturating_sub(local)
                 );
             } else {
@@ -4657,10 +4695,14 @@ del "%~f0"
 
     fn ui_address_qr_hover(&mut self, ctx: &egui::Context, address: &str) {
         let Some(until) = self.qr_hover_until else { return; };
-        if Instant::now() > until { return; }
-        let address = address.trim();
-        if address.is_empty() { return; }
-        if let Some(tex) = self.qr_texture_for_address(ctx, address) {
+        if Instant::now() > until {
+            self.qr_hover_until = None;
+            self.qr_hover_address.clear();
+            return;
+        }
+        let target = if !self.qr_hover_address.trim().is_empty() { self.qr_hover_address.trim().to_string() } else { address.trim().to_string() };
+        if target.is_empty() { return; }
+        if let Some(tex) = self.qr_texture_for_address(ctx, &target) {
             egui::Window::new("Address QR")
                 .collapsible(false)
                 .resizable(false)
@@ -4668,7 +4710,7 @@ del "%~f0"
                 .show(ctx, |ui| {
                     let sized = egui::load::SizedTexture::new(tex.id(), egui::vec2(220.0, 220.0));
                     ui.add(egui::Image::from_texture(sized));
-                    ui.monospace(shorten_hash(address));
+                    ui.monospace(shorten_hash(&target));
                     ui.small("QR encodes this public address only. Never share private keys.");
                 });
         }
@@ -6133,12 +6175,12 @@ impl eframe::App for QubCoreApp {
                     let known = self.best_known_network_height();
                     let local = self.snapshot.height;
                     if known > local {
-                        // HF110/v1.7.0: an auto-heal restart must not start the
+                        // HF111/v1.7.1: an auto-heal restart must not start the
                         // miner while we still know the canonical chain is ahead.
                         // Keep repairing and re-check shortly.
                         self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(15));
                         self.status_line = format!(
-                            "HF110 auto-heal is still catching up before mining restart: local #{} → official/direct #{} ({} block(s) remaining).",
+                            "HF110 auto-heal is still catching up before mining restart: local #{} -> official/direct #{} ({} block(s) remaining).",
                             local, known, known.saturating_sub(local)
                         );
                         spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), true);
@@ -6371,13 +6413,13 @@ impl QubCoreApp {
                 let bpm = self.sync_progress_rate_bps * 60.0;
                 let eta_secs = (remaining as f32 / self.sync_progress_rate_bps).max(1.0);
                 let eta = if eta_secs < 90.0 { format!("{:.0}s", eta_secs) } else { format!("{:.1}m", eta_secs / 60.0) };
-                format!(" • {:.1} block(s)/min • ETA {eta}", bpm)
+                format!(" | {:.1} block(s)/min | ETA {eta}", bpm)
             } else {
-                " • measuring live rate".to_string()
+                " | measuring live rate".to_string()
             };
-            format!("local #{local} → known #{known} • {remaining} block(s) remaining{rate_extra}")
+            format!("local #{local} -> known #{known} | {remaining} block(s) remaining{rate_extra}")
         } else if known > 0 {
-            format!("local #{local} at known tip • final verification")
+            format!("local #{local} at known tip | final verification")
         } else {
             "discovering official/peer tip".to_string()
         };
@@ -6569,6 +6611,7 @@ impl QubCoreApp {
                 };
                 if qr_resp.hovered() {
                     self.qr_hover_until = Some(Instant::now() + Duration::from_secs(1));
+                    self.qr_hover_address = self.prefs.payout_address.clone();
                 }
                 if self.ui_icon_button(ui, "sync", "Sync").clicked() {
                     self.start_wallet_sync(true);
@@ -6672,7 +6715,7 @@ impl QubCoreApp {
             ui.small("OpenCL GPU mining is available. If GPU power is 0, CPU mining is used. QUB Core keeps high-performance full double-SHA GPU batches and per-device auto-tuning. Hybrid laptops default to the strongest GPU; All detected GPUs can run iGPU+dGPU if the drivers expose both, but thermals/power sharing may lower the discrete GPU boost.");
         }
 
-        egui::CollapsingHeader::new("📚 Library")
+        egui::CollapsingHeader::new("Library")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_heading_icon(ui, "list", "Library");
@@ -6684,7 +6727,7 @@ impl QubCoreApp {
                 }
             });
 
-        egui::CollapsingHeader::new("👛 Create / import address")
+        egui::CollapsingHeader::new("Create / import address")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_heading_icon(ui, "wallet-address", "Create / import address");
@@ -6740,7 +6783,7 @@ impl QubCoreApp {
                 });
             });
 
-        egui::CollapsingHeader::new("⚠ Danger zone")
+        egui::CollapsingHeader::new("Danger zone")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_icon_label(ui, "danger-zone", "Danger zone");
@@ -6751,7 +6794,7 @@ impl QubCoreApp {
                 ui.small("Deletion rewrites wallet.json without local keys. It is not a forensic secure-wipe guarantee on SSDs/backups.");
             });
 
-        egui::CollapsingHeader::new("⚡ Benchmark")
+        egui::CollapsingHeader::new("Benchmark")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_heading_icon(ui, "benchmark", self.tr("Benchmark", "Benchmark"));
@@ -6762,7 +6805,7 @@ impl QubCoreApp {
                 if let Some(result) = &self.benchmark_result { ui.label(result); }
             });
 
-        egui::CollapsingHeader::new("⚙ Settings")
+        egui::CollapsingHeader::new("Settings")
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_heading_icon(ui, "settings", self.tr("Settings", "Settings"));
@@ -6869,23 +6912,27 @@ impl QubCoreApp {
         if self.eth_balance_in_flight { return; }
         let Some(wallet) = self.selected_ethereum_wallet() else { return; };
         let rpc = self.eth_wallets.rpc_url.trim().to_string();
-        let usdj_contract = self.prefs.eth_usdj_token_contract.trim().to_string();
-        let vault_contract = self.prefs.eth_usdj_vault_contract.trim().to_string();
+        let usdj_contract = self.fiatj_token_contract_hf108(StablecoinFamily::Usd);
+        let vault_contract = self.fiatj_vault_contract_hf108(StablecoinFamily::Usd);
         let usdt_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Usdt).unwrap_or_else(|| ETHEREUM_USDT_ADDRESS.to_string());
         let usdc_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Usdc).unwrap_or_else(|| ETHEREUM_USDC_ADDRESS.to_string());
-        let eurj_contract = self.prefs.eth_eurj_token_contract.trim().to_string();
-        let eur_vault_contract = self.prefs.eth_eurj_vault_contract.trim().to_string();
+        let eurj_contract = self.fiatj_token_contract_hf108(StablecoinFamily::Eur);
+        let eur_vault_contract = self.fiatj_vault_contract_hf108(StablecoinFamily::Eur);
         let eurc_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Eurc).unwrap_or_default();
         let eurs_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Eurs).unwrap_or_default();
+        let xauj_contract = self.fiatj_token_contract_hf108(StablecoinFamily::Gold);
+        let xau_vault_contract = self.fiatj_vault_contract_hf108(StablecoinFamily::Gold);
+        let paxg_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Paxg).unwrap_or_default();
+        let xaut_contract = self.ethereum_asset_contract_hf107(EthereumAsset::Xaut).unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         self.eth_balance_rx = Some(rx);
         self.eth_balance_in_flight = true;
         self.eth_balances.status = format!("Refreshing Ethereum balances for {}...", shorten_eth_address(&wallet.address));
         thread::spawn(move || {
-            let result = fetch_ethereum_balances_hf108(&rpc, &wallet.address, &usdt_contract, &usdc_contract, &usdj_contract, &vault_contract, &eurc_contract, &eurs_contract, &eurj_contract, &eur_vault_contract);
+            let result = fetch_ethereum_balances_hf108(&rpc, &wallet.address, &usdt_contract, &usdc_contract, &usdj_contract, &vault_contract, &eurc_contract, &eurs_contract, &eurj_contract, &eur_vault_contract, &paxg_contract, &xaut_contract, &xauj_contract, &xau_vault_contract);
             match result {
-                Ok((eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, reserve_status, eur_reserve_status, status)) => {
-                    let _ = tx.send(EthereumWalletEvent::Balance { eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, reserve_status, eur_reserve_status, status });
+                Ok((eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, paxg, xaut, xauj_eth, paxg_reserve, xaut_reserve, reserve_status, eur_reserve_status, gold_reserve_status, status)) => {
+                    let _ = tx.send(EthereumWalletEvent::Balance { eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, paxg, xaut, xauj_eth, paxg_reserve, xaut_reserve, reserve_status, eur_reserve_status, gold_reserve_status, status });
                 }
                 Err(err) => { let _ = tx.send(EthereumWalletEvent::Failed(format!("{err:#}"))); }
             }
@@ -6896,7 +6943,7 @@ impl QubCoreApp {
     fn poll_ethereum_wallet_events(&mut self) {
         if let Some(rx) = &self.eth_balance_rx {
             match rx.try_recv() {
-                Ok(EthereumWalletEvent::Balance { eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, reserve_status, eur_reserve_status, status }) => {
+                Ok(EthereumWalletEvent::Balance { eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, paxg, xaut, xauj_eth, paxg_reserve, xaut_reserve, reserve_status, eur_reserve_status, gold_reserve_status, status }) => {
                     self.eth_balances.eth = eth;
                     self.eth_balances.usdt = usdt;
                     self.eth_balances.usdc = usdc;
@@ -6908,8 +6955,14 @@ impl QubCoreApp {
                     self.eth_balances.eurj_eth = eurj_eth;
                     self.eth_balances.eurc_reserve = eurc_reserve;
                     self.eth_balances.eurs_reserve = eurs_reserve;
+                    self.eth_balances.paxg = paxg;
+                    self.eth_balances.xaut = xaut;
+                    self.eth_balances.xauj_eth = xauj_eth;
+                    self.eth_balances.paxg_reserve = paxg_reserve;
+                    self.eth_balances.xaut_reserve = xaut_reserve;
                     self.eth_balances.reserve_status = reserve_status;
                     self.eth_balances.eur_reserve_status = eur_reserve_status;
+                    self.eth_balances.gold_reserve_status = gold_reserve_status;
                     self.eth_balances.status = status;
                     self.eth_balances.updated_at = Some(Instant::now());
                     self.eth_balance_in_flight = false;
@@ -7086,18 +7139,30 @@ impl QubCoreApp {
                 let c = self.prefs.eth_eurj_token_contract.trim();
                 if is_valid_eth_address(c) { Some(c.to_string()) } else if is_valid_eth_address(ETHEREUM_EURJ_ADDRESS_DEFAULT) { Some(ETHEREUM_EURJ_ADDRESS_DEFAULT.to_string()) } else { None }
             }
+            EthereumAsset::Paxg => {
+                let c = self.prefs.eth_paxg_contract_override.trim();
+                Some(if is_valid_eth_address(c) { c.to_string() } else { ETHEREUM_PAXG_ADDRESS.to_string() })
+            }
+            EthereumAsset::Xaut => {
+                let c = self.prefs.eth_xaut_contract_override.trim();
+                Some(if is_valid_eth_address(c) { c.to_string() } else { ETHEREUM_XAUT_ADDRESS.to_string() })
+            }
+            EthereumAsset::Xauj => {
+                let c = self.prefs.eth_xauj_token_contract.trim();
+                if is_valid_eth_address(c) { Some(c.to_string()) } else if is_valid_eth_address(ETHEREUM_XAUJ_ADDRESS_DEFAULT) { Some(ETHEREUM_XAUJ_ADDRESS_DEFAULT.to_string()) } else { None }
+            }
         }
     }
 
     fn fiatj_token_contract_hf108(&self, family: StablecoinFamily) -> String {
-        let custom = match family { StablecoinFamily::Usd => self.prefs.eth_usdj_token_contract.trim(), StablecoinFamily::Eur => self.prefs.eth_eurj_token_contract.trim() };
-        let default = match family { StablecoinFamily::Usd => ETHEREUM_USDJ_ADDRESS_DEFAULT, StablecoinFamily::Eur => ETHEREUM_EURJ_ADDRESS_DEFAULT };
+        let custom = match family { StablecoinFamily::Usd => self.prefs.eth_usdj_token_contract.trim(), StablecoinFamily::Eur => self.prefs.eth_eurj_token_contract.trim(), StablecoinFamily::Gold => self.prefs.eth_xauj_token_contract.trim() };
+        let default = match family { StablecoinFamily::Usd => ETHEREUM_USDJ_ADDRESS_DEFAULT, StablecoinFamily::Eur => ETHEREUM_EURJ_ADDRESS_DEFAULT, StablecoinFamily::Gold => ETHEREUM_XAUJ_ADDRESS_DEFAULT };
         if is_valid_eth_address(custom) { custom.to_string() } else { default.to_string() }
     }
 
     fn fiatj_vault_contract_hf108(&self, family: StablecoinFamily) -> String {
-        let custom = match family { StablecoinFamily::Usd => self.prefs.eth_usdj_vault_contract.trim(), StablecoinFamily::Eur => self.prefs.eth_eurj_vault_contract.trim() };
-        let default = match family { StablecoinFamily::Usd => ETHEREUM_USDJ_VAULT_ADDRESS_DEFAULT, StablecoinFamily::Eur => ETHEREUM_EURJ_VAULT_ADDRESS_DEFAULT };
+        let custom = match family { StablecoinFamily::Usd => self.prefs.eth_usdj_vault_contract.trim(), StablecoinFamily::Eur => self.prefs.eth_eurj_vault_contract.trim(), StablecoinFamily::Gold => self.prefs.eth_xauj_vault_contract.trim() };
+        let default = match family { StablecoinFamily::Usd => ETHEREUM_USDJ_VAULT_ADDRESS_DEFAULT, StablecoinFamily::Eur => ETHEREUM_EURJ_VAULT_ADDRESS_DEFAULT, StablecoinFamily::Gold => ETHEREUM_XAUJ_VAULT_ADDRESS_DEFAULT };
         if is_valid_eth_address(custom) { custom.to_string() } else { default.to_string() }
     }
 
@@ -7110,7 +7175,7 @@ impl QubCoreApp {
     fn open_usdj_vault_dialog_hf107(&mut self, mode: UsdjVaultMode, asset: EthereumAsset) {
         self.usdj_vault_dialog.open = true;
         self.usdj_vault_dialog.mode = mode;
-        self.usdj_vault_dialog.asset = match asset { EthereumAsset::Usdc => EthereumAsset::Usdc, EthereumAsset::Eurc => EthereumAsset::Eurc, EthereumAsset::Eurs => EthereumAsset::Eurs, _ => EthereumAsset::Usdt };
+        self.usdj_vault_dialog.asset = match asset { EthereumAsset::Usdc => EthereumAsset::Usdc, EthereumAsset::Eurc => EthereumAsset::Eurc, EthereumAsset::Eurs => EthereumAsset::Eurs, EthereumAsset::Paxg => EthereumAsset::Paxg, EthereumAsset::Xaut => EthereumAsset::Xaut, _ => EthereumAsset::Usdt };
         self.usdj_vault_dialog.status = SendDialogStatus::Editing;
         self.usdj_vault_dialog.txid.clear();
         self.usdj_vault_dialog.message.clear();
@@ -7199,6 +7264,10 @@ impl QubCoreApp {
                             ui.radio_value(&mut self.usdj_vault_dialog.asset, EthereumAsset::Eurc, "EURC bucket");
                             ui.radio_value(&mut self.usdj_vault_dialog.asset, EthereumAsset::Eurs, "EURS bucket");
                         }
+                        StablecoinFamily::Gold => {
+                            ui.radio_value(&mut self.usdj_vault_dialog.asset, EthereumAsset::Paxg, "PAXG bucket");
+                            ui.radio_value(&mut self.usdj_vault_dialog.asset, EthereumAsset::Xaut, "XAUt bucket");
+                        }
                     }
                 });
                 ui.horizontal(|ui| {
@@ -7241,6 +7310,39 @@ impl QubCoreApp {
         self.usdj_vault_dialog.open = if close_requested { false } else { open };
     }
 
+    fn ui_contract_address_text_hf111(&self, ui: &mut egui::Ui, label: &str, addr: &str) {
+        ui.label(label);
+        let shown = if addr.trim().is_empty() { "not configured" } else { addr.trim() };
+        ui.monospace(shown);
+        ui.end_row();
+    }
+
+    fn ui_stablecoin_contracts_readonly_hf111(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("USDJ / USDT / USDC").strong());
+        egui::Grid::new("usdj_contracts_readonly_hf111").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            self.ui_contract_address_text_hf111(ui, "USDT token", ETHEREUM_USDT_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "USDC token", ETHEREUM_USDC_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "USDJ token", &self.fiatj_token_contract_hf108(StablecoinFamily::Usd));
+            self.ui_contract_address_text_hf111(ui, "USDJ Reserve vault", &self.fiatj_vault_contract_hf108(StablecoinFamily::Usd));
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("EURJ / EURC / EURS").strong());
+        egui::Grid::new("eurj_contracts_readonly_hf111").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            self.ui_contract_address_text_hf111(ui, "EURC token", ETHEREUM_EURC_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "EURS token", ETHEREUM_EURS_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "EURJ token", &self.fiatj_token_contract_hf108(StablecoinFamily::Eur));
+            self.ui_contract_address_text_hf111(ui, "EURJ Reserve vault", &self.fiatj_vault_contract_hf108(StablecoinFamily::Eur));
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("XAUJ / PAXG / XAUt").strong());
+        egui::Grid::new("xauj_contracts_readonly_hf111").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            self.ui_contract_address_text_hf111(ui, "PAXG token", ETHEREUM_PAXG_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "XAUt token", ETHEREUM_XAUT_ADDRESS);
+            self.ui_contract_address_text_hf111(ui, "XAUJ token", &self.fiatj_token_contract_hf108(StablecoinFamily::Gold));
+            self.ui_contract_address_text_hf111(ui, "XAUJ Reserve vault", &self.fiatj_vault_contract_hf108(StablecoinFamily::Gold));
+        });
+    }
+
     fn ui_ethereum_wallets_section_hf102(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -7263,28 +7365,8 @@ impl QubCoreApp {
             egui::CollapsingHeader::new("Stablecoin Ethereum contracts")
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.small("Paste deployed token/vault addresses for USDJ and EURJ pooled-reserve contracts. Bridge to QUB remains disabled until the bridge is live.");
-                    ui.label(egui::RichText::new("USDJ / USDT / USDC").strong());
-                    egui::Grid::new("usdj_contracts_grid_hf108").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                        ui.label("USDT token"); if ui.text_edit_singleline(&mut self.prefs.eth_usdt_contract_override).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("USDC token"); if ui.text_edit_singleline(&mut self.prefs.eth_usdc_contract_override).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("USDJ token"); if ui.text_edit_singleline(&mut self.prefs.eth_usdj_token_contract).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("USDJ Reserve vault"); if ui.text_edit_singleline(&mut self.prefs.eth_usdj_vault_contract).changed() { self.prefs_dirty = true; } ui.end_row();
-                    });
-                    ui.small("Blank USDT/USDC/EURC/EURS override uses canonical Ethereum mainnet contracts. Paste mock addresses for Anvil/local tests.");
-                    ui.separator();
-                    ui.label(egui::RichText::new("EURJ / EURC / EURS").strong());
-                    egui::Grid::new("eurj_contracts_grid_hf108").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                        ui.label("EURC token"); if ui.text_edit_singleline(&mut self.prefs.eth_eurc_contract_override).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("EURS token"); if ui.text_edit_singleline(&mut self.prefs.eth_eurs_contract_override).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("EURJ token"); if ui.text_edit_singleline(&mut self.prefs.eth_eurj_token_contract).changed() { self.prefs_dirty = true; } ui.end_row();
-                        ui.label("EURJ Reserve vault"); if ui.text_edit_singleline(&mut self.prefs.eth_eurj_vault_contract).changed() { self.prefs_dirty = true; } ui.end_row();
-                    });
-                    for (label, addr) in [("USDJ token", self.prefs.eth_usdj_token_contract.as_str()), ("USDJ vault", self.prefs.eth_usdj_vault_contract.as_str()), ("EURC token", self.prefs.eth_eurc_contract_override.as_str()), ("EURS token", self.prefs.eth_eurs_contract_override.as_str()), ("EURJ token", self.prefs.eth_eurj_token_contract.as_str()), ("EURJ vault", self.prefs.eth_eurj_vault_contract.as_str())] {
-                        if !addr.trim().is_empty() && !is_valid_eth_address(addr.trim()) {
-                            ui.colored_label(egui::Color32::from_rgb(255, 80, 80), format!("{label} address must be a valid 0x Ethereum address."));
-                        }
-                    }
+                    ui.small("Official contract addresses are bundled with QUB Core. They are shown here for verification; they are not editable in the production UI.");
+                    self.ui_stablecoin_contracts_readonly_hf111(ui);
                 });
             ui.horizontal_wrapped(|ui| {
                 if self.ui_icon_button_enabled(ui, true, "wallet-address", "Create Ethereum wallet").clicked() { self.create_ethereum_wallet_hf102(); }
@@ -7310,7 +7392,10 @@ impl QubCoreApp {
                         ui.small(&w.label);
                         if ui.button("Copy").clicked() { ui.ctx().copy_text(w.address.clone()); }
                         let qr_resp = self.ui_icon_only_button_enabled(ui, true, "qr", "Show ETH address QR");
-                        if qr_resp.hovered() { self.qr_hover_until = Some(Instant::now() + Duration::from_secs(1)); }
+                        if qr_resp.hovered() {
+                            self.qr_hover_until = Some(Instant::now() + Duration::from_secs(1));
+                            self.qr_hover_address = w.address.clone();
+                        }
                     });
                     if self.qr_hover_until.is_some() { self.ui_address_qr_hover(ui.ctx(), &w.address); }
                 }
@@ -7332,14 +7417,17 @@ impl QubCoreApp {
                     ui.monospace(shorten_eth_address(&w.address));
                     if ui.button("Copy").clicked() { ui.ctx().copy_text(w.address.clone()); }
                     let qr_resp = self.ui_icon_only_button_enabled(ui, true, "qr", "Show ETH QR");
-                    if qr_resp.hovered() { self.qr_hover_until = Some(Instant::now() + Duration::from_secs(1)); }
+                    if qr_resp.hovered() {
+                        self.qr_hover_until = Some(Instant::now() + Duration::from_secs(1));
+                        self.qr_hover_address = w.address.clone();
+                    }
                 });
                 self.ui_address_qr_hover(ui.ctx(), &w.address);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Spendable").strong());
                     ui.label(egui::RichText::new(format!("{} ETH", self.eth_balances.eth)).size(18.0).strong());
                 });
-                ui.small(format!("USDT: {} | USDC: {} | USDJ: {} | EURC: {} | EURS: {} | EURJ: {} | {}", self.eth_balances.usdt, self.eth_balances.usdc, self.eth_balances.usdj_eth, self.eth_balances.eurc, self.eth_balances.eurs, self.eth_balances.eurj_eth, self.eth_balances.status));
+                ui.small(format!("USDT: {} | USDC: {} | USDJ: {} | EURC: {} | EURS: {} | EURJ: {} | PAXG: {} | XAUt: {} | XAUJ: {} | {}", self.eth_balances.usdt, self.eth_balances.usdc, self.eth_balances.usdj_eth, self.eth_balances.eurc, self.eth_balances.eurs, self.eth_balances.eurj_eth, self.eth_balances.paxg, self.eth_balances.xaut, self.eth_balances.xauj_eth, self.eth_balances.status));
                 ui.horizontal_wrapped(|ui| {
                     if self.ui_icon_button_enabled(ui, true, "send", "Send ETH").clicked() { self.open_ethereum_send_dialog(EthereumAsset::Eth); }
                     self.ui_icon_button_enabled(ui, false, "buy", "Buy");
@@ -7664,17 +7752,19 @@ impl QubCoreApp {
                 self.ui_icon(ui, "stablecoins", 24.0);
                 ui.label(egui::RichText::new("Stablecoins").size(20.0).strong());
                 ui.add_space(8.0);
-                egui::ComboBox::from_id_salt("stablecoin_family_hf108")
+                egui::ComboBox::from_id_salt("stablecoin_family_hf111")
                     .selected_text(self.prefs.stablecoin_family.label())
                     .show_ui(ui, |ui| {
                         ui.horizontal(|ui| { self.ui_icon(ui, "usd", 16.0); if ui.selectable_label(self.prefs.stablecoin_family == StablecoinFamily::Usd, "USD").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Usd; self.prefs_dirty = true; ui.close(); } });
                         ui.horizontal(|ui| { self.ui_icon(ui, "eur", 16.0); if ui.selectable_label(self.prefs.stablecoin_family == StablecoinFamily::Eur, "EUR").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Eur; self.prefs_dirty = true; ui.close(); } });
+                        ui.horizontal(|ui| { self.ui_icon(ui, "gold", 16.0); if ui.selectable_label(self.prefs.stablecoin_family == StablecoinFamily::Gold, "Gold").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Gold; self.prefs_dirty = true; ui.close(); } });
                     });
             });
             ui.separator();
             match self.prefs.stablecoin_family {
                 StablecoinFamily::Usd => self.ui_usdj_family_card_hf108(ui),
                 StablecoinFamily::Eur => self.ui_eurj_family_card_hf108(ui),
+                StablecoinFamily::Gold => self.ui_xauj_family_card_hf111(ui),
             }
         });
     }
@@ -7707,13 +7797,29 @@ impl QubCoreApp {
         }
     }
 
-    fn fiatj_display_balance_hf108(&self, family: StablecoinFamily) -> String {
-        match family { StablecoinFamily::Usd => self.eth_balances.usdj_eth.clone(), StablecoinFamily::Eur => self.eth_balances.eurj_eth.clone() }
+    fn ui_xauj_family_card_hf111(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if self.ui_icon_selectable_button(ui, self.prefs.xauj_balance_tab == XaujBalanceSubTab::Xauj, "xauj", "XAUJ").clicked() { self.prefs.xauj_balance_tab = XaujBalanceSubTab::Xauj; self.prefs_dirty = true; }
+            if self.ui_icon_selectable_button(ui, self.prefs.xauj_balance_tab == XaujBalanceSubTab::Paxg, "paxg", "PAXG").clicked() { self.prefs.xauj_balance_tab = XaujBalanceSubTab::Paxg; self.prefs_dirty = true; }
+            if self.ui_icon_selectable_button(ui, self.prefs.xauj_balance_tab == XaujBalanceSubTab::Xaut, "xaut", "XAUt").clicked() { self.prefs.xauj_balance_tab = XaujBalanceSubTab::Xaut; self.prefs_dirty = true; }
+        });
+        ui.separator();
+        match self.prefs.xauj_balance_tab {
+            XaujBalanceSubTab::Xauj => self.ui_fiatj_main_card_body_hf108(ui, StablecoinFamily::Gold),
+            XaujBalanceSubTab::Paxg => self.ui_stable_asset_card_body_hf108(ui, EthereumAsset::Paxg, "PAX Gold", "XAUJ pooled reserve input / redemption bucket."),
+            XaujBalanceSubTab::Xaut => self.ui_stable_asset_card_body_hf108(ui, EthereumAsset::Xaut, "Tether Gold", "XAUJ pooled reserve input / redemption bucket."),
+        }
     }
+
+    fn fiatj_display_balance_hf108(&self, family: StablecoinFamily) -> String {
+        match family { StablecoinFamily::Usd => self.eth_balances.usdj_eth.clone(), StablecoinFamily::Eur => self.eth_balances.eurj_eth.clone(), StablecoinFamily::Gold => self.eth_balances.xauj_eth.clone() }
+    }
+
     fn fiatj_reserves_hf108(&self, family: StablecoinFamily) -> (String, String, &'static str, &'static str, &'static str, &'static str) {
         match family {
             StablecoinFamily::Usd => (self.eth_balances.usdt_reserve.clone(), self.eth_balances.usdc_reserve.clone(), "usdt", "USDT", "usdc", "USDC"),
             StablecoinFamily::Eur => (self.eth_balances.eurc_reserve.clone(), self.eth_balances.eurs_reserve.clone(), "eurc", "EURC", "eurs", "EURS"),
+            StablecoinFamily::Gold => (self.eth_balances.paxg_reserve.clone(), self.eth_balances.xaut_reserve.clone(), "paxg", "PAXG", "xaut", "XAUt"),
         }
     }
 
@@ -7726,13 +7832,17 @@ impl QubCoreApp {
             ui.label(egui::RichText::new(format!("Ethereum {token}")).strong());
             ui.label(egui::RichText::new(format!("{} {token}", self.fiatj_display_balance_hf108(family))).size(18.0).strong());
         });
-        ui.small(match family { StablecoinFamily::Usd => "Jinex USD pooled reserve: one public USDJ, backed by USDT + USDC buckets.", StablecoinFamily::Eur => EURJ_ETH_BACKING_NOTE });
+        ui.small(match family {
+            StablecoinFamily::Usd => "Jinex USD pooled reserve: one public USDJ, backed by USDT + USDC buckets.",
+            StablecoinFamily::Eur => EURJ_ETH_BACKING_NOTE,
+            StablecoinFamily::Gold => XAUJ_ETH_BACKING_NOTE,
+        });
         egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.ui_icon(ui, "eth", 18.0);
                 ui.label(egui::RichText::new("Backed by:").strong());
             });
-            egui::Grid::new(format!("{}_pooled_backing_grid_hf109", token))
+            egui::Grid::new(format!("{}_pooled_backing_grid_hf111", token))
                 .num_columns(3)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
@@ -7740,23 +7850,41 @@ impl QubCoreApp {
                     ui.label(egui::RichText::new(r1).strong()); self.ui_icon(ui, icon1, 18.0); ui.label(sym1); ui.end_row();
                 });
             ui.small("One fungible token backed by pooled reserves. Melt chooses the output bucket if liquidity exists.");
-            ui.small(match family { StablecoinFamily::Usd => &self.eth_balances.reserve_status, StablecoinFamily::Eur => &self.eth_balances.eur_reserve_status });
-            if !contracts_ready { ui.colored_label(egui::Color32::from_rgb(255, 175, 75), format!("Paste deployed {token} token + ReserveVault addresses in Create / import address → Ethereum → Stablecoin contracts.")); }
+            ui.small(match family { StablecoinFamily::Usd => &self.eth_balances.reserve_status, StablecoinFamily::Eur => &self.eth_balances.eur_reserve_status, StablecoinFamily::Gold => &self.eth_balances.gold_reserve_status });
+            if !contracts_ready { ui.colored_label(egui::Color32::from_rgb(255, 175, 75), format!("Official {token} token + ReserveVault addresses are not configured yet.")); }
         });
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
             if self.ui_icon_button_enabled(ui, contracts_ready && !self.eth_wallets.wallets.is_empty(), "send", &format!("Send Ethereum {token}")).clicked() {
-                self.open_ethereum_send_dialog(match family { StablecoinFamily::Usd => EthereumAsset::Usdj, StablecoinFamily::Eur => EthereumAsset::Eurj });
+                self.open_ethereum_send_dialog(match family { StablecoinFamily::Usd => EthereumAsset::Usdj, StablecoinFamily::Eur => EthereumAsset::Eurj, StablecoinFamily::Gold => EthereumAsset::Xauj });
             }
             self.ui_icon_button_enabled(ui, false, "send", &format!("Send QUB-chain {token} disabled until bridge is live"));
-            let (a0, a1) = match family { StablecoinFamily::Usd => (EthereumAsset::Usdt, EthereumAsset::Usdc), StablecoinFamily::Eur => (EthereumAsset::Eurc, EthereumAsset::Eurs) };
+            if family == StablecoinFamily::Usd {
+                ui.add_space(4.0);
+                egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        self.ui_icon(ui, "bridge", 18.0);
+                        ui.label(egui::RichText::new("USDJ bridge preview").strong());
+                    });
+                    ui.small(format!("Toll: {} bps (1%). Protocol address: {}", USDJ_BRIDGE_TOLL_BPS, QUB_USDJ_BRIDGE_PROTOCOL_ADDRESS));
+                    ui.small("ETH -> QUB: lock 100 USDJ on Ethereum, claim 99 QUB-chain USDJ and route 1 USDJ toll to the protocol address.");
+                    ui.small("QUB -> ETH: burn/pay 101 QUB-chain USDJ, route 1 USDJ toll to the protocol address, and release 100 Ethereum USDJ after proof verification.");
+                    let gw = ETHEREUM_USDJ_BRIDGE_ADDRESS_DEFAULT;
+                    ui.small(format!("Ethereum bridge gateway: {}", if gw.trim().is_empty() { "not deployed yet" } else { gw }));
+                    ui.horizontal_wrapped(|ui| {
+                        self.ui_icon_button_enabled(ui, false, "bridge", "Bridge ETH -> QUB disabled until gateway + QUB proof path are live");
+                        self.ui_icon_button_enabled(ui, false, "bridge", "Bridge QUB -> ETH disabled until QUB burn proofs are live");
+                    });
+                });
+            }
+            let (a0, a1) = match family { StablecoinFamily::Usd => (EthereumAsset::Usdt, EthereumAsset::Usdc), StablecoinFamily::Eur => (EthereumAsset::Eurc, EthereumAsset::Eurs), StablecoinFamily::Gold => (EthereumAsset::Paxg, EthereumAsset::Xaut) };
             if self.ui_icon_button_enabled(ui, contracts_ready && !self.eth_wallets.wallets.is_empty(), "melt", &format!("Melt for {sym0}")).clicked() { self.open_usdj_vault_dialog_hf107(UsdjVaultMode::Melt, a0); }
             if self.ui_icon_button_enabled(ui, contracts_ready && !self.eth_wallets.wallets.is_empty(), "melt", &format!("Melt for {sym1}")).clicked() { self.open_usdj_vault_dialog_hf107(UsdjVaultMode::Melt, a1); }
         });
     }
 
     fn stable_asset_balance_hf108(&self, asset: EthereumAsset) -> String {
-        match asset { EthereumAsset::Usdt => self.eth_balances.usdt.clone(), EthereumAsset::Usdc => self.eth_balances.usdc.clone(), EthereumAsset::Eurc => self.eth_balances.eurc.clone(), EthereumAsset::Eurs => self.eth_balances.eurs.clone(), EthereumAsset::Usdj => self.eth_balances.usdj_eth.clone(), EthereumAsset::Eurj => self.eth_balances.eurj_eth.clone(), EthereumAsset::Eth => self.eth_balances.eth.clone() }
+        match asset { EthereumAsset::Usdt => self.eth_balances.usdt.clone(), EthereumAsset::Usdc => self.eth_balances.usdc.clone(), EthereumAsset::Eurc => self.eth_balances.eurc.clone(), EthereumAsset::Eurs => self.eth_balances.eurs.clone(), EthereumAsset::Paxg => self.eth_balances.paxg.clone(), EthereumAsset::Xaut => self.eth_balances.xaut.clone(), EthereumAsset::Usdj => self.eth_balances.usdj_eth.clone(), EthereumAsset::Eurj => self.eth_balances.eurj_eth.clone(), EthereumAsset::Xauj => self.eth_balances.xauj_eth.clone(), EthereumAsset::Eth => self.eth_balances.eth.clone() }
     }
 
     fn ui_stable_asset_card_body_hf108(&mut self, ui: &mut egui::Ui, asset: EthereumAsset, name: &str, detail: &str) {
@@ -7781,9 +7909,10 @@ impl QubCoreApp {
                 ui.label(egui::RichText::new("Stablecoins").strong());
                 if self.ui_icon_selectable_button(ui, self.prefs.stablecoin_family == StablecoinFamily::Usd, "usd", "USD").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Usd; self.prefs_dirty = true; }
                 if self.ui_icon_selectable_button(ui, self.prefs.stablecoin_family == StablecoinFamily::Eur, "eur", "EUR").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Eur; self.prefs_dirty = true; }
+                if self.ui_icon_selectable_button(ui, self.prefs.stablecoin_family == StablecoinFamily::Gold, "gold", "Gold").clicked() { self.prefs.stablecoin_family = StablecoinFamily::Gold; self.prefs_dirty = true; }
             });
             ui.add_space(3.0);
-            match self.prefs.stablecoin_family { StablecoinFamily::Usd => self.ui_usdj_family_card_hf108(ui), StablecoinFamily::Eur => self.ui_eurj_family_card_hf108(ui) }
+            match self.prefs.stablecoin_family { StablecoinFamily::Usd => self.ui_usdj_family_card_hf108(ui), StablecoinFamily::Eur => self.ui_eurj_family_card_hf108(ui), StablecoinFamily::Gold => self.ui_xauj_family_card_hf111(ui) }
         });
     }
 
@@ -8119,7 +8248,7 @@ impl QubCoreApp {
             format!("{} global live / {} direct / {} known / {}", self.snapshot.global_live_peers, self.snapshot.direct_reachable_peers, self.snapshot.known_peers, relay_label)
         } else { "disabled".to_string() };
 
-        egui::CollapsingHeader::new(format!("⛓ Live chain data   |   {}   |   #{}", self.snapshot.network, self.snapshot.height))
+        egui::CollapsingHeader::new(format!("Live chain data   |   {}   |   #{}", self.snapshot.network, self.snapshot.height))
             .id_salt("central_live_chain_data")
             .default_open(false)
             .show(ui, |ui| {
@@ -8196,13 +8325,13 @@ impl QubCoreApp {
         }
         ui.add_space(10.0);
 
-        egui::CollapsingHeader::new(format!("🌐 Peers / block stream   |   {} direct   |   {} known", self.snapshot.direct_reachable_peers, self.snapshot.known_peers))
+        egui::CollapsingHeader::new(format!("Peers / block stream   |   {} direct   |   {} known", self.snapshot.direct_reachable_peers, self.snapshot.known_peers))
             .id_salt("central_peers_block_stream")
             .default_open(false)
             .show(ui, |ui| self.ui_peer_modes(ui));
         ui.add_space(10.0);
 
-        egui::CollapsingHeader::new(format!("🧱 Recent global blocks   |   latest #{}", self.snapshot.recent_blocks.first().map(|b| b.height).unwrap_or(0)))
+        egui::CollapsingHeader::new(format!("Recent global blocks   |   latest #{}", self.snapshot.recent_blocks.first().map(|b| b.height).unwrap_or(0)))
             .id_salt("central_recent_global_blocks")
             .default_open(true)
             .show(ui, |ui| self.ui_recent_global_blocks(ui));
@@ -8241,7 +8370,7 @@ impl QubCoreApp {
         }
 
         ui.add_space(12.0);
-        egui::CollapsingHeader::new("✨ Feature status")
+        egui::CollapsingHeader::new("Feature status")
             .default_open(false)
             .show(ui, |ui| {
                 ui.label(&self.snapshot.features);
@@ -8471,7 +8600,7 @@ impl QubCoreApp {
                 ui.end_row();
                 if known_tip > local_latest {
                     let latest_tip_help = "Latest known network block is provisional and has not been locally fetched/validated yet. Treat mined blocks as pending until 2+ confirmations; a competing tip can replace the newest row.";
-                    ui_recent_block_cell(ui, format!("⏳ #{}", known_tip), true, false, latest_tip_help);
+                    ui_recent_block_cell(ui, format!("pending #{}", known_tip), true, false, latest_tip_help);
                     ui_recent_block_cell(ui, "pending local validation", true, false, latest_tip_help);
                     ui_recent_block_cell(ui, "-", true, false, latest_tip_help);
                     ui_recent_block_cell(ui, "catching up", true, false, latest_tip_help);
@@ -8482,7 +8611,7 @@ impl QubCoreApp {
                     if known_tip > local_latest.saturating_add(1) {
                         let missing = known_tip.saturating_sub(local_latest).saturating_sub(1);
                         let gap_help = "QUB Core knows the official/direct tip is ahead and is fetching the missing intermediate blocks. Mining waits for the canonical chain view; this row is informational only.";
-                        ui_recent_block_cell(ui, format!("↳ #{}..#{}", local_latest.saturating_add(1), known_tip.saturating_sub(1)), true, false, gap_help);
+                        ui_recent_block_cell(ui, format!("gap #{}..#{}", local_latest.saturating_add(1), known_tip.saturating_sub(1)), true, false, gap_help);
                         ui_recent_block_cell(ui, format!("fetching {missing} block(s)"), true, false, gap_help);
                         ui_recent_block_cell(ui, "-", true, false, gap_help);
                         ui_recent_block_cell(ui, "syncing", true, false, gap_help);
@@ -8497,7 +8626,7 @@ impl QubCoreApp {
                         if prev_height > card.height.saturating_add(1) {
                             let missing = prev_height.saturating_sub(card.height).saturating_sub(1);
                             let gap_help = "There is a gap between visible block rows. QUB Core is fetching those intermediate blocks from the official/direct chain view before treating the list as complete.";
-                            ui_recent_block_cell(ui, format!("↳ #{}..#{}", card.height.saturating_add(1), prev_height.saturating_sub(1)), true, false, gap_help);
+                            ui_recent_block_cell(ui, format!("gap #{}..#{}", card.height.saturating_add(1), prev_height.saturating_sub(1)), true, false, gap_help);
                             ui_recent_block_cell(ui, format!("fetching {missing} block(s)"), true, false, gap_help);
                             ui_recent_block_cell(ui, "-", true, false, gap_help);
                             ui_recent_block_cell(ui, "syncing", true, false, gap_help);
@@ -8524,7 +8653,7 @@ impl QubCoreApp {
                     } else {
                         format!("{} confirmation(s). This block is past the latest-row pending-finality warning.", confirmations.max(1))
                     };
-                    let block_label = if pending_finality { format!("⏳ #{}", card.height) } else { format!("#{}", card.height) };
+                    let block_label = if pending_finality { format!("pending #{}", card.height) } else { format!("#{}", card.height) };
                     ui_recent_block_cell(ui, block_label, pending_finality, false, &finality_hover);
                     ui_recent_block_cell(ui, card.reward.clone(), pending_finality, false, &finality_hover);
                     ui_recent_block_cell(ui, card.txs.to_string(), pending_finality, false, &finality_hover);
@@ -9682,8 +9811,14 @@ fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fe
     let tx = wallet.create_jin_public_sale_buy_transaction(&chain, &settings, listing_id, units, Amount::from_str(fee.trim())?)?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let mut relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
+    // HF113: JIN buys are high-value UX actions. Keep them hot in the official
+    // relay path immediately after creation so they are not silently lost behind
+    // ordinary mempool traffic during fast block races.
+    for _ in 0..3 {
+        relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 64).unwrap_or(0));
+        thread::sleep(Duration::from_millis(180));
+    }
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10148,6 +10283,7 @@ fn query_gui_tx_status(config_path: &str, txid: &str) -> Result<TxUiStatus> {
         }
     }
     if chain.mempool.iter().any(|tx| tx.txid().to_string() == txid) {
+        let _ = p2p::rebroadcast_local_mempool(&settings, 64);
         return Ok(TxUiStatus::PendingMempool);
     }
     Ok(TxUiStatus::NotFound)
@@ -10383,7 +10519,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if last_template_check.elapsed() >= Duration::from_secs(8) {
+            if last_template_check.elapsed() >= Duration::from_secs(4) {
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != chain.tip_hash() {
                         round_stop.store(true, Ordering::Relaxed);
@@ -10397,20 +10533,11 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
                 }
                 last_template_check = Instant::now();
             }
-            if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(24) {
-                match p2p::mining_parent_guard(&settings, chain.height(), chain.tip_hash()) {
-                    Ok(report) => {
-                        if report.peers_contacted > 0 && (report.chains_adopted > 0 || report.blocks_connected > 0 || report.height > chain.height()) {
-                            let _ = events.send(MinerEvent::Status(format!("Network tip moved to #{}; rebuilding pool candidate.", report.height)));
-                            round_stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = events.send(MinerEvent::Status(format!("Pool candidate cancelled by the single-flight catch-up gate: {err:#}")));
-                        round_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
+            if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
+                if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, chain.height(), chain.tip_hash(), 520) {
+                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF113 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    round_stop.store(true, Ordering::Relaxed);
+                    break;
                 }
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != chain.tip_hash() {
@@ -10450,8 +10577,8 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let candidate_parent_hash = block.header.prev_block_hash;
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
-                if let Err(err) = p2p::mining_parent_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the single-flight catch-up gate: {err:#}")));
+                if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
+                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF113 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -10626,7 +10753,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if last_template_check.elapsed() >= Duration::from_secs(8) {
+            if last_template_check.elapsed() >= Duration::from_secs(4) {
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != base_chain.tip_hash() {
                         round_stop.store(true, Ordering::Relaxed);
@@ -10640,20 +10767,11 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 }
                 last_template_check = Instant::now();
             }
-            if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(24) {
-                match p2p::mining_parent_guard(&settings, base_chain.height(), base_chain.tip_hash()) {
-                    Ok(report) => {
-                        if report.peers_contacted > 0 && (report.chains_adopted > 0 || report.blocks_connected > 0 || report.height > base_chain.height()) {
-                            let _ = events.send(MinerEvent::Status(format!("Network tip moved to #{}; rebuilding mining candidate.", report.height)));
-                            round_stop.store(true, Ordering::Relaxed);
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = events.send(MinerEvent::Status(format!("Candidate cancelled by the single-flight catch-up gate: {err:#}")));
-                        round_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
+            if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
+                if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, base_chain.height(), base_chain.tip_hash(), 520) {
+                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF113 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    round_stop.store(true, Ordering::Relaxed);
+                    break;
                 }
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != base_chain.tip_hash() {
@@ -10693,8 +10811,8 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             let candidate_parent_hash = block.header.prev_block_hash;
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
-                if let Err(err) = p2p::mining_parent_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the single-flight catch-up gate: {err:#}")));
+                if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
+                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF113 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -11600,7 +11718,7 @@ fn ui_recent_block_miner_cell(ui: &mut egui::Ui, block: &SnapshotBlock, text: im
         } else {
             egui::Color32::from_rgb(230, 244, 255)
         };
-        let mut rich = egui::RichText::new(format!("  pool • {}  ", text))
+        let mut rich = egui::RichText::new(format!("  {}  ", text))
             .strong()
             .color(fg)
             .background_color(bg);
@@ -11760,15 +11878,15 @@ fn qub_payout_address_warning(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() { return None; }
     if trimmed.to_ascii_lowercase().starts_with("0x") {
-        return Some("Wrong payout address format: Ethereum 0x... addresses cannot receive QUB mining rewards. Create/import a QUB Chain wallet in Create / import address → QUB Chain, then use its qub1... address here.".to_string());
+        return Some("Wrong payout address format: Ethereum 0x... addresses cannot receive QUB mining rewards. Create/import a QUB Chain wallet in Create / import address -> QUB Chain, then use its qub1... address here.".to_string());
     }
     if trimmed.contains(':') || trimmed.contains('@') || trimmed.contains('/') {
-        return Some("Wrong payout address format: use a QUB Chain qub1... address or a .qub QNS name for mining payout. Create/import a QUB wallet in Create / import address → QUB Chain.".to_string());
+        return Some("Wrong payout address format: use a QUB Chain qub1... address or a .qub QNS name for mining payout. Create/import a QUB wallet in Create / import address -> QUB Chain.".to_string());
     }
     if trimmed.ends_with(".qub") { return None; }
     match Address::parse_with_prefix(trimmed, "qub") {
         Ok(_) => None,
-        Err(_) => Some("Wrong payout address format: mining payout must be a QUB Chain qub1... address or .qub name. Create/import a QUB wallet in Create / import address → QUB Chain.".to_string()),
+        Err(_) => Some("Wrong payout address format: mining payout must be a QUB Chain qub1... address or .qub name. Create/import a QUB wallet in Create / import address -> QUB Chain.".to_string()),
     }
 }
 
@@ -11973,7 +12091,7 @@ fn fetch_erc20_balance_hf102(rpc: &str, contract: &str, address: &str) -> Result
     hex_quantity_to_biguint(res.as_str().unwrap_or("0x0"))
 }
 
-fn fetch_ethereum_balances_hf108(rpc: &str, address: &str, usdt_contract: &str, usdc_contract: &str, usdj_contract: &str, vault_contract: &str, eurc_contract: &str, eurs_contract: &str, eurj_contract: &str, eur_vault_contract: &str) -> Result<(String, String, String, String, String, String, String, String, String, String, String, String, String, String)> {
+fn fetch_ethereum_balances_hf108(rpc: &str, address: &str, usdt_contract: &str, usdc_contract: &str, usdj_contract: &str, vault_contract: &str, eurc_contract: &str, eurs_contract: &str, eurj_contract: &str, eur_vault_contract: &str, paxg_contract: &str, xaut_contract: &str, xauj_contract: &str, xau_vault_contract: &str) -> Result<(String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String, String)> {
     let addr = normalize_eth_address(address)?;
     let eth_raw = ethereum_rpc_call_any_hf102(rpc, "eth_getBalance", serde_json::json!([addr, "latest"]))?;
     let eth_units = hex_quantity_to_biguint(eth_raw.as_str().unwrap_or("0x0"))?;
@@ -11983,21 +12101,23 @@ fn fetch_ethereum_balances_hf108(rpc: &str, address: &str, usdt_contract: &str, 
     let usdt = format_decimal_units(&usdt_units, 6, 6);
     let usdc = format_decimal_units(&usdc_units, 6, 6);
     let status = format!("ETH RPC refreshed via {}", effective_eth_rpc_urls(rpc).first().cloned().unwrap_or_default());
+
     let mut usdj_eth = "-".to_string();
     let mut usdt_reserve = "-".to_string();
     let mut usdc_reserve = "-".to_string();
     let mut reserve_status = "USDJ contracts not configured".to_string();
     if is_valid_eth_address(usdj_contract) {
         let units = fetch_erc20_balance_hf102(rpc, usdj_contract, address)?;
-        usdj_eth = format_decimal_units(&units, FIATJ_DECIMALS, 6);
+        usdj_eth = format_decimal_units(&units, StablecoinFamily::Usd.token_decimals(), 6);
     }
     if is_valid_eth_address(vault_contract) {
         let usdt_units = fetch_usdj_vault_reserve_hf107(rpc, vault_contract, 0).unwrap_or_else(|_| BigUint::zero());
         let usdc_units = fetch_usdj_vault_reserve_hf107(rpc, vault_contract, 1).unwrap_or_else(|_| BigUint::zero());
-        usdt_reserve = format_decimal_units(&usdt_units, 6, 6);
-        usdc_reserve = format_decimal_units(&usdc_units, 6, 6);
+        usdt_reserve = format_decimal_units(&usdt_units, EthereumAsset::Usdt.decimals(), 6);
+        usdc_reserve = format_decimal_units(&usdc_units, EthereumAsset::Usdc.decimals(), 6);
         reserve_status = format!("USDJ vault reserves refreshed from {}", shorten_eth_address(vault_contract));
     }
+
     let mut eurc = "-".to_string();
     let mut eurs = "-".to_string();
     let mut eurj_eth = "-".to_string();
@@ -12011,7 +12131,7 @@ fn fetch_ethereum_balances_hf108(rpc: &str, address: &str, usdt_contract: &str, 
         eurs = format_decimal_units(&fetch_erc20_balance_hf102(rpc, eurs_contract, address)?, EthereumAsset::Eurs.decimals(), 2);
     }
     if is_valid_eth_address(eurj_contract) {
-        eurj_eth = format_decimal_units(&fetch_erc20_balance_hf102(rpc, eurj_contract, address)?, FIATJ_DECIMALS, 6);
+        eurj_eth = format_decimal_units(&fetch_erc20_balance_hf102(rpc, eurj_contract, address)?, StablecoinFamily::Eur.token_decimals(), 6);
     }
     if is_valid_eth_address(eur_vault_contract) {
         let eurc_units = fetch_usdj_vault_reserve_hf107(rpc, eur_vault_contract, 0).unwrap_or_else(|_| BigUint::zero());
@@ -12020,7 +12140,31 @@ fn fetch_ethereum_balances_hf108(rpc: &str, address: &str, usdt_contract: &str, 
         eurs_reserve = format_decimal_units(&eurs_units, EthereumAsset::Eurs.decimals(), 2);
         eur_reserve_status = format!("EURJ vault reserves refreshed from {}", shorten_eth_address(eur_vault_contract));
     }
-    Ok((eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, reserve_status, eur_reserve_status, status))
+
+    let mut paxg = "-".to_string();
+    let mut xaut = "-".to_string();
+    let mut xauj_eth = "-".to_string();
+    let mut paxg_reserve = "-".to_string();
+    let mut xaut_reserve = "-".to_string();
+    let mut gold_reserve_status = "XAUJ contracts not configured".to_string();
+    if is_valid_eth_address(paxg_contract) {
+        paxg = format_decimal_units(&fetch_erc20_balance_hf102(rpc, paxg_contract, address)?, EthereumAsset::Paxg.decimals(), 6);
+    }
+    if is_valid_eth_address(xaut_contract) {
+        xaut = format_decimal_units(&fetch_erc20_balance_hf102(rpc, xaut_contract, address)?, EthereumAsset::Xaut.decimals(), 6);
+    }
+    if is_valid_eth_address(xauj_contract) {
+        xauj_eth = format_decimal_units(&fetch_erc20_balance_hf102(rpc, xauj_contract, address)?, StablecoinFamily::Gold.token_decimals(), 6);
+    }
+    if is_valid_eth_address(xau_vault_contract) {
+        let paxg_units = fetch_usdj_vault_reserve_hf107(rpc, xau_vault_contract, 0).unwrap_or_else(|_| BigUint::zero());
+        let xaut_units = fetch_usdj_vault_reserve_hf107(rpc, xau_vault_contract, 1).unwrap_or_else(|_| BigUint::zero());
+        paxg_reserve = format_decimal_units(&paxg_units, EthereumAsset::Paxg.decimals(), 6);
+        xaut_reserve = format_decimal_units(&xaut_units, EthereumAsset::Xaut.decimals(), 6);
+        gold_reserve_status = format!("XAUJ vault reserves refreshed from {}", shorten_eth_address(xau_vault_contract));
+    }
+
+    Ok((eth, usdt, usdc, usdj_eth, usdt_reserve, usdc_reserve, eurc, eurs, eurj_eth, eurc_reserve, eurs_reserve, paxg, xaut, xauj_eth, paxg_reserve, xaut_reserve, reserve_status, eur_reserve_status, gold_reserve_status, status))
 }
 
 fn function_selector_hex(signature: &str) -> String {
@@ -12082,11 +12226,11 @@ fn execute_usdj_vault_action_hf107(rpc: &str, chain_id: u64, wallet: &EthereumWa
     let usdj_contract = normalize_eth_address(usdj_contract)?;
     let vault_contract = normalize_eth_address(vault_contract)?;
     let receiver = normalize_eth_address(receiver)?;
-    let asset = match asset { EthereumAsset::Usdc => EthereumAsset::Usdc, EthereumAsset::Eurc => EthereumAsset::Eurc, EthereumAsset::Eurs => EthereumAsset::Eurs, _ => EthereumAsset::Usdt };
+    let asset = match asset { EthereumAsset::Usdc => EthereumAsset::Usdc, EthereumAsset::Eurc => EthereumAsset::Eurc, EthereumAsset::Eurs => EthereumAsset::Eurs, EthereumAsset::Paxg => EthereumAsset::Paxg, EthereumAsset::Xaut => EthereumAsset::Xaut, _ => EthereumAsset::Usdt };
     let stable_contract = normalize_eth_address(stable_contract)?;
     let amount_decimals = match mode {
         UsdjVaultMode::Infuse => asset.decimals(),
-        UsdjVaultMode::Melt => FIATJ_DECIMALS,
+        UsdjVaultMode::Melt => asset.family().unwrap_or(StablecoinFamily::Usd).token_decimals(),
     };
     let amount = parse_decimal_units(amount_text, amount_decimals)?;
     let nonce_val = ethereum_rpc_call_any_hf102(rpc, "eth_getTransactionCount", serde_json::json!([wallet.address.clone(), "pending"]))?;

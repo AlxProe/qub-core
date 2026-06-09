@@ -1,4 +1,4 @@
-﻿# QUB Core
+# QUB Core
 
 QUB Core is the reference implementation of the QUB network.
 
@@ -6,7 +6,7 @@ It is a from-scratch Rust implementation of a non-EVM, UTXO-based, CPU/GPU Proof
 
 Current open-source baseline:
 
-QUB Core v1.7.0 HF110
+QUB Core v1.7.1 HF113
 
 ## What is included
 

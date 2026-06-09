@@ -2,7 +2,7 @@ use crate::*;
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.0/"; // HF110
+const USER_AGENT: &str = "/QUB Core:1.7.1/"; // HF111
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -948,6 +948,14 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
     // least one official/direct TCP seed sample so a stale published tip cannot
     // green-light an old local parent while the live seed already moved ahead.
     if direct_contacted == 0 || best_height == 0 {
+        // HF113: if all official/direct seeds are temporarily unreachable, keep
+        // the network alive only when a directly reachable peer quorum agrees
+        // with our validated local tip. This avoids seed dependency without
+        // trusting one random future/ghost peer.
+        if hf113_peer_quorum_greenlight(settings, local, 12, timeout_ms.max(420)) {
+            mark_fresh_tip_trusted(settings, local);
+            return true;
+        }
         return false;
     }
     if best_height > local.height() {
@@ -1028,6 +1036,103 @@ fn best_reachable_peer_tip(settings: &Settings, max_peers: usize, timeout_ms: u6
         }
     }
     Ok((contacted, best_height, best_tip))
+}
+
+
+/// HF113/v1.7.1: if official seeds are temporarily unavailable, do not shut
+/// the whole network down. Allow mining only when directly reachable peers give
+/// a conservative quorum view that is compatible with the local validated tip.
+/// A single random future/ghost peer is telemetry only and cannot green-light or
+/// pause mining by itself.
+fn hf113_peer_quorum_greenlight(settings: &Settings, local: &ChainState, max_peers: usize, timeout_ms: u64) -> bool {
+    let Ok(peers) = prioritized_outbound_peers(settings, max_peers.max(3).min(16)) else { return false; };
+    let mut contacted = 0usize;
+    let mut compatible = 0usize;
+    let mut same_tip = 0usize;
+    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
+    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
+    let local_height = local.height();
+    let local_tip = local.tip_hash().to_string();
+    let per_peer = Duration::from_millis(timeout_ms.max(120).min(700));
+
+    for addr in peers.into_iter() {
+        if should_skip_outbound(settings, &addr) { continue; }
+        let Ok(info) = probe_peer(settings, &addr, per_peer) else { continue; };
+        if info.height == 0 { continue; }
+        contacted = contacted.saturating_add(1);
+        if info.height > local_height {
+            *ahead_counts.entry((info.height, info.tip_hash.clone())).or_insert(0) += 1;
+            continue;
+        }
+        if info.height == local_height && !info.tip_hash.trim().is_empty() && info.tip_hash != local_tip {
+            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+            continue;
+        }
+        if local_is_at_or_past_tip(local, info.height, &info.tip_hash) {
+            compatible = compatible.saturating_add(1);
+            if info.height == local_height && (info.tip_hash.trim().is_empty() || info.tip_hash == local_tip) {
+                same_tip = same_tip.saturating_add(1);
+            }
+        }
+    }
+
+    // Two directly reachable peers agreeing on a future tip means we should not
+    // green-light the old parent. One peer alone is not enough; it could be a
+    // stale/private/future telemetry row.
+    if ahead_counts.values().any(|count| *count >= 2) { return false; }
+    if conflict_counts.values().any(|count| *count >= 2) { return false; }
+
+    // Strongest fallback: two peers agree with our exact current tip. If only
+    // older peers are reachable, allow when at least two are compatible ancestors
+    // and none provided a quorum-ahead/quorum-conflict signal.
+    same_tip >= 2 || (contacted >= 2 && compatible >= 2)
+}
+
+/// HF113/v1.7.1: lightweight active-mining pause probe. This is intentionally
+/// fast and non-repairing: it can stop workers within a few seconds when the
+/// official/direct chain or a peer quorum has moved, without making the miner
+/// continue hashing while a heavy catch-up function is blocked.
+pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, parent_hash: Hash256, timeout_ms: u64) -> Option<String> {
+    if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan") {
+        return None;
+    }
+    let parent_hash_s = parent_hash.to_string();
+
+    if let Ok((contacted, official_h, official_tip)) = best_official_peer_tip(settings, timeout_ms.max(180).min(900)) {
+        if contacted > 0 {
+            if official_h > parent_height {
+                return Some(format!("official seed moved to #{} while candidate parent is #{}", official_h, parent_height));
+            }
+            if official_h == parent_height && !official_tip.trim().is_empty() && official_tip != parent_hash_s {
+                return Some(format!("official seed reports a different hash at #{}", parent_height));
+            }
+            return None;
+        }
+    }
+
+    // If no official seed could be sampled, use direct peer quorum only. A single
+    // high/future peer is ignored so the old orange/future-tip problem cannot
+    // stop otherwise healthy miners.
+    let Ok(peers) = prioritized_outbound_peers(settings, 12) else { return None; };
+    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
+    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
+    let per_peer = Duration::from_millis(timeout_ms.max(120).min(550));
+    for addr in peers.into_iter() {
+        let Ok(info) = probe_peer(settings, &addr, per_peer) else { continue; };
+        if info.height == 0 { continue; }
+        if info.height > parent_height {
+            *ahead_counts.entry((info.height, info.tip_hash.clone())).or_insert(0) += 1;
+        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() && info.tip_hash != parent_hash_s {
+            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+        }
+    }
+    if let Some(((height, _), count)) = ahead_counts.iter().find(|(_, count)| **count >= 2) {
+        return Some(format!("direct peer quorum ({count}) moved to #{} while candidate parent is #{}", height, parent_height));
+    }
+    if let Some((_, count)) = conflict_counts.iter().find(|(_, count)| **count >= 2) {
+        return Some(format!("direct peer quorum ({count}) disagrees at candidate parent #{}", parent_height));
+    }
+    None
 }
 
 fn best_known_live_tip(settings: &Settings, report: &mut P2PSyncReport, timeout_ms: u64) -> (usize, u32, String) {
@@ -1544,7 +1649,7 @@ pub fn hf110_deep_official_repair(settings: &Settings, total_timeout_ms: u64) ->
         return finish_report(settings, report);
     }
 
-    // HF110/v1.7.0: this is the heavy but safe repair used by manual Repair and
+    // HF111/v1.7.1: this is the heavy but safe repair used by manual Repair and
     // GUI auto-heal when a miner has been behind for too long. It is official-
     // source only: first the fresh HTTP tail/snapshot, then official direct full
     // chain, then suffix/overlap repair. All adopted blocks are consensus-
@@ -3286,6 +3391,56 @@ pub fn mining_parent_guard(settings: &Settings, parent_height: u32, expected_par
             mark_fresh_tip_trusted(settings, &local);
         }
     }
+    finish_report(settings, report)
+}
+
+/// HF113/v1.7.1: fast submit guard used after a nonce was found. Do not run a
+/// heavy repair here; every second spent verifying before relay increases stale
+/// risk, especially for pool blocks with multiple transactions. The outer miner
+/// loop will perform deep repair/rebuild after this rejects a stale candidate.
+pub fn mining_parent_submit_guard(settings: &Settings, parent_height: u32, expected_parent_hash: Hash256) -> Result<P2PSyncReport> {
+    let mut report = P2PSyncReport::default();
+    if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan") {
+        return finish_report(settings, report);
+    }
+    let local = load_chain_for_hf90_catchup(settings)?;
+    validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+    if local.height() != parent_height || local.tip_hash() != expected_parent_hash {
+        bail!(
+            "mining submit stale: local tip is #{} {}, candidate parent is #{} {}",
+            local.height(),
+            local.tip_hash(),
+            parent_height,
+            expected_parent_hash
+        );
+    }
+    if let Some(reason) = hf113_live_tip_pause_reason(settings, parent_height, expected_parent_hash, 520) {
+        bail!("mining submit paused by fast canonical guard: {reason}");
+    }
+    let (direct_contacted, best_direct_height, conflicts) = direct_parent_view(
+        settings,
+        parent_height,
+        &expected_parent_hash.to_string(),
+        settings.p2p.max_outbound_peers.max(6).min(10),
+        360,
+    )?;
+    report.peers_contacted = report.peers_contacted.max(direct_contacted);
+    report.best_peer_height = report.best_peer_height.max(best_direct_height);
+    if !conflicts.is_empty() {
+        bail!(
+            "mining submit paused: direct peer(s) disagree at candidate parent #{}: {}",
+            parent_height,
+            conflicts.join(", ")
+        );
+    }
+    if best_direct_height > parent_height {
+        bail!(
+            "mining submit paused: direct peer height {} is ahead of candidate parent #{}",
+            best_direct_height,
+            parent_height
+        );
+    }
+    mark_fresh_tip_trusted(settings, &local);
     finish_report(settings, report)
 }
 

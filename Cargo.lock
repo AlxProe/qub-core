@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "qubd"
-version = "1.6.9"
+version = "1.7.1"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2612,6 +2612,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tiny-keccak",
  "toml 0.8.23",
  "webbrowser",
  "wgpu",
@@ -3236,6 +3237,15 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]

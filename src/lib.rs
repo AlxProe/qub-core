@@ -2933,6 +2933,78 @@ pub fn verified_governance_decision_marker_script(moderator: &Address, report_id
     Ok(ScriptBuf(format!("VGOV1|decision|{}|{}|{}|{}", moderator, report_id, decision, slash_bps).into_bytes()))
 }
 
+
+// HF112 / USDJ Bridge v1 marker scaffold.
+// This is intentionally separated from consensus activation. Full QUB-chain
+// USDJ accounting should be enabled only by a future explicit bridge activation.
+pub const USDJ_BRIDGE_TOLL_BPS: u16 = 100;
+pub const MAINNET_USDJ_BRIDGE_PROTOCOL_ADDRESS: &str = "qub1a229a209ca3fc2b3066f6f31d4b27c9d663c46959346d1";
+const USDJ_BRIDGE_SCRIPT_PREFIX: &[u8] = b"BRDG1|";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsdjBridgeMarker {
+    EthToQubClaim { eth_tx: String, eth_log_index: u32, recipient: Address, gross_units: u128, toll_units: u128, net_units: u128 },
+    QubToEthExit { sender: Address, eth_recipient: String, release_units: u128, toll_units: u128, debit_units: u128 },
+}
+
+pub fn usdj_bridge_toll_units(amount_units: u128) -> u128 {
+    amount_units.saturating_mul(USDJ_BRIDGE_TOLL_BPS as u128) / 10_000u128
+}
+
+fn bridge_clean_ascii(input: &str, max_bytes: usize, label: &str) -> Result<String> {
+    let s = input.trim();
+    if s.is_empty() { bail!("{label} cannot be empty"); }
+    if s.len() > max_bytes { bail!("{label} too long; max {max_bytes} bytes"); }
+    if !s.chars().all(|c| c.is_ascii() && c.is_ascii_graphic()) { bail!("{label} must be printable ASCII"); }
+    if s.contains('|') { bail!("{label} cannot contain pipe characters"); }
+    Ok(s.to_string())
+}
+
+pub fn usdj_bridge_eth_to_qub_claim_marker_script(eth_tx: &str, eth_log_index: u32, recipient: &Address, gross_units: u128) -> Result<ScriptBuf> {
+    let eth_tx = bridge_clean_ascii(eth_tx, 96, "Ethereum tx hash")?;
+    if gross_units == 0 { bail!("gross USDJ amount must be non-zero"); }
+    let toll_units = usdj_bridge_toll_units(gross_units);
+    let net_units = gross_units.saturating_sub(toll_units);
+    Ok(ScriptBuf(format!("BRDG1|eth_to_qub|{}|{}|{}|{}|{}|{}", eth_tx, eth_log_index, recipient, gross_units, toll_units, net_units).into_bytes()))
+}
+
+pub fn usdj_bridge_qub_to_eth_exit_marker_script(sender: &Address, eth_recipient: &str, release_units: u128) -> Result<ScriptBuf> {
+    let eth_recipient = bridge_clean_ascii(eth_recipient, 64, "Ethereum recipient")?;
+    if !eth_recipient.starts_with("0x") || eth_recipient.len() != 42 { bail!("Ethereum recipient must be a 0x address"); }
+    if release_units == 0 { bail!("release USDJ amount must be non-zero"); }
+    let toll_units = usdj_bridge_toll_units(release_units);
+    let debit_units = release_units.saturating_add(toll_units);
+    Ok(ScriptBuf(format!("BRDG1|qub_to_eth|{}|{}|{}|{}|{}", sender, eth_recipient, release_units, toll_units, debit_units).into_bytes()))
+}
+
+pub fn parse_usdj_bridge_marker_script(script: &ScriptBuf) -> Option<UsdjBridgeMarker> {
+    let b = script.as_bytes();
+    if !b.starts_with(USDJ_BRIDGE_SCRIPT_PREFIX) { return None; }
+    let raw = std::str::from_utf8(b).ok()?;
+    let mut parts = raw.split('|');
+    if parts.next()? != "BRDG1" { return None; }
+    match parts.next()? {
+        "eth_to_qub" => {
+            let eth_tx = parts.next()?.to_string();
+            let eth_log_index = parts.next()?.parse::<u32>().ok()?;
+            let recipient = Address::from_str(parts.next()?).ok()?;
+            let gross_units = parts.next()?.parse::<u128>().ok()?;
+            let toll_units = parts.next()?.parse::<u128>().ok()?;
+            let net_units = parts.next()?.parse::<u128>().ok()?;
+            Some(UsdjBridgeMarker::EthToQubClaim { eth_tx, eth_log_index, recipient, gross_units, toll_units, net_units })
+        }
+        "qub_to_eth" => {
+            let sender = Address::from_str(parts.next()?).ok()?;
+            let eth_recipient = parts.next()?.to_string();
+            let release_units = parts.next()?.parse::<u128>().ok()?;
+            let toll_units = parts.next()?.parse::<u128>().ok()?;
+            let debit_units = parts.next()?.parse::<u128>().ok()?;
+            Some(UsdjBridgeMarker::QubToEthExit { sender, eth_recipient, release_units, toll_units, debit_units })
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_verified_governance_marker_script(script: &ScriptBuf, settings: &Settings) -> Option<VerifiedGovernanceMarker> {
     let b = script.as_bytes();
     if !b.starts_with(VERIFIED_GOVERNANCE_SCRIPT_PREFIX) { return None; }

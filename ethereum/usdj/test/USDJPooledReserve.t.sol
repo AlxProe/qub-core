@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {JinexUSD} from "../src/JinexUSD.sol";
 import {USDJReserveVault} from "../src/USDJReserveVault.sol";
 import {MockERC20} from "../src/MockERC20.sol";
+import {USDJBridgeGateway} from "../src/USDJBridgeGateway.sol";
 
 contract USDJPooledReserveTest {
     MockERC20 usdt;
@@ -55,4 +56,23 @@ contract USDJPooledReserveTest {
         try vault.melt(1, 1e6, address(this)) { ok = true; } catch { ok = false; }
         require(!ok, "empty USDC bucket must fail");
     }
+    function testBridgeToQubLocksUsdjAndAppliesOnePercentToll() public {
+        usdt.approve(address(vault), 100e6);
+        vault.infuse(0, 100e6, address(this));
+        USDJBridgeGateway gateway = new USDJBridgeGateway(address(usdj), address(this));
+        usdj.approve(address(gateway), 100e6);
+        uint256 nonce = gateway.bridgeToQub(100e6, "qub1examplebridgeclaimaddress000000000000000000");
+        require(nonce == 0, "nonce");
+        require(usdj.balanceOf(address(gateway)) == 100e6, "gateway balance");
+        require(gateway.lockedForQub() == 100e6, "locked");
+        require(gateway.tollFor(100e6) == 1e6, "toll");
+    }
+
+    function testReleaseFromQubRequiresVerifier() public {
+        USDJBridgeGateway gateway = new USDJBridgeGateway(address(usdj), address(this));
+        try gateway.releaseFromQub(bytes32(uint256(1)), address(this), 1e6, "") {
+            revert("expected verifier failure");
+        } catch {}
+    }
+
 }
