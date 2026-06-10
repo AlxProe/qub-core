@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.1/"; // HF111
+const USER_AGENT: &str = "/QUB Core:1.7.2/"; // HF114
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -877,6 +877,27 @@ fn official_tip_compatible_with_local(local: &ChainState, official_height: u32, 
     local_chain_contains_tip(local, official_height, official_tip)
 }
 
+
+/// HF114/v1.7.2: mainnet mining needs an exact live acknowledgement of the
+/// current local tip. A local chain that merely contains the official tip as an
+/// older ancestor is not canonical; it is a private/self-mined suffix and must be
+/// paused or re-anchored before any new candidate is built.
+fn hf114_official_tip_acknowledges_local(settings: &Settings, local: &ChainState, official_height: u32, official_tip: &str) -> bool {
+    if settings.network.name != "mainnet" {
+        return official_tip_compatible_with_local(local, official_height, official_tip);
+    }
+    if official_height == 0 || official_height != local.height() { return false; }
+    let official_tip = official_tip.trim();
+    !official_tip.is_empty() && official_tip == local.tip_hash().to_string()
+}
+
+fn hf114_official_tip_is_local_ancestor(settings: &Settings, local: &ChainState, official_height: u32, official_tip: &str) -> bool {
+    if settings.network.name != "mainnet" { return false; }
+    if official_height == 0 || official_height >= local.height() { return false; }
+    let official_tip = official_tip.trim();
+    official_tip.is_empty() || local_chain_contains_tip(local, official_height, official_tip)
+}
+
 fn official_tip_summary(settings: &Settings, report: &mut P2PSyncReport, timeout_ms: u64) -> (usize, u32, String) {
     let (contacted, height, tip) = best_official_peer_tip(settings, timeout_ms).unwrap_or((0, 0, String::new()));
     report.peers_contacted = report.peers_contacted.max(contacted);
@@ -887,7 +908,12 @@ fn official_tip_summary(settings: &Settings, report: &mut P2PSyncReport, timeout
 fn official_tip_greenlight(settings: &Settings, report: &mut P2PSyncReport, local: &ChainState, timeout_ms: u64) -> bool {
     let (contacted, official_height, official_tip) = official_tip_summary(settings, report, timeout_ms);
     if contacted == 0 { return false; }
-    if official_tip_compatible_with_local(local, official_height, &official_tip) {
+    let ok = if settings.network.name == "mainnet" {
+        hf114_official_tip_acknowledges_local(settings, local, official_height, &official_tip)
+    } else {
+        official_tip_compatible_with_local(local, official_height, &official_tip)
+    };
+    if ok {
         mark_fresh_tip_trusted(settings, local);
         return true;
     }
@@ -898,7 +924,12 @@ fn official_http_tip_greenlight(settings: &Settings, report: &mut P2PSyncReport,
     if let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700)) {
         report.peers_contacted = report.peers_contacted.max(1);
         report.best_peer_height = report.best_peer_height.max(height);
-        if official_tip_compatible_with_local(local, height, &tip) {
+        let ok = if settings.network.name == "mainnet" {
+            hf114_official_tip_acknowledges_local(settings, local, height, &tip)
+        } else {
+            official_tip_compatible_with_local(local, height, &tip)
+        };
+        if ok {
             mark_fresh_tip_trusted(settings, local);
             return true;
         }
@@ -958,10 +989,12 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
         }
         return false;
     }
-    if best_height > local.height() {
-        return false;
-    }
-    if !best_tip.trim().is_empty() && !local_chain_contains_tip(local, best_height, &best_tip) {
+    // HF114: exact mainnet acknowledgement only. HF113 still allowed
+    // "official tip is an ancestor of my longer local branch", which is the
+    // all-self-mined stale mode users were seeing. If local is ahead of the
+    // official/direct tip, do not hash on that suffix; the repair/re-anchor path
+    // will roll back or replace it before mining resumes.
+    if !hf114_official_tip_acknowledges_local(settings, local, best_height, &best_tip) {
         return false;
     }
 
@@ -1070,7 +1103,7 @@ fn hf113_peer_quorum_greenlight(settings: &Settings, local: &ChainState, max_pee
         }
         if local_is_at_or_past_tip(local, info.height, &info.tip_hash) {
             compatible = compatible.saturating_add(1);
-            if info.height == local_height && (info.tip_hash.trim().is_empty() || info.tip_hash == local_tip) {
+            if info.height == local_height && !info.tip_hash.trim().is_empty() && info.tip_hash == local_tip {
                 same_tip = same_tip.saturating_add(1);
             }
         }
@@ -1082,10 +1115,12 @@ fn hf113_peer_quorum_greenlight(settings: &Settings, local: &ChainState, max_pee
     if ahead_counts.values().any(|count| *count >= 2) { return false; }
     if conflict_counts.values().any(|count| *count >= 2) { return false; }
 
-    // Strongest fallback: two peers agree with our exact current tip. If only
-    // older peers are reachable, allow when at least two are compatible ancestors
-    // and none provided a quorum-ahead/quorum-conflict signal.
-    same_tip >= 2 || (contacted >= 2 && compatible >= 2)
+    // HF114: fallback green-light also needs two peers to acknowledge the exact
+    // current tip. Compatible older ancestors are telemetry only; using them as OK
+    // made local-ahead self-mined branches look canonical during seed outages.
+    let _ = contacted;
+    let _ = compatible;
+    same_tip >= 2
 }
 
 /// HF113/v1.7.1: lightweight active-mining pause probe. This is intentionally
@@ -1103,8 +1138,16 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
             if official_h > parent_height {
                 return Some(format!("official seed moved to #{} while candidate parent is #{}", official_h, parent_height));
             }
-            if official_h == parent_height && !official_tip.trim().is_empty() && official_tip != parent_hash_s {
-                return Some(format!("official seed reports a different hash at #{}", parent_height));
+            if settings.network.name == "mainnet" && official_h < parent_height {
+                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF114 canonical acknowledgement/re-anchor", parent_height, official_h));
+            }
+            if official_h == parent_height {
+                if official_tip.trim().is_empty() && settings.network.name == "mainnet" {
+                    return Some(format!("official seed did not acknowledge candidate parent hash at #{}", parent_height));
+                }
+                if !official_tip.trim().is_empty() && official_tip != parent_hash_s {
+                    return Some(format!("official seed reports a different hash at #{}", parent_height));
+                }
             }
             return None;
         }
@@ -1112,18 +1155,27 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
 
     // If no official seed could be sampled, use direct peer quorum only. A single
     // high/future peer is ignored so the old orange/future-tip problem cannot
-    // stop otherwise healthy miners.
+    // stop otherwise healthy miners. HF114 additionally requires two peers to
+    // acknowledge the exact candidate parent before mainnet miners keep hashing
+    // during a seed outage; older compatible ancestors are not enough.
     let Ok(peers) = prioritized_outbound_peers(settings, 12) else { return None; };
+    let mut contacted = 0usize;
+    let mut same_parent = 0usize;
     let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
     let mut conflict_counts: HashMap<String, usize> = HashMap::new();
     let per_peer = Duration::from_millis(timeout_ms.max(120).min(550));
     for addr in peers.into_iter() {
         let Ok(info) = probe_peer(settings, &addr, per_peer) else { continue; };
         if info.height == 0 { continue; }
+        contacted = contacted.saturating_add(1);
         if info.height > parent_height {
             *ahead_counts.entry((info.height, info.tip_hash.clone())).or_insert(0) += 1;
-        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() && info.tip_hash != parent_hash_s {
-            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() {
+            if info.tip_hash == parent_hash_s {
+                same_parent = same_parent.saturating_add(1);
+            } else {
+                *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+            }
         }
     }
     if let Some(((height, _), count)) = ahead_counts.iter().find(|(_, count)| **count >= 2) {
@@ -1132,9 +1184,11 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
     if let Some((_, count)) = conflict_counts.iter().find(|(_, count)| **count >= 2) {
         return Some(format!("direct peer quorum ({count}) disagrees at candidate parent #{}", parent_height));
     }
+    if settings.network.name == "mainnet" && contacted >= 2 && same_parent < 2 {
+        return Some(format!("candidate parent #{} is not acknowledged by two direct peers; preventing local-stale self-mining", parent_height));
+    }
     None
 }
-
 fn best_known_live_tip(settings: &Settings, report: &mut P2PSyncReport, timeout_ms: u64) -> (usize, u32, String) {
     let (official_contacted, official_height, official_tip) = official_tip_summary(settings, report, timeout_ms.max(150));
     if settings.network.name == "mainnet" {
@@ -2326,6 +2380,225 @@ fn apply_official_tail_snapshot(settings: &Settings, local_before: &ChainState, 
     Ok((repaired, appended_from_tail))
 }
 
+
+/// HF114/v1.7.2: official-tail re-anchor for local-ahead/self-mined stale
+/// branches. The normal tail sync is append/reorg-forward only; this path is
+/// deliberately separate because it is allowed to replace a longer local suffix
+/// with the shorter official canonical prefix/tail after full consensus replay.
+fn apply_official_tail_snapshot_hf114_reanchor(settings: &Settings, local_before: &ChainState, tail: OfficialTailSnapshot) -> Result<(ChainState, usize)> {
+    if settings.network.name != "mainnet" { bail!("HF114 re-anchor is mainnet-only"); }
+    if tail.network != settings.network.name { bail!("tail network mismatch"); }
+    if tail.blocks.is_empty() { bail!("empty tail snapshot"); }
+    let local_height = local_before.height();
+    if tail.tip_height > local_height.saturating_add(1) {
+        bail!("tail tip #{} is ahead of local #{}; use normal catch-up", tail.tip_height, local_height);
+    }
+
+    let mut anchor_height: Option<u32> = None;
+    for (idx, block) in tail.blocks.iter().enumerate() {
+        let height = tail.start_height.saturating_add(idx as u32);
+        if height > local_height { break; }
+        if local_before.blocks.get(height as usize).map(|b| b.block_hash()) == Some(block.block_hash()) {
+            anchor_height = Some(height);
+        }
+    }
+    let anchor = anchor_height.context("official tail has no common ancestor with local chain for HF114 re-anchor")?;
+
+    let mut candidate_blocks = local_before.blocks[..=anchor as usize].to_vec();
+    let mut appended_from_tail = 0usize;
+    for (idx, block) in tail.blocks.into_iter().enumerate() {
+        let height = tail.start_height.saturating_add(idx as u32);
+        if height <= anchor { continue; }
+        if height != candidate_blocks.len() as u32 {
+            bail!("tail has a height gap during HF114 re-anchor: got #{}, expected #{}", height, candidate_blocks.len());
+        }
+        candidate_blocks.push(block);
+        appended_from_tail = appended_from_tail.saturating_add(1);
+    }
+
+    let mut candidate = ChainState::from_blocks(candidate_blocks, settings)?;
+    if candidate.height() != tail.tip_height {
+        bail!("tail metadata height #{} does not match HF114 re-anchor height #{}", tail.tip_height, candidate.height());
+    }
+    if candidate.tip_hash().to_string() != tail.tip_hash {
+        bail!("tail metadata hash {} does not match HF114 re-anchor tip {}", tail.tip_hash, candidate.tip_hash());
+    }
+    validate_chain_consensus_checkpoints(settings, &candidate.blocks)?;
+
+    // Keep valid local mempool transactions, but rebuild them against the
+    // canonical re-anchored chain so transactions already mined on the abandoned
+    // local suffix are either reaccepted safely or dropped by normal policy.
+    let keep_mempool = local_before.mempool.clone();
+    candidate.rebuild_mempool_from(keep_mempool, settings);
+    let rolled_back = local_height.saturating_sub(candidate.height()) as usize;
+    Ok((candidate, rolled_back.saturating_add(appended_from_tail)))
+}
+
+/// HF114/v1.7.2: when the local node is ahead only because it kept mining a
+/// private stale suffix, re-anchor it to the official HTTP tail immediately. This
+/// removes the old user workaround of stopping mining and waiting for canonical
+/// height to overtake the local height.
+fn sync_official_http_tail_reanchor_hf114(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let mut report = P2PSyncReport::default();
+    if settings.network.name != "mainnet" { return finish_report(settings, report); }
+    let mut urls = official_http_tail_urls(settings);
+    if urls.is_empty() { return finish_report(settings, report); }
+
+    let local_before = load_chain_for_hf90_catchup(settings)?;
+    let local_height_before = local_before.height();
+    let local_tip_before = local_before.tip_hash().to_string();
+
+    let (_, mut official_height, mut official_tip) = official_tip_summary(settings, &mut report, 420);
+    if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
+        report.peers_contacted = report.peers_contacted.max(1);
+        report.best_peer_height = report.best_peer_height.max(http_height);
+        if http_height >= official_height || official_tip.trim().is_empty() {
+            official_height = http_height;
+            official_tip = http_tip;
+        }
+    }
+
+    let same_height_conflict = official_height == local_height_before
+        && !official_tip.trim().is_empty()
+        && official_tip != local_tip_before;
+    let local_ahead = hf114_official_tip_is_local_ancestor(settings, &local_before, official_height, &official_tip);
+    if !same_height_conflict && !local_ahead {
+        report.height = local_height_before;
+        report.tip_hash = local_tip_before;
+        return finish_report(settings, report);
+    }
+
+    urls.sort_by_key(|url| official_tail_window_from_url(url));
+    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
+    for url in urls {
+        if Instant::now() >= deadline { break; }
+        let left_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u64::MAX as u128) as u64;
+        let per_url_timeout = left_ms.min(8_000).max(1_500);
+        report.peers_contacted = report.peers_contacted.saturating_add(1);
+        let raw = match download_http_text(&url, per_url_timeout, "official-tail-hf114-reanchor") {
+            Ok(raw) => raw,
+            Err(_) => { report.peer_errors = report.peer_errors.saturating_add(1); continue; }
+        };
+        let tail: OfficialTailSnapshot = match serde_json::from_str(&raw) {
+            Ok(tail) => tail,
+            Err(_) => { report.peer_errors = report.peer_errors.saturating_add(1); continue; }
+        };
+        report.best_peer_height = report.best_peer_height.max(tail.tip_height);
+        if official_height > 0 && tail.tip_height != official_height { continue; }
+        if !official_tip.trim().is_empty() && tail.tip_hash != official_tip { continue; }
+
+        let (candidate, replaced_hint) = match apply_official_tail_snapshot_hf114_reanchor(settings, &local_before, tail) {
+            Ok(v) => v,
+            Err(_) => { report.peer_errors = report.peer_errors.saturating_add(1); continue; }
+        };
+        if candidate.height() < local_height_before
+            || (candidate.height() == local_height_before && candidate.tip_hash().to_string() != local_tip_before)
+        {
+            save_chain(settings, &candidate)?;
+            mark_fresh_tip_trusted(settings, &candidate);
+            report.chains_adopted = report.chains_adopted.saturating_add(1);
+            report.blocks_connected = report.blocks_connected.saturating_add(replaced_hint);
+            report.height = candidate.height();
+            report.tip_hash = candidate.tip_hash().to_string();
+            return finish_report(settings, report);
+        }
+    }
+
+    // If the stale private suffix is longer than the published tail windows, use
+    // the full official snapshot as a last re-anchor path. This is intentionally
+    // reached only for local-ahead/same-height-conflict repair, not normal mining.
+    let snapshot_budget = total_timeout_ms.max(30_000).min(90_000);
+    if let Ok(snapshot) = sync_official_http_snapshot_reanchor_hf114(settings, official_height, &official_tip, snapshot_budget) {
+        let adopted = snapshot.chains_adopted > 0;
+        merge_sync_reports(&mut report, snapshot);
+        if adopted { return finish_report(settings, report); }
+    }
+
+    report.height = local_height_before;
+    report.tip_hash = local_tip_before;
+    finish_report(settings, report)
+}
+
+/// HF114/v1.7.2: full official HTTP snapshot re-anchor fallback. This is used
+/// only when mainnet local state is ahead/same-height-conflicting and the shorter
+/// tail windows do not include the fork ancestor. It is slower than tail repair but
+/// removes the old requirement to wait for the canonical chain to overtake a long
+/// private self-mined suffix.
+fn sync_official_http_snapshot_reanchor_hf114(settings: &Settings, official_height_hint: u32, official_tip_hint: &str, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let mut report = P2PSyncReport::default();
+    if settings.network.name != "mainnet" { return finish_report(settings, report); }
+    let urls = official_http_snapshot_urls(settings);
+    if urls.is_empty() { return finish_report(settings, report); }
+
+    let local_before = load_chain_for_hf90_catchup(settings)?;
+    let local_height_before = local_before.height();
+    let local_tip_before = local_before.tip_hash().to_string();
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("qub-{}-official-snapshot-hf114-reanchor-{}.json", settings.network.name, std::process::id()));
+
+    for url in urls {
+        let _ = fs::remove_file(&tmp);
+        report.peers_contacted = report.peers_contacted.saturating_add(1);
+        if let Err(err) = download_http_snapshot_to(&tmp, &url, total_timeout_ms.max(8_000)) {
+            report.peer_errors = report.peer_errors.saturating_add(1);
+            let _ = fs::remove_file(&tmp);
+            if !err.to_string().contains("404") { /* try next official URL */ }
+            continue;
+        }
+
+        let raw = fs::read_to_string(&tmp).with_context(|| format!("failed reading HF114 re-anchor snapshot from {url}"))?;
+        let persisted: PersistedChainState = serde_json::from_str(&raw).with_context(|| format!("invalid HF114 re-anchor snapshot json from {url}"))?;
+        let (mut candidate, connected_hint) = apply_official_snapshot_fast_path(settings, &local_before, persisted)
+            .with_context(|| format!("HF114 re-anchor snapshot failed consensus replay from {url}"))?;
+
+        validate_chain_consensus_checkpoints(settings, &candidate.blocks)?;
+        report.best_peer_height = report.best_peer_height.max(candidate.height());
+        if official_height_hint > 0 && candidate.height() < official_height_hint {
+            report.peer_errors = report.peer_errors.saturating_add(1);
+            continue;
+        }
+        if official_height_hint > 0
+            && candidate.height() == official_height_hint
+            && !official_tip_hint.trim().is_empty()
+            && candidate.tip_hash().to_string() != official_tip_hint.trim()
+        {
+            report.peer_errors = report.peer_errors.saturating_add(1);
+            continue;
+        }
+
+        if candidate.height() < local_height_before
+            || candidate.height() > local_height_before
+            || (candidate.height() == local_height_before && candidate.tip_hash().to_string() != local_tip_before)
+        {
+            let mut keep_mempool = local_before.mempool.clone();
+            keep_mempool.extend(candidate.mempool.clone());
+            candidate.rebuild_mempool_from(keep_mempool, settings);
+            save_chain(settings, &candidate)?;
+            mark_fresh_tip_trusted(settings, &candidate);
+            let height_delta = if candidate.height() >= local_height_before {
+                candidate.height().saturating_sub(local_height_before) as usize
+            } else {
+                local_height_before.saturating_sub(candidate.height()) as usize
+            };
+            report.chains_adopted = report.chains_adopted.saturating_add(1);
+            report.blocks_connected = report.blocks_connected.saturating_add(connected_hint.max(height_delta));
+            report.height = candidate.height();
+            report.tip_hash = candidate.tip_hash().to_string();
+            let _ = fs::remove_file(&tmp);
+            return finish_report(settings, report);
+        }
+
+        report.height = local_height_before;
+        report.tip_hash = local_tip_before.clone();
+        let _ = fs::remove_file(&tmp);
+        return finish_report(settings, report);
+    }
+
+    let _ = fs::remove_file(&tmp);
+    finish_report(settings, report)
+}
+
+
 /// HF70/v1.5.8: static HTTP tail snapshot. This is much smaller than full
 /// chain.json and covers the common case where a miner is 1..1024 blocks behind.
 /// The tail is not trusted blindly: every block is connected with full consensus
@@ -3152,15 +3425,45 @@ fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, 
     if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
         report.peers_contacted = report.peers_contacted.max(1);
         report.best_peer_height = report.best_peer_height.max(http_height);
-        if http_height >= official_height {
+        if http_height >= official_height || official_tip.trim().is_empty() {
             official_height = http_height;
             official_tip = http_tip;
         }
     }
-    if official_tip_compatible_with_local(local, official_height, &official_tip) {
+
+    if hf114_official_tip_acknowledges_local(settings, local, official_height, &official_tip) {
         mark_fresh_tip_trusted(settings, local);
         return Ok(());
     }
+
+    // HF114: local-ahead is not "safe but ahead"; it is an unacknowledged
+    // private suffix. Re-anchor it immediately to the official HTTP tail if the
+    // official tip is an ancestor, instead of waiting for canonical height to pass
+    // the local height while the user manually stops mining.
+    let initial_same_height_conflict = official_height == local.height()
+        && !official_tip.trim().is_empty()
+        && official_tip != local.tip_hash().to_string();
+    let initial_local_ahead = hf114_official_tip_is_local_ancestor(settings, local, official_height, &official_tip);
+    if settings.network.name == "mainnet" && (initial_local_ahead || initial_same_height_conflict) {
+        let reanchor = sync_official_http_tail_reanchor_hf114(settings, timeout_ms.min(18_000).max(6_000))?;
+        merge_sync_reports(report, reanchor);
+        *local = load_chain_for_hf90_catchup(settings)?;
+        validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
+            return Ok(());
+        }
+        let (_, check_height, check_tip) = official_tip_summary(settings, report, 420);
+        if hf114_official_tip_acknowledges_local(settings, local, check_height, &check_tip) {
+            mark_fresh_tip_trusted(settings, local);
+            return Ok(());
+        }
+        bail!(
+            "mining green-light wait: local tip #{} is not acknowledged by official/direct canonical tip #{} after HF114 re-anchor attempt. Mining is paused before extending a self-mined stale branch.",
+            local.height(),
+            check_height
+        );
+    }
+
     if official_height > local.height() && hf97_uncatchable_tip_quarantined(settings, local, official_height) {
         report.best_peer_height = local.height();
         report.height = local.height();
@@ -3176,30 +3479,53 @@ fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, 
         let heal = hf90_mining_catchup(settings, timeout_ms.max(HF82_PARENT_CATCHUP_MS))?;
         merge_sync_reports(report, heal);
         *local = load_chain_for_hf90_catchup(settings)?;
-        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS)
-        { return Ok(()); }
+        if settings.network.name == "mainnet" {
+            let reanchor = sync_official_http_tail_reanchor_hf114(settings, timeout_ms.min(18_000).max(6_000))?;
+            merge_sync_reports(report, reanchor);
+            *local = load_chain_for_hf90_catchup(settings)?;
+        }
+        validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS) {
+            return Ok(());
+        }
 
         let (_, mut latest_official_height, mut latest_official_tip) = official_tip_summary(settings, report, 350);
         if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
             report.peers_contacted = report.peers_contacted.max(1);
             report.best_peer_height = report.best_peer_height.max(http_height);
-            if http_height >= latest_official_height {
+            if http_height >= latest_official_height || latest_official_tip.trim().is_empty() {
                 latest_official_height = http_height;
                 latest_official_tip = http_tip;
             }
         }
-        if official_tip_compatible_with_local(local, latest_official_height, &latest_official_tip) {
+        if hf114_official_tip_acknowledges_local(settings, local, latest_official_height, &latest_official_tip) {
             mark_fresh_tip_trusted(settings, local);
             return Ok(());
         }
+
+        let latest_same_height_conflict = latest_official_height == local.height()
+            && !latest_official_tip.trim().is_empty()
+            && latest_official_tip != local.tip_hash().to_string();
+        let latest_local_ahead = hf114_official_tip_is_local_ancestor(settings, local, latest_official_height, &latest_official_tip);
+        if settings.network.name == "mainnet" && (latest_local_ahead || latest_same_height_conflict) {
+            let reanchor = sync_official_http_tail_reanchor_hf114(settings, timeout_ms.min(18_000).max(6_000))?;
+            merge_sync_reports(report, reanchor);
+            *local = load_chain_for_hf90_catchup(settings)?;
+            validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+            if hf104_canonical_greenlight(settings, report, local, 700) {
+                return Ok(());
+            }
+        }
+
         if latest_official_height > local.height() {
             let gap = latest_official_height.saturating_sub(local.height());
             if gap > 4096 {
                 let http = sync_official_http_snapshot(settings, timeout_ms.min(20_000).max(10_000))?;
                 merge_sync_reports(report, http);
                 *local = load_chain_for_hf90_catchup(settings)?;
-                if hf104_canonical_greenlight(settings, report, local, 700)
-                { return Ok(()); }
+                if hf104_canonical_greenlight(settings, report, local, 700) {
+                    return Ok(());
+                }
             }
         }
 
@@ -3219,14 +3545,24 @@ fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, 
             && latest_official_tip != local.tip_hash().to_string()
         {
             bail!(
-                "mining green-light wait: official seed tip at #{} differs from local tip. HF98 bounded repair is running before hashing.",
+                "mining green-light wait: official seed tip at #{} differs from local tip. HF114 bounded repair/re-anchor is running before hashing.",
+                latest_official_height
+            );
+        }
+        if settings.network.name == "mainnet"
+            && latest_official_height > 0
+            && latest_official_height < local.height()
+            && !hf114_official_tip_acknowledges_local(settings, local, latest_official_height, &latest_official_tip)
+        {
+            bail!(
+                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF114 prevents extending this stale suffix.",
+                local.height(),
                 latest_official_height
             );
         }
     }
     Ok(())
 }
-
 /// HF54/v1.5.2 hard template gate. This runs immediately before building a
 /// mining candidate and again immediately before submitting a found block.
 /// It prevents GUI/CLI miners from extending a local branch when direct peers
@@ -3280,6 +3616,9 @@ pub fn mining_parent_guard(settings: &Settings, parent_height: u32, expected_par
     local = load_chain_for_hf90_catchup(settings)?;
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_PARENT_GATE_MS)?;
+    if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
+        bail!("mining candidate paused by HF114: local parent #{} is not acknowledged by official/direct canonical view or exact peer quorum.", local.height());
+    }
 
     if local.height() != parent_height || local.tip_hash() != expected_parent_hash {
         bail!(
@@ -3497,6 +3836,9 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
 
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_FAST_GATE_MS)?;
+    if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
+        bail!("mining paused by HF114: local tip #{} is not acknowledged by official/direct canonical view or exact peer quorum. This prevents all-self-mined local stale branches.", local.height());
+    }
     if hf97_uncatchable_tip_quarantined(settings, &local, report.best_peer_height) {
         report.best_peer_height = local.height();
     }
@@ -3682,6 +4024,39 @@ fn relay_chain_to_known_peers(settings: &Settings, source_peer: Option<&str>) ->
 pub fn broadcast_tx(settings: &Settings, tx: &Transaction) -> Result<usize> {
     if !settings.p2p.enabled { return Ok(0); }
     broadcast(settings, WireMessage::Tx { tx: tx.clone() })
+}
+
+/// HF114/v1.7.2: exact, bounded transaction relay for GUI-created high-value
+/// actions. HF113 repeatedly rebroadcasted the whole mempool after JIN buys; on
+/// weak links that could tie up relay sockets and make mining look like block
+/// time slowed after a buy attempt. This path relays only the requested tx to a
+/// small official-first peer set with short per-peer timeouts.
+pub fn broadcast_tx_limited(settings: &Settings, tx: &Transaction, max_peers: usize, timeout_ms: u64) -> Result<usize> {
+    if !settings.p2p.enabled { return Ok(0); }
+    if hf106_jin_sale_standardness_policy(tx, settings).is_err() { return Ok(0); }
+    let chain = load_chain_for_hf90_catchup(settings)?;
+    let per_peer = Duration::from_millis(timeout_ms.max(150).min(2_000));
+    let mut sent = 0usize;
+    for addr in prioritized_outbound_peers(settings, max_peers.max(1).min(32))? {
+        if should_skip_outbound(settings, &addr) { continue; }
+        let Ok(mut stream) = connect_peer(&addr, per_peer) else { continue; };
+        let _ = stream.set_read_timeout(Some(per_peer));
+        let _ = stream.set_write_timeout(Some(per_peer));
+        let _ = send_version(&mut stream, settings, &chain);
+        if send_wire(&mut stream, &WireMessage::Tx { tx: tx.clone() }).is_ok() {
+            sent = sent.saturating_add(1);
+        }
+    }
+    Ok(sent)
+}
+
+pub fn rebroadcast_txid_limited(settings: &Settings, txid: &Hash256, max_peers: usize, timeout_ms: u64) -> Result<usize> {
+    if !settings.p2p.enabled { return Ok(0); }
+    let chain = load_chain_for_hf90_catchup(settings)?;
+    let Some(tx) = chain.mempool.iter().find(|tx| tx.txid() == *txid).cloned() else {
+        return Ok(0);
+    };
+    broadcast_tx_limited(settings, &tx, max_peers, timeout_ms)
 }
 
 fn relay_tx_to_known_peers(settings: &Settings, tx: &Transaction, source_peer: Option<&str>) -> Result<usize> {

@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.1";
+const APP_VERSION: &str = "v1.7.2";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -84,6 +84,7 @@ const ENJIN_MATRIX_RPC_URLS: &[&str] = &[
 const ENJIN_MATRIX_JIN_TOKEN_STORAGE_KEY: &str = "0xfa7484c926e764ee2a64df96876c814599971b5749ac43e0235e41b0d378691884fc0f7cf200fdee9785e65b2cef05e3471100000000000000000000000000003ba80a3778f04ebf45e806d19a05202501000000000000000000000000000000";
 const JIN_TOKEN_SUBSCAN_URL: &str = "https://matrix.subscan.io/multitoken_item/4423-1";
 const JIN_TOKEN_NFT_IO_URL: &str = "https://nft.io/asset/4423-1";
+const QUB_EXPLORER_URL: &str = "https://explorer.qubit-coin.io/";
 const USDJ_ETH_BACKING_NOTE: &str = "USDJ is designed as Jinex USD on QUB Chain, backed by USDT + USDC smart contracts on Ethereum through the future bridge.";
 const USDJ_BRIDGE_DISABLED_NOTE: &str = "Bridge contracts are not live yet. QUB-chain USDJ/EURJ mint/burn is shown as roadmap UI only.";
 const EURJ_ETH_BACKING_NOTE: &str = "EURJ is designed as Jinex EUR, backed by EURC + EURS smart contracts on Ethereum through the same pooled-reserve model as USDJ.";
@@ -248,7 +249,7 @@ const UI_ICON_NAMES: &[&str] = &[
     "address-balances", "crypto", "stablecoins", "import-private-key", "buy", "sell", "offer",
     "melt", "infuse", "convert", "jin-token", "usd", "eur", "gold", "usdj", "usdt", "usdc", "eurj", "eurc", "eurs", "xauj", "paxg", "xaut", "eth", "enj", "subscan-logo", "nft-io-logo", "auction", "list-asset",
     "pools", "create-pool", "join-pool", "pool-capacity", "pool-commission",
-    "to-right", "to-left", "full-to-right", "full-to-left",
+    "to-right", "to-left", "full-to-right", "full-to-left", "qub-explorer",
 ];
 
 
@@ -258,6 +259,21 @@ fn build_channel() -> &'static str {
 
 fn app_title() -> &'static str {
     if build_channel() == "testnet" { APP_TITLE_TESTNET } else { APP_TITLE }
+}
+
+
+fn qub_explorer_route_url(route: &str) -> String {
+    let clean = route.trim().trim_start_matches('/').trim_start_matches("#/");
+    if clean.is_empty() {
+        QUB_EXPLORER_URL.to_string()
+    } else {
+        format!("{}#/{}", QUB_EXPLORER_URL, clean)
+    }
+}
+
+fn qub_explorer_entity_url(kind: &str, id: &str) -> String {
+    let id = id.trim();
+    if id.is_empty() { QUB_EXPLORER_URL.to_string() } else { qub_explorer_route_url(&format!("{}/{}", kind.trim_matches('/'), id)) }
 }
 
 fn default_config_path() -> String {
@@ -4601,6 +4617,30 @@ del "%~f0"
         response.on_hover_text(tooltip)
     }
 
+
+    fn ui_explorer_url_button(&self, ui: &mut egui::Ui, url: &str, tooltip: &str) -> egui::Response {
+        let response = if let Some(texture) = self.icons.get("qub-explorer", ui.visuals().dark_mode) {
+            let sized = egui::load::SizedTexture::new(texture.id(), egui::vec2(21.0, 21.0));
+            ui.add(egui::Button::image_and_text(egui::Image::from_texture(sized).corner_radius(16), "").min_size(egui::vec2(34.0, 32.0)))
+        } else {
+            ui.add(egui::Button::new("↗").min_size(egui::vec2(34.0, 32.0)))
+        };
+        let clicked = response.clicked();
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tooltip);
+        if clicked { let _ = webbrowser::open(url); }
+        response
+    }
+
+    fn ui_explorer_route_button(&self, ui: &mut egui::Ui, route: &str, tooltip: &str) -> egui::Response {
+        let url = qub_explorer_route_url(route);
+        self.ui_explorer_url_button(ui, &url, tooltip)
+    }
+
+    fn ui_explorer_entity_button(&self, ui: &mut egui::Ui, kind: &str, id: &str, tooltip: &str) -> egui::Response {
+        let url = qub_explorer_entity_url(kind, id);
+        self.ui_explorer_url_button(ui, &url, tooltip)
+    }
+
     fn ui_tall_icon_button(&self, ui: &mut egui::Ui, icon: &str, fallback: &str, tooltip: &str, height: f32) -> egui::Response {
         let response = if let Some(texture) = self.icons.get(icon, ui.visuals().dark_mode) {
             let sized = egui::load::SizedTexture::new(texture.id(), egui::vec2(20.0, height.min(54.0)));
@@ -4805,6 +4845,7 @@ del "%~f0"
                         if self.ui_icon_button(ui, "create-pool", "Create pool").clicked() {
                             self.pool_dialog.create_open = true;
                         }
+                        self.ui_explorer_route_button(ui, "pools", "Open pools in QUB Explorer");
                     });
                 });
                 if !self.pool_activation_ready() {
@@ -4896,6 +4937,7 @@ del "%~f0"
                         ui.add_sized([MANAGER_W, ROW_H], egui::Label::new(egui::RichText::new(shorten_hash(&pool.manager_address)).monospace()));
                         ui.add_sized([PAID_W, ROW_H], egui::Label::new(format!("{} QUB", pool.total_paid_qub)));
                         ui.allocate_ui_with_layout(egui::vec2(ACTIONS_W, ROW_H), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            self.ui_explorer_entity_button(ui, "pool", &pool.pool_id, "Open pool in QUB Explorer");
                             if is_pool_mining {
                                 if self.ui_icon_button_enabled(ui, true, "stop-mining", "Stop").clicked() { self.stop_mining(); }
                             } else {
@@ -5023,6 +5065,7 @@ del "%~f0"
             ui.label(egui::RichText::new("Attached pool:").weak());
             ui.label(egui::RichText::new(&pool.name).strong());
             ui.monospace(shorten_hash(&pool.pool_id));
+            self.ui_explorer_entity_button(ui, "pool", &pool.pool_id, "Open managed pool in QUB Explorer");
         });
         ui.small(format!("Current: commission {:.2}% | capacity {} | active {} | open {}", pool.commission_bps as f64 / 100.0, pool.capacity_slots, pool.active_miners, pool.open_slots));
         let locked = matches!(self.pool_dialog.status, SendDialogStatus::Sending | SendDialogStatus::Pending);
@@ -5099,7 +5142,10 @@ del "%~f0"
             SendDialogStatus::Pending => {
                 ui.spinner();
                 ui.label(egui::RichText::new(format!("Pool {} pending", self.pool_dialog.action)).strong());
-                ui.monospace(&self.pool_dialog.txid);
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.pool_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.pool_dialog.txid, "Open pending pool transaction in QUB Explorer");
+                });
                 ui.label(&self.pool_dialog.message);
             }
             SendDialogStatus::Failed => {
@@ -5109,7 +5155,10 @@ del "%~f0"
             }
             SendDialogStatus::Confirmed => {
                 ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66,220,120), "Confirmed"); });
-                ui.monospace(&self.pool_dialog.txid);
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.pool_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.pool_dialog.txid, "Open confirmed pool transaction in QUB Explorer");
+                });
                 ui.label(&self.pool_dialog.message);
                 if ui.button("New pool action").clicked() { self.pool_dialog.status = SendDialogStatus::Editing; self.pool_dialog.message.clear(); self.pool_dialog.txid.clear(); }
             }
@@ -5131,13 +5180,23 @@ del "%~f0"
                 ui.horizontal(|ui| {
                     self.ui_icon(ui, "jin", 26.0);
                     ui.label(egui::RichText::new("JIN Public Protocol Sale").size(22.0).strong());
+                    self.ui_explorer_route_button(ui, "assets", "Open JIN asset view in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "activity", "Open JIN activity in QUB Explorer");
                     if ui.button("Refresh listings").clicked() { self.request_buy_jin_listings(ctx, true); }
                 });
                 ui.small("85,000,000 JIN Coin public sale from the JIN protocol reserve. Payments are in QUB only. Each purchase pays a deterministic 0.1% protocol fee split 50/50: 0.05% as miner fee and 0.05% to the JIN protocol address.");
                 ui.small("JIN Token bridge conversion is disabled until the Enjin Matrixchain bridge is live. Do not manually send funds to bridge addresses.");
                 ui.separator();
                 if self.buy_jin_dialog.loading { ui.small("Loading sale listings in the background..."); }
-                if !self.buy_jin_dialog.message.is_empty() { ui.label(&self.buy_jin_dialog.message); }
+                if !self.buy_jin_dialog.message.is_empty() {
+                    ui.label(&self.buy_jin_dialog.message);
+                    if !self.buy_jin_dialog.txid.trim().is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(&self.buy_jin_dialog.txid);
+                            self.ui_explorer_entity_button(ui, "tx", &self.buy_jin_dialog.txid, "Open JIN buy transaction in QUB Explorer");
+                        });
+                    }
+                }
                 let listings = self.buy_jin_dialog.listings.clone();
                 if listings.is_empty() {
                     ui.add_space(8.0);
@@ -5263,7 +5322,10 @@ del "%~f0"
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Permanent .qub registration").strong());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Permanent .qub registration").strong());
+                    self.ui_explorer_route_button(ui, "qns", "Open QNS in QUB Explorer");
+                });
                 ui.small(format!("Network: {} - Registered names: {} - Pools: {}", self.snapshot.network, self.snapshot.qns_count, self.snapshot.pools_count));
                 ui.add_space(8.0);
                 let locked = matches!(self.qns_dialog.status, QnsDialogStatus::Sending | QnsDialogStatus::Pending | QnsDialogStatus::Confirmed);
@@ -5307,9 +5369,38 @@ del "%~f0"
                         });
                     }
                     QnsDialogStatus::Sending => { ui.spinner(); ui.label(&self.qns_dialog.message); }
-                    QnsDialogStatus::Pending => { ui.spinner(); ui.label("Pending confirmation"); ui.monospace(&self.qns_dialog.txid); ui.label(&self.qns_dialog.message); if ui.button("Close").clicked() { want_close = true; } }
+                    QnsDialogStatus::Pending => {
+                        ui.spinner();
+                        ui.label("Pending confirmation");
+                        ui.horizontal(|ui| {
+                            ui.monospace(&self.qns_dialog.txid);
+                            self.ui_explorer_entity_button(ui, "tx", &self.qns_dialog.txid, "Open pending QNS transaction in QUB Explorer");
+                        });
+                        if !self.qns_dialog.name.trim().is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label("Name");
+                                self.ui_explorer_entity_button(ui, "qns", self.qns_dialog.name.trim(), "Open QNS name in QUB Explorer");
+                            });
+                        }
+                        ui.label(&self.qns_dialog.message);
+                        if ui.button("Close").clicked() { want_close = true; }
+                    }
                     QnsDialogStatus::Failed => { ui.horizontal(|ui| { self.ui_icon(ui, "failed", 18.0); ui.colored_label(egui::Color32::from_rgb(255,105,105), "Failed"); }); ui.label(&self.qns_dialog.message); ui.horizontal(|ui| { if ui.button("Close").clicked() { want_close = true; } if ui.button("Retry").clicked() { self.qns_dialog.status = QnsDialogStatus::Editing; self.qns_dialog.message.clear(); self.qns_dialog.txid.clear(); } }); }
-                    QnsDialogStatus::Confirmed => { ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66,220,120), "Success"); }); ui.monospace(&self.qns_dialog.txid); ui.label(&self.qns_dialog.message); if ui.button("Close").clicked() { want_close = true; } }
+                    QnsDialogStatus::Confirmed => {
+                        ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66,220,120), "Success"); });
+                        ui.horizontal(|ui| {
+                            ui.monospace(&self.qns_dialog.txid);
+                            self.ui_explorer_entity_button(ui, "tx", &self.qns_dialog.txid, "Open confirmed QNS transaction in QUB Explorer");
+                        });
+                        if !self.qns_dialog.name.trim().is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label("Name");
+                                self.ui_explorer_entity_button(ui, "qns", self.qns_dialog.name.trim(), "Open QNS name in QUB Explorer");
+                            });
+                        }
+                        ui.label(&self.qns_dialog.message);
+                        if ui.button("Close").clicked() { want_close = true; }
+                    }
                 }
             });
         if want_close { open = false; }
@@ -5364,9 +5455,26 @@ del "%~f0"
                         });
                     }
                     SendDialogStatus::Sending => { ui.spinner(); ui.label(&self.conversion_dialog.message); }
-                    SendDialogStatus::Pending => { ui.spinner(); ui.label("Pending confirmation"); ui.monospace(&self.conversion_dialog.txid); ui.label(&self.conversion_dialog.message); if ui.button("Close").clicked() { want_close = true; } }
+                    SendDialogStatus::Pending => {
+                        ui.spinner();
+                        ui.label("Pending confirmation");
+                        ui.horizontal(|ui| {
+                            ui.monospace(&self.conversion_dialog.txid);
+                            self.ui_explorer_entity_button(ui, "tx", &self.conversion_dialog.txid, "Open conversion transaction in QUB Explorer");
+                        });
+                        ui.label(&self.conversion_dialog.message);
+                        if ui.button("Close").clicked() { want_close = true; }
+                    }
                     SendDialogStatus::Failed => { ui.horizontal(|ui| { self.ui_icon(ui, "failed", 18.0); ui.colored_label(egui::Color32::from_rgb(255,105,105), "Failed"); }); ui.label(&self.conversion_dialog.message); ui.horizontal(|ui| { if ui.button("Close").clicked() { want_close = true; } if ui.button("Retry").clicked() { self.conversion_dialog.status = SendDialogStatus::Editing; self.conversion_dialog.message.clear(); self.conversion_dialog.txid.clear(); } }); }
-                    SendDialogStatus::Confirmed => { ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66,220,120), "Confirmed"); }); ui.monospace(&self.conversion_dialog.txid); ui.label(&self.conversion_dialog.message); if ui.button("Close").clicked() { want_close = true; } }
+                    SendDialogStatus::Confirmed => {
+                        ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66,220,120), "Confirmed"); });
+                        ui.horizontal(|ui| {
+                            ui.monospace(&self.conversion_dialog.txid);
+                            self.ui_explorer_entity_button(ui, "tx", &self.conversion_dialog.txid, "Open conversion transaction in QUB Explorer");
+                        });
+                        ui.label(&self.conversion_dialog.message);
+                        if ui.button("Close").clicked() { want_close = true; }
+                    }
                 }
             });
         if want_close { open = false; }
@@ -5407,9 +5515,26 @@ del "%~f0"
                 if self.snapshot.wallet_keys == 0 { ui.colored_label(egui::Color32::from_rgb(255, 170, 90), "Send is disabled because this QUB Core has no local private key wallet."); }
             }
             SendDialogStatus::Sending => { ui.spinner(); ui.label(&self.send_dialog.message); if ui.button("Cancel view").clicked() { *want_close = true; } }
-            SendDialogStatus::Pending => { ui.spinner(); ui.label(egui::RichText::new("Pending confirmation").strong()); ui.monospace(&self.send_dialog.txid); ui.label(&self.send_dialog.message); if ui.button("Close").clicked() { *want_close = true; } }
+            SendDialogStatus::Pending => {
+                ui.spinner();
+                ui.label(egui::RichText::new("Pending confirmation").strong());
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.send_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.send_dialog.txid, "Open pending transaction in QUB Explorer");
+                });
+                ui.label(&self.send_dialog.message);
+                if ui.button("Close").clicked() { *want_close = true; }
+            }
             SendDialogStatus::Failed => { ui.horizontal(|ui| { self.ui_icon(ui, "failed", 18.0); ui.colored_label(egui::Color32::from_rgb(255, 105, 105), "Failed"); }); ui.label(&self.send_dialog.message); ui.horizontal(|ui| { if ui.button("Close").clicked() { *want_close = true; } if ui.button("Retry").clicked() { self.send_dialog.status = SendDialogStatus::Editing; self.send_dialog.message.clear(); self.send_dialog.txid.clear(); } }); }
-            SendDialogStatus::Confirmed => { ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66, 220, 120), "Success"); }); ui.monospace(&self.send_dialog.txid); ui.label(&self.send_dialog.message); if ui.button("Close").clicked() { *want_close = true; } }
+            SendDialogStatus::Confirmed => {
+                ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66, 220, 120), "Success"); });
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.send_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.send_dialog.txid, "Open confirmed transaction in QUB Explorer");
+                });
+                ui.label(&self.send_dialog.message);
+                if ui.button("Close").clicked() { *want_close = true; }
+            }
         }
     }
 
@@ -5725,7 +5850,10 @@ del "%~f0"
             SendDialogStatus::Pending => {
                 ui.spinner();
                 ui.label(egui::RichText::new("Pending confirmation").strong());
-                ui.monospace(&self.send_dialog.txid);
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.send_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.send_dialog.txid, "Open pending transaction in QUB Explorer");
+                });
                 ui.label(&self.send_dialog.message);
                 ui.horizontal(|ui| {
                     if ui.button("Close").clicked() { *want_close = true; }
@@ -5745,7 +5873,10 @@ del "%~f0"
             }
             SendDialogStatus::Confirmed => {
                 ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(66, 220, 120), "Success"); });
-                ui.monospace(&self.send_dialog.txid);
+                ui.horizontal(|ui| {
+                    ui.monospace(&self.send_dialog.txid);
+                    self.ui_explorer_entity_button(ui, "tx", &self.send_dialog.txid, "Open confirmed transaction in QUB Explorer");
+                });
                 ui.label(&self.send_dialog.message);
                 if ui.button("Close").clicked() { *want_close = true; }
             }
@@ -5769,11 +5900,18 @@ del "%~f0"
                     if ui.selectable_label(self.library_dialog.tab == LibraryTab::Create, "Create post").clicked() { self.library_dialog.tab = LibraryTab::Create; }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Create post").clicked() { self.library_dialog.tab = LibraryTab::Create; }
+                        self.ui_explorer_route_button(ui, "library", "Open Library in QUB Explorer");
                     });
                 });
                 ui.separator();
                 if !self.library_dialog.message.trim().is_empty() {
                     ui.colored_label(egui::Color32::from_rgb(255, 190, 80), &self.library_dialog.message);
+                    if !self.library_dialog.pending_txid.trim().is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.monospace(shorten_hash(&self.library_dialog.pending_txid));
+                            self.ui_explorer_entity_button(ui, "tx", &self.library_dialog.pending_txid, "Open pending Library transaction in QUB Explorer");
+                        });
+                    }
                     ui.separator();
                 }
                 self.request_library_state_refresh(ctx, false);
@@ -5802,8 +5940,8 @@ del "%~f0"
                     LibraryTab::Browse => {
                         ui.small("Public on-chain posts. Delete is a tombstone in the current view; historical chain bytes are immutable.");
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            egui::Grid::new("library_posts_grid").striped(true).num_columns(8).spacing([12.0, 6.0]).show(ui, |ui| {
-                                ui.strong("Height"); ui.strong("Category"); ui.strong("Title"); ui.strong("Author"); ui.strong("Votes"); ui.strong("Comments"); ui.strong("Read"); ui.strong("More"); ui.end_row();
+                            egui::Grid::new("library_posts_grid").striped(true).num_columns(9).spacing([12.0, 6.0]).show(ui, |ui| {
+                                ui.strong("Height"); ui.strong("Category"); ui.strong("Title"); ui.strong("Author"); ui.strong("Votes"); ui.strong("Comments"); ui.strong("Explorer"); ui.strong("Read"); ui.strong("More"); ui.end_row();
                                 for post in state.posts.iter().filter(|p| !p.deleted).take(200) {
                                     ui.label(format!("#{}", post.created_height));
                                     ui.label(&post.category);
@@ -5811,6 +5949,7 @@ del "%~f0"
                                     ui.monospace(shorten_hash(&post.author));
                                     ui.label(format!("+{} / -{}", post.upvotes, post.downvotes));
                                     ui.label(post.comment_count.to_string());
+                                    self.ui_explorer_entity_button(ui, "library", &post.id, "Open Library post in QUB Explorer");
                                     if ui.button("Read").clicked() { self.library_dialog.selected_post_id = post.id.clone(); self.library_dialog.tab = LibraryTab::Read; }
                                     ui.menu_button("More", |ui| {
                                         if ui.button("Edit").clicked() { action = Some(LibraryGuiAction::Edit { kind: "post".to_string(), id: post.id.clone() }); ui.close_menu(); }
@@ -5832,7 +5971,10 @@ del "%~f0"
                             if let Some(h) = post.edited_height { ui.colored_label(egui::Color32::YELLOW, format!("Edited at #{}", h)); }
                             ui.label(format!("Votes +{} / -{}", post.upvotes, post.downvotes));
                         });
-                        ui.monospace(format!("post id: {}", post.id));
+                        ui.horizontal(|ui| {
+                            ui.monospace(format!("post id: {}", post.id));
+                            self.ui_explorer_entity_button(ui, "library", &post.id, "Open this Library post in QUB Explorer");
+                        });
                         ui.separator();
                         egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
@@ -5883,6 +6025,7 @@ del "%~f0"
                                             ui.small(format!("#{}", c.created_height));
                                             if let Some(h) = c.edited_height { ui.colored_label(egui::Color32::YELLOW, format!("edited #{}", h)); }
                                             ui.small(format!("+{} / -{}", c.upvotes, c.downvotes));
+                                            self.ui_explorer_entity_button(ui, "library", &c.id, "Open Library comment in QUB Explorer");
                                         });
                                         ui.add_space(4.0);
                                         ui.add(egui::Label::new(c.body.as_str()).wrap());
@@ -6509,6 +6652,8 @@ impl QubCoreApp {
                     if update_response.clicked() {
                         self.update_dialog.open = true;
                     }
+                    ui.add_space(8.0);
+                    self.ui_explorer_url_button(ui, QUB_EXPLORER_URL, "Open QUB Explorer main page");
                 });
             });
         });
@@ -7555,6 +7700,14 @@ impl QubCoreApp {
     fn ui_address_balances(&mut self, ui: &mut egui::Ui) {
         self.ui_heading_icon(ui, "address-balances", self.tr("Address balances", "Address balances"));
         ui.small("Spendable balances and assets for the selected payout/default address. This is public-address readable and does not require private keys.");
+        ui.horizontal_wrapped(|ui| {
+            ui.small("Explorer:");
+            if !self.prefs.payout_address.trim().is_empty() {
+                self.ui_explorer_entity_button(ui, "address", self.prefs.payout_address.trim(), "Open selected address in QUB Explorer");
+            }
+            self.ui_explorer_route_button(ui, "assets", "Open QUB/JIN assets in QUB Explorer");
+            self.ui_explorer_route_button(ui, "qns", "Open QNS names in QUB Explorer");
+        });
         if self.initial_loading || self.wallet_sync_in_flight || self.snapshot_in_flight || HF105_CATCHUP_IN_FLIGHT.load(Ordering::SeqCst) {
             self.ui_sync_progress_bar_rows(ui, "Loading crypto balances", 3);
             ui.small("Temporary 0 balances during startup mean the chain/wallet view is still loading, not that funds are gone. JIN balances show only 2+ confirmed JIN.");
@@ -7600,6 +7753,7 @@ impl QubCoreApp {
                     for name in self.snapshot.owned_qns.clone() {
                         egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
                             self.ui_icon_label(ui, "qns", name.clone());
+                            self.ui_explorer_entity_button(ui, "qns", &name, "Open this QNS name in QUB Explorer");
                             ui.small("Permanent QNS name owned by the selected address.");
                             ui.horizontal_wrapped(|ui| {
                                 self.ui_icon_button_enabled(ui, false, "sell", "Sell");
@@ -7619,6 +7773,7 @@ impl QubCoreApp {
             ui.horizontal(|ui| {
                 self.ui_icon(ui, icon, 24.0);
                 ui.label(egui::RichText::new(symbol).size(20.0).strong());
+                self.ui_explorer_route_button(ui, "assets", &format!("Open {symbol} asset view in QUB Explorer"));
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -7670,6 +7825,7 @@ impl QubCoreApp {
             ui.horizontal(|ui| {
                 self.ui_icon(ui, "jin", 24.0);
                 ui.label(egui::RichText::new("JIN").size(20.0).strong());
+                self.ui_explorer_route_button(ui, "assets", "Open JIN asset view in QUB Explorer");
                 ui.add_space(8.0);
                 if self.ui_icon_selectable_button(ui, self.prefs.jin_balance_tab == JinBalanceSubTab::Coin, "jin", "Coin").clicked() {
                     self.prefs.jin_balance_tab = JinBalanceSubTab::Coin;
@@ -7751,6 +7907,7 @@ impl QubCoreApp {
             ui.horizontal_wrapped(|ui| {
                 self.ui_icon(ui, "stablecoins", 24.0);
                 ui.label(egui::RichText::new("Stablecoins").size(20.0).strong());
+                self.ui_explorer_route_button(ui, "assets", "Open assets in QUB Explorer");
                 ui.add_space(8.0);
                 egui::ComboBox::from_id_salt("stablecoin_family_hf111")
                     .selected_text(self.prefs.stablecoin_family.label())
@@ -7930,6 +8087,7 @@ impl QubCoreApp {
         card.show(ui, |ui| {
             self.ui_icon(ui, "qub", 22.0);
             ui.label(egui::RichText::new("QUB").strong());
+            self.ui_explorer_route_button(ui, "assets", "Open QUB in QUB Explorer");
             ui.label(egui::RichText::new(format!("{}", self.snapshot.spendable)).strong());
             ui.small(format!("imm {}", self.snapshot.immature));
             ui.add_space(4.0);
@@ -7961,6 +8119,7 @@ impl QubCoreApp {
                 JinBalanceSubTab::Coin => {
                     self.ui_icon(ui, "jin", 22.0);
                     ui.label(egui::RichText::new("JIN Coin").strong());
+                    self.ui_explorer_route_button(ui, "assets", "Open JIN Coin in QUB Explorer");
                     ui.label(egui::RichText::new(&self.snapshot.jin_total).strong());
                     ui.small("confirmed 2+");
                     ui.small(format!("Infusion: {}", confirmed_jin_total_infusion_display(&self.snapshot.jin_total, &self.enjin_metrics.per_jin_infusion)));
@@ -8222,7 +8381,13 @@ impl QubCoreApp {
                     ui.label(egui::RichText::new(&entry.amount).strong());
                     if entry.fee != "0 QUB" { ui.separator(); ui.label(format!("fee {}", entry.fee)); }
                 });
-                ui.monospace(shorten_hash(&entry.txid));
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(shorten_hash(&entry.txid));
+                    self.ui_explorer_entity_button(ui, "tx", &entry.txid, "Open transaction in QUB Explorer");
+                    if let Some(h) = entry.height {
+                        self.ui_explorer_entity_button(ui, "block", &h.to_string(), "Open containing block in QUB Explorer");
+                    }
+                });
                 let height = entry.height.map(|h| format!("#{}", h)).unwrap_or_else(|| "mempool".to_string());
                 let counterparty_display = if entry.counterparty.trim().is_empty() {
                     "-".to_string()
@@ -8235,7 +8400,12 @@ impl QubCoreApp {
                     ui.small("Counterparty:");
                     ui.monospace(counterparty_display);
                 });
-                if !entry.qns_name.is_empty() { ui.small(format!("QNS: {}", entry.qns_name)); }
+                if !entry.qns_name.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small(format!("QNS: {}", entry.qns_name));
+                        self.ui_explorer_entity_button(ui, "qns", &entry.qns_name, "Open QNS name in QUB Explorer");
+                    });
+                }
                 ui.small(&entry.details);
             });
             ui.add_space(6.0);
@@ -8253,6 +8423,18 @@ impl QubCoreApp {
             .default_open(false)
             .show(ui, |ui| {
                 self.ui_heading_icon(ui, "live-chain-data", self.tr("Live chain data", "Live chain data"));
+                ui.horizontal_wrapped(|ui| {
+                    ui.small("Explorer:");
+                    self.ui_explorer_url_button(ui, QUB_EXPLORER_URL, "Open QUB Explorer");
+                    self.ui_explorer_route_button(ui, "blocks", "Open blocks in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "txs", "Open transactions in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "addresses", "Open addresses in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "activity", "Open activity in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "assets", "Open QUB/JIN assets in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "qns", "Open QNS in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "pools", "Open pools in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "library", "Open library in QUB Explorer");
+                });
                 ui.add_space(8.0);
                 egui::Grid::new("chain_grid").num_columns(2).spacing([28.0, 8.0]).show(ui, |ui| {
                     self.metric_info(ui, "network", "Network", &self.snapshot.network, "Current installed network channel. Mainnet and Testnet are separate apps.");
@@ -8590,13 +8772,14 @@ impl QubCoreApp {
                     local_latest
                 ));
             }
-            egui::Grid::new("block_history_grid").num_columns(6).spacing([30.0, 6.0]).striped(true).show(ui, |ui| {
+            egui::Grid::new("block_history_grid").num_columns(7).spacing([30.0, 6.0]).striped(true).show(ui, |ui| {
                 ui.label(egui::RichText::new("Block").weak());
                 ui.label(egui::RichText::new("Reward").weak());
                 ui.label(egui::RichText::new("Txs").weak());
                 ui.label(egui::RichText::new("Age").weak());
                 ui.label(egui::RichText::new("Mined by").weak());
                 ui.label(egui::RichText::new("Hash").weak());
+                ui.label(egui::RichText::new("Explorer").weak());
                 ui.end_row();
                 if known_tip > local_latest {
                     let latest_tip_help = "Latest known network block is provisional and has not been locally fetched/validated yet. Treat mined blocks as pending until 2+ confirmations; a competing tip can replace the newest row.";
@@ -8607,6 +8790,11 @@ impl QubCoreApp {
                     ui_recent_block_cell(ui, "official/direct tip", true, false, latest_tip_help);
                     let tip_hash = if self.snapshot.known_network_hash.trim().is_empty() { "-".to_string() } else { shorten_hash(&self.snapshot.known_network_hash) };
                     ui_recent_block_cell(ui, tip_hash, true, true, latest_tip_help);
+                    if self.snapshot.known_network_hash.trim().is_empty() {
+                        self.ui_explorer_entity_button(ui, "block", &known_tip.to_string(), "Open known tip in QUB Explorer");
+                    } else {
+                        self.ui_explorer_entity_button(ui, "block", &self.snapshot.known_network_hash, "Open known tip in QUB Explorer");
+                    }
                     ui.end_row();
                     if known_tip > local_latest.saturating_add(1) {
                         let missing = known_tip.saturating_sub(local_latest).saturating_sub(1);
@@ -8617,6 +8805,7 @@ impl QubCoreApp {
                         ui_recent_block_cell(ui, "syncing", true, false, gap_help);
                         ui_recent_block_cell(ui, "official/direct gap", true, false, gap_help);
                         ui_recent_block_cell(ui, "-", true, false, gap_help);
+                        ui.label("-");
                         ui.end_row();
                     }
                 }
@@ -8632,6 +8821,7 @@ impl QubCoreApp {
                             ui_recent_block_cell(ui, "syncing", true, false, gap_help);
                             ui_recent_block_cell(ui, "missing intermediate blocks", true, false, gap_help);
                             ui_recent_block_cell(ui, "-", true, false, gap_help);
+                            ui.label("-");
                             ui.end_row();
                         }
                     }
@@ -8660,6 +8850,7 @@ impl QubCoreApp {
                     ui_recent_block_cell(ui, format_block_age(card), pending_finality, false, &finality_hover);
                     ui_recent_block_miner_cell(ui, card, block_miner_label(card, &self.prefs.payout_address), pending_finality, &finality_hover);
                     ui_recent_block_cell(ui, shorten_hash(&card.hash), pending_finality, true, &finality_hover);
+                    self.ui_explorer_entity_button(ui, "block", &card.hash, "Open block in QUB Explorer");
                     ui.end_row();
                 }
             });
@@ -9794,30 +9985,39 @@ fn jin_swap_fee_split_for_ui(config_path: &str, price_atoms: u64) -> Result<(u64
 fn hf79_pre_tx_fast_sync(settings: &Settings) {
     if !settings.p2p.enabled { return; }
     // QUB Core/v1.6.9: transaction builders run in worker threads. Use the same
-    // bounded self-healing catch-up path as mining so JIN buys/sends are signed
+    // bounded self-healing catch-up path as mining so sends and normal actions are signed
     // against a fresh ledger even when the local node was parked behind.
     let _ = p2p::hf90_auto_catchup(settings, 45_000);
     let _ = p2p::rebroadcast_local_mempool(settings, 8);
 }
 
+fn hf114_pre_jin_buy_sync(settings: &Settings) {
+    if !settings.p2p.enabled { return; }
+    // HF114: JIN buys must sync/re-anchor before signing, but must not trigger a
+    // whole-mempool rebroadcast burst that competes with mining relay right after
+    // the user presses Buy. Exact-tx relay happens after the buy is accepted.
+    let _ = p2p::hf90_auto_catchup(settings, 30_000);
+}
+
 fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fee: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf114_pre_jin_buy_sync(&settings);
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let listing_id = listing_id.trim().parse::<u32>()?;
     let units = parse_jin_amount(amount_jin.trim())?;
     let tx = wallet.create_jin_public_sale_buy_transaction(&chain, &settings, listing_id, units, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
     save_chain(&settings, &chain)?;
-    let mut relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    // HF113: JIN buys are high-value UX actions. Keep them hot in the official
-    // relay path immediately after creation so they are not silently lost behind
-    // ordinary mempool traffic during fast block races.
-    for _ in 0..3 {
-        relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 64).unwrap_or(0));
-        thread::sleep(Duration::from_millis(180));
+    // HF114: relay the exact JIN buy tx, not the whole mempool repeatedly. HF113's
+    // full-mempool rebroadcast helped reliability but could load relay sockets hard
+    // enough that users perceived slower block cadence right after a buy attempt.
+    let mut relayed = p2p::broadcast_tx_limited(&settings, &tx, 24, 850).unwrap_or(0);
+    for _ in 0..2 {
+        relayed = relayed.saturating_add(p2p::rebroadcast_txid_limited(&settings, &txid_h, 24, 850).unwrap_or(0));
+        thread::sleep(Duration::from_millis(120));
     }
     Ok((txid, relayed, chain.mempool.len()))
 }
@@ -10283,7 +10483,11 @@ fn query_gui_tx_status(config_path: &str, txid: &str) -> Result<TxUiStatus> {
         }
     }
     if chain.mempool.iter().any(|tx| tx.txid().to_string() == txid) {
-        let _ = p2p::rebroadcast_local_mempool(&settings, 64);
+        if let Ok(txid_h) = Hash256::from_hex(txid) {
+            let _ = p2p::rebroadcast_txid_limited(&settings, &txid_h, 12, 650);
+        } else {
+            let _ = p2p::rebroadcast_local_mempool(&settings, 4);
+        }
         return Ok(TxUiStatus::PendingMempool);
     }
     Ok(TxUiStatus::NotFound)
@@ -10535,7 +10739,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, chain.height(), chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF113 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF114 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -10578,7 +10782,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF113 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF114 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -10769,7 +10973,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, base_chain.height(), base_chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF113 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF114 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -10812,7 +11016,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF113 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF114 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }

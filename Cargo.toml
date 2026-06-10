@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.7.1 full-node core with verified governance and Ethereum wallet bridge groundwork"
+description = "Qubit Coin v1.7.2 full-node core with verified governance and Ethereum wallet bridge groundwork"
 readme = "README.md"
 
 [features]

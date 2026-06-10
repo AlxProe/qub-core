@@ -192,8 +192,13 @@ fn cmd_buy_jin(settings: &Settings, listing_id_s: &str, amount: &str, fee: &str)
     let tx = wallet.create_jin_public_sale_buy_transaction(&chain, settings, listing_id, units, Amount::from_str(fee.trim())?)?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     save_chain(settings, &chain)?;
-    let relayed = p2p::broadcast_tx(settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(settings, 16).unwrap_or(0));
+    // HF114/v1.7.2: JIN buys relay the exact tx with short timeouts instead of
+    // rebroadcasting the whole mempool, which could slow miner/block activity
+    // after a buy attempt on weak links.
+    let mut relayed = p2p::broadcast_tx_limited(settings, &tx, 24, 850).unwrap_or(0);
+    for _ in 0..2 {
+        relayed = relayed.saturating_add(p2p::rebroadcast_txid_limited(settings, &txid, 24, 850).unwrap_or(0));
+    }
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "txid": txid.to_string(),
         "listing_id": listing_id,
@@ -1657,4 +1662,4 @@ fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &st
     Ok(())
 }
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> { let pos = args.iter().position(|a| a == flag)?; args.remove(pos); if pos >= args.len() { None } else { Some(args.remove(pos)) } }
-fn help(config: &str) { println!("QUB Core v1.7.1\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }
+fn help(config: &str) { println!("QUB Core v1.7.2\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }
