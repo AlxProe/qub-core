@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.2";
+const APP_VERSION: &str = "v1.7.3";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -10739,7 +10739,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, chain.height(), chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF114 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF115 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -10782,7 +10782,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF114 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF115 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -10973,7 +10973,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, base_chain.height(), base_chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF114 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF115 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -11016,7 +11016,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF114 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF115 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }

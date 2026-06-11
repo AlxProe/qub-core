@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.2/"; // HF114
+const USER_AGENT: &str = "/QUB Core:1.7.3/"; // HF115
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -898,6 +898,42 @@ fn hf114_official_tip_is_local_ancestor(settings: &Settings, local: &ChainState,
     official_tip.is_empty() || local_chain_contains_tip(local, official_height, official_tip)
 }
 
+
+/// HF115/v1.7.3: liveness-preserving exact HTTP acknowledgement. HF114 made
+/// live mainnet mining depend on exact TCP seed/direct peer acknowledgement. If
+/// seed TCP is unavailable or stale while the official published snapshot tip is
+/// exactly our local tip, all honest GUI miners can deadlock at the public tip.
+/// HTTP is not allowed to green-light a private local suffix; it is exact-tip only
+/// and still loses to a two-peer direct quorum that proves a different/ahead tip.
+fn hf115_http_tip_acknowledges_local(settings: &Settings, local: &ChainState, timeout_ms: u64) -> bool {
+    if settings.network.name != "mainnet" { return false; }
+    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700).min(2_500)) else { return false; };
+    hf114_official_tip_acknowledges_local(settings, local, height, &tip)
+}
+
+fn hf115_http_tip_acknowledges_parent(settings: &Settings, parent_height: u32, parent_hash: &str, timeout_ms: u64) -> bool {
+    if settings.network.name != "mainnet" { return false; }
+    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700).min(2_500)) else { return false; };
+    height == parent_height && !tip.trim().is_empty() && tip == parent_hash
+}
+
+fn hf115_http_exact_greenlight(settings: &Settings, report: &mut P2PSyncReport, local: &ChainState, timeout_ms: u64) -> bool {
+    if !hf115_http_tip_acknowledges_local(settings, local, timeout_ms) { return false; }
+    let local_tip = local.tip_hash().to_string();
+    let (contacted, quorum_ahead_height, quorum_conflicts) = direct_parent_view(
+        settings,
+        local.height(),
+        &local_tip,
+        settings.p2p.max_outbound_peers.max(6).min(12),
+        timeout_ms.max(220).min(700),
+    ).unwrap_or((0, 0, Vec::new()));
+    report.peers_contacted = report.peers_contacted.max(contacted);
+    report.best_peer_height = report.best_peer_height.max(quorum_ahead_height);
+    if quorum_ahead_height > local.height() || !quorum_conflicts.is_empty() { return false; }
+    mark_fresh_tip_trusted(settings, local);
+    true
+}
+
 fn official_tip_summary(settings: &Settings, report: &mut P2PSyncReport, timeout_ms: u64) -> (usize, u32, String) {
     let (contacted, height, tip) = best_official_peer_tip(settings, timeout_ms).unwrap_or((0, 0, String::new()));
     report.peers_contacted = report.peers_contacted.max(contacted);
@@ -979,6 +1015,14 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
     // least one official/direct TCP seed sample so a stale published tip cannot
     // green-light an old local parent while the live seed already moved ahead.
     if direct_contacted == 0 || best_height == 0 {
+        // HF115: exact official HTTP/public-snapshot acknowledgement is enough to
+        // keep mainnet alive when TCP seeds are unreachable. HF114 rejected this
+        // and could freeze every honest miner at the public tip until a seed or
+        // two exact peers came back. This remains exact-tip only and is vetoed by
+        // a two-peer direct quorum above/a conflicting same-height quorum.
+        if hf115_http_exact_greenlight(settings, report, local, timeout_ms.max(900)) {
+            return true;
+        }
         // HF113: if all official/direct seeds are temporarily unreachable, keep
         // the network alive only when a directly reachable peer quorum agrees
         // with our validated local tip. This avoids seed dependency without
@@ -995,6 +1039,18 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
     // official/direct tip, do not hash on that suffix; the repair/re-anchor path
     // will roll back or replace it before mining resumes.
     if !hf114_official_tip_acknowledges_local(settings, local, best_height, &best_tip) {
+        // HF115: if an official TCP seed is reachable but stale/lower, do not let
+        // it freeze the network after the next public block. Exact HTTP/public
+        // snapshot acknowledgement wins, and if the published snapshot also lags,
+        // two direct peers acknowledging our exact local tip are enough to keep
+        // mining alive while still rejecting two-peer ahead/conflict quorums.
+        if hf115_http_exact_greenlight(settings, report, local, timeout_ms.max(900)) {
+            return true;
+        }
+        if best_height > 0 && best_height < local.height() && hf113_peer_quorum_greenlight(settings, local, 12, timeout_ms.max(420)) {
+            mark_fresh_tip_trusted(settings, local);
+            return true;
+        }
         return false;
     }
 
@@ -1123,6 +1179,32 @@ fn hf113_peer_quorum_greenlight(settings: &Settings, local: &ChainState, max_pee
     same_tip >= 2
 }
 
+fn hf115_direct_parent_ack_quorum(settings: &Settings, parent_height: u32, parent_hash: &str, max_peers: usize, timeout_ms: u64) -> bool {
+    if settings.network.name != "mainnet" { return false; }
+    let Ok(peers) = prioritized_outbound_peers(settings, max_peers.max(3).min(16)) else { return false; };
+    let mut same_parent = 0usize;
+    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
+    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
+    let per_peer = Duration::from_millis(timeout_ms.max(120).min(700));
+    for addr in peers.into_iter() {
+        if should_skip_outbound(settings, &addr) { continue; }
+        let Ok(info) = probe_peer(settings, &addr, per_peer) else { continue; };
+        if info.height == 0 { continue; }
+        if info.height > parent_height {
+            *ahead_counts.entry((info.height, info.tip_hash.clone())).or_insert(0) += 1;
+        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() {
+            if info.tip_hash == parent_hash {
+                same_parent = same_parent.saturating_add(1);
+            } else {
+                *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    if ahead_counts.values().any(|count| *count >= 2) { return false; }
+    if conflict_counts.values().any(|count| *count >= 2) { return false; }
+    same_parent >= 2
+}
+
 /// HF113/v1.7.1: lightweight active-mining pause probe. This is intentionally
 /// fast and non-repairing: it can stop workers within a few seconds when the
 /// official/direct chain or a peer quorum has moved, without making the miner
@@ -1139,13 +1221,24 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
                 return Some(format!("official seed moved to #{} while candidate parent is #{}", official_h, parent_height));
             }
             if settings.network.name == "mainnet" && official_h < parent_height {
-                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF114 canonical acknowledgement/re-anchor", parent_height, official_h));
+                if hf115_http_tip_acknowledges_parent(settings, parent_height, &parent_hash_s, timeout_ms.max(900))
+                    || hf115_direct_parent_ack_quorum(settings, parent_height, &parent_hash_s, 12, timeout_ms.max(420))
+                {
+                    return None;
+                }
+                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF115 canonical acknowledgement/re-anchor", parent_height, official_h));
             }
             if official_h == parent_height {
                 if official_tip.trim().is_empty() && settings.network.name == "mainnet" {
+                    if hf115_http_tip_acknowledges_parent(settings, parent_height, &parent_hash_s, timeout_ms.max(900)) {
+                        return None;
+                    }
                     return Some(format!("official seed did not acknowledge candidate parent hash at #{}", parent_height));
                 }
                 if !official_tip.trim().is_empty() && official_tip != parent_hash_s {
+                    if hf115_http_tip_acknowledges_parent(settings, parent_height, &parent_hash_s, timeout_ms.max(900)) {
+                        return None;
+                    }
                     return Some(format!("official seed reports a different hash at #{}", parent_height));
                 }
             }
@@ -1185,6 +1278,9 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
         return Some(format!("direct peer quorum ({count}) disagrees at candidate parent #{}", parent_height));
     }
     if settings.network.name == "mainnet" && contacted >= 2 && same_parent < 2 {
+        if hf115_http_tip_acknowledges_parent(settings, parent_height, &parent_hash_s, timeout_ms.max(900)) {
+            return None;
+        }
         return Some(format!("candidate parent #{} is not acknowledged by two direct peers; preventing local-stale self-mining", parent_height));
     }
     None
@@ -3015,7 +3111,7 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
                         }
                         WireMessage::Mempool { txs } => {
                             let mut chain = load_chain_for_hf90_catchup(settings)?;
-                            for tx in txs {
+                            for tx in txs.into_iter().take(hf115_mempool_inbound_limit(settings)) {
                                 if chain.accept_transaction_to_mempool(tx, settings).is_ok() {
                                     report.txs_accepted = report.txs_accepted.saturating_add(1);
                                 }
@@ -3405,19 +3501,50 @@ fn request_earlier_fork_window(stream: &mut TcpStream, local_height: u32, start_
 
 fn direct_parent_view(settings: &Settings, parent_height: u32, expected_parent_hash: &str, max_peers: usize, timeout_ms: u64) -> Result<(usize, u32, Vec<String>)> {
     let mut contacted = 0usize;
-    let mut best_direct_height = 0u32;
-    let mut conflicts = Vec::new();
+    let mut raw_best_direct_height = 0u32;
+    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
+    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
+    let mut first_conflict_addr: HashMap<String, String> = HashMap::new();
+
     for addr in known_peers(settings)?.into_iter().take(max_peers.max(1)) {
         if should_skip_outbound(settings, &addr) { continue; }
         let Ok(info) = probe_peer(settings, &addr, Duration::from_millis(timeout_ms.max(100))) else { continue; };
+        if info.height == 0 { continue; }
         contacted = contacted.saturating_add(1);
-        best_direct_height = best_direct_height.max(info.height);
-        if info.height == parent_height && info.tip_hash != expected_parent_hash {
-            conflicts.push(format!("{}@{}", addr, info.tip_hash));
-            if conflicts.len() >= 4 { break; }
+        raw_best_direct_height = raw_best_direct_height.max(info.height);
+        if info.height > parent_height {
+            *ahead_counts.entry((info.height, info.tip_hash.clone())).or_insert(0) += 1;
+        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() && info.tip_hash != expected_parent_hash {
+            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
+            first_conflict_addr.entry(info.tip_hash.clone()).or_insert(addr);
         }
     }
-    Ok((contacted, best_direct_height, conflicts))
+
+    // HF115: on mainnet, one noisy/future/private peer must not pause every
+    // miner or make a found block miss the submit window. Only a two-peer quorum
+    // is returned as an actionable ahead/conflict signal. Non-mainnet keeps the
+    // old more aggressive direct-peer behavior for tests/dev networks.
+    if settings.network.name == "mainnet" {
+        let quorum_ahead = ahead_counts
+            .iter()
+            .filter(|(_, count)| **count >= 2)
+            .map(|((height, _), _)| *height)
+            .max()
+            .unwrap_or(0);
+        let mut conflicts = Vec::new();
+        for (hash, count) in conflict_counts.iter().filter(|(_, count)| **count >= 2).take(4) {
+            let addr = first_conflict_addr.get(hash).cloned().unwrap_or_else(|| "peer-quorum".to_string());
+            conflicts.push(format!("{}@{} ({} peers)", addr, hash, count));
+        }
+        return Ok((contacted, quorum_ahead, conflicts));
+    }
+
+    let mut conflicts = Vec::new();
+    for (hash, _) in conflict_counts.iter().take(4) {
+        let addr = first_conflict_addr.get(hash).cloned().unwrap_or_else(|| "peer".to_string());
+        conflicts.push(format!("{}@{}", addr, hash));
+    }
+    Ok((contacted, raw_best_direct_height, conflicts))
 }
 
 fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, local: &mut ChainState, timeout_ms: u64) -> Result<()> {
@@ -3555,7 +3682,7 @@ fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, 
             && !hf114_official_tip_acknowledges_local(settings, local, latest_official_height, &latest_official_tip)
         {
             bail!(
-                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF114 prevents extending this stale suffix.",
+                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF115 prevents extending this stale suffix.",
                 local.height(),
                 latest_official_height
             );
@@ -3617,7 +3744,7 @@ pub fn mining_parent_guard(settings: &Settings, parent_height: u32, expected_par
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_PARENT_GATE_MS)?;
     if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
-        bail!("mining candidate paused by HF114: local parent #{} is not acknowledged by official/direct canonical view or exact peer quorum.", local.height());
+        bail!("mining candidate paused by HF115: local parent #{} is not acknowledged by official/direct canonical view or exact peer quorum.", local.height());
     }
 
     if local.height() != parent_height || local.tip_hash() != expected_parent_hash {
@@ -3837,7 +3964,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_FAST_GATE_MS)?;
     if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
-        bail!("mining paused by HF114: local tip #{} is not acknowledged by official/direct canonical view or exact peer quorum. This prevents all-self-mined local stale branches.", local.height());
+        bail!("mining paused by HF115: local tip #{} is not acknowledged by official/direct canonical view or exact peer quorum. This prevents all-self-mined local stale branches.", local.height());
     }
     if hf97_uncatchable_tip_quarantined(settings, &local, report.best_peer_height) {
         report.best_peer_height = local.height();
@@ -3945,13 +4072,33 @@ fn prioritized_outbound_peers(settings: &Settings, max_count: usize) -> Result<V
 }
 
 
+const HF115_MEMPOOL_RELAY_BATCH_TXS: usize = 512;
+const HF115_MEMPOOL_INBOUND_BATCH_TXS: usize = 2_048;
+
+fn hf115_mempool_inbound_limit(settings: &Settings) -> usize {
+    effective_mempool_max_transactions(settings).min(HF115_MEMPOOL_INBOUND_BATCH_TXS).max(1)
+}
+
+fn hf115_mempool_relay_batch(settings: &Settings, mempool: &[Transaction]) -> Vec<Transaction> {
+    let mut txs = mempool
+        .iter()
+        .filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok())
+        .collect::<Vec<_>>();
+    txs.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
+    txs.into_iter()
+        .take(hf115_mempool_inbound_limit(settings).min(HF115_MEMPOOL_RELAY_BATCH_TXS))
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+
 fn merge_mempool_from_chain(local: &mut ChainState, source: &ChainState, settings: &Settings) -> Vec<Transaction> {
     // HF76/v1.5.8: merge by txid and let full mempool admission resolve feature-state
     // conflicts. This is used before any p2p loop save so GUI/CLI-created txs cannot
     // be overwritten by an older in-memory node view.
     let mut accepted = Vec::<Transaction>::new();
     let mut known = local.mempool_txids();
-    for tx in source.mempool.iter().cloned().take(settings.mempool.max_transactions) {
+    for tx in source.mempool.iter().cloned().take(effective_mempool_max_transactions(settings)) {
         let txid = tx.txid();
         if known.contains(&txid) { continue; }
         if local.accept_transaction_to_mempool(tx.clone(), settings).is_ok() {
@@ -3969,9 +4116,9 @@ pub fn rebroadcast_local_mempool(settings: &Settings, max_txs: usize) -> Result<
     // HF107/v1.6.9: prioritize pool shares and high-impact JIN protocol txs
     // deterministically so large JIN sale purchases do not bounce around the
     // network while ordinary traffic is relayed first.
-    txs.sort_by_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
+    txs.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
     let mut sent = 0usize;
-    for tx in txs.into_iter().filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok()).take(max_txs.max(1)) {
+    for tx in txs.into_iter().filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok()).take(max_txs.max(1).min(HF115_MEMPOOL_RELAY_BATCH_TXS)) {
         sent = sent.saturating_add(relay_tx_to_known_peers(settings, tx, None).unwrap_or(0));
     }
     Ok(sent)
@@ -3981,17 +4128,21 @@ pub fn broadcast_block(settings: &Settings, block: &Block) -> Result<usize> {
     if !settings.p2p.enabled { return Ok(0); }
     let chain = load_chain_for_hf90_catchup(settings)?;
     let mut sent = 0usize;
+    // HF115: relay the found block plus a small recent suffix, not the entire
+    // chain to every peer. HF114 could spend the submit window serializing/sending
+    // the whole chain repeatedly, which amplified JIN/Library/mempool load and
+    // made block propagation look stalled on weak links. Peers that are far behind
+    // can still request older windows through GetChain/GetHeaders.
+    let tail_from = chain.height().saturating_sub(128);
     for addr in prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(16).min(48))? {
         let Ok(mut stream) = connect_peer(&addr, Duration::from_secs(2)) else { continue; };
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let _ = send_version(&mut stream, settings, &chain);
         let mut ok = send_wire(&mut stream, &WireMessage::Block { block: block.clone() }).is_ok();
-        let mut from_height = 0u32;
-        while ok && (from_height as usize) < chain.blocks.len() {
-            ok = send_chain(&mut stream, settings, &chain, from_height).is_ok();
-            from_height = from_height.saturating_add(settings.p2p.max_blocks_per_message.max(1) as u32);
-        }
+        if ok { ok = send_inv(&mut stream, &chain).is_ok(); }
+        if ok { ok = send_headers(&mut stream, settings, &chain, tail_from).is_ok(); }
+        if ok { ok = send_chain(&mut stream, settings, &chain, tail_from).is_ok(); }
         if ok { sent += 1; }
     }
     Ok(sent)
@@ -4002,6 +4153,7 @@ fn relay_chain_to_known_peers(settings: &Settings, source_peer: Option<&str>) ->
     let chain = load_chain_for_hf90_catchup(settings)?;
     let source = source_peer.map(normalize_peer_addr).unwrap_or_default();
     let mut sent = 0usize;
+    let tail_from = chain.height().saturating_sub(128);
     for addr in prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(16).min(48))? {
         let normalized = normalize_peer_addr(&addr);
         if normalized.is_empty() || (!source.is_empty() && normalized == source) { continue; }
@@ -4010,13 +4162,8 @@ fn relay_chain_to_known_peers(settings: &Settings, source_peer: Option<&str>) ->
         stream.set_write_timeout(Some(Duration::from_secs(4)))?;
         if send_version(&mut stream, settings, &chain).is_err() { continue; }
         if send_inv(&mut stream, &chain).is_err() { continue; }
-        let mut ok = true;
-        let mut from_height = 0u32;
-        while ok && (from_height as usize) < chain.blocks.len() {
-            ok = send_chain(&mut stream, settings, &chain, from_height).is_ok();
-            from_height = from_height.saturating_add(settings.p2p.max_blocks_per_message.max(1) as u32);
-        }
-        if ok { sent += 1; }
+        if send_headers(&mut stream, settings, &chain, tail_from).is_err() { continue; }
+        if send_chain(&mut stream, settings, &chain, tail_from).is_ok() { sent += 1; }
     }
     Ok(sent)
 }
@@ -4281,19 +4428,17 @@ fn process_peer_message(
             }
         }
         WireMessage::GetMempool => {
-            let txs = chain.lock().expect("chain mutex poisoned")
-                .mempool
-                .iter()
-                .filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok())
-                .cloned()
-                .collect::<Vec<_>>();
+            let txs = {
+                let local = chain.lock().expect("chain mutex poisoned");
+                hf115_mempool_relay_batch(settings, &local.mempool)
+            };
             send_wire(stream, &WireMessage::Mempool { txs })?;
         }
         WireMessage::Mempool { txs } => {
             let mut accepted_txs = Vec::new();
             {
                 let mut local = chain.lock().expect("chain mutex poisoned");
-                for tx in txs.into_iter().take(settings.mempool.max_transactions) {
+                for tx in txs.into_iter().take(hf115_mempool_inbound_limit(settings)) {
                     if local.accept_transaction_to_mempool(tx.clone(), settings).is_ok() {
                         accepted_txs.push(tx);
                     }
@@ -4440,17 +4585,14 @@ fn process_client_message(settings: &Settings, addr: &str, message: WireMessage,
         }
         WireMessage::GetChain { from_height } => send_chain(stream, settings, &load_chain_for_hf90_catchup(settings)?, from_height)?,
         WireMessage::GetMempool => {
-            let txs = load_chain_for_hf90_catchup(settings)?
-                .mempool
-                .into_iter()
-                .filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok())
-                .collect::<Vec<_>>();
+            let local = load_chain_for_hf90_catchup(settings)?;
+            let txs = hf115_mempool_relay_batch(settings, &local.mempool);
             send_wire(stream, &WireMessage::Mempool { txs })?;
         }
         WireMessage::Mempool { txs } => {
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let mut accepted_txs = Vec::<Transaction>::new();
-            for tx in txs.into_iter().take(settings.mempool.max_transactions) {
+            for tx in txs.into_iter().take(hf115_mempool_inbound_limit(settings)) {
                 if local.accept_transaction_to_mempool(tx.clone(), settings).is_ok() { accepted_txs.push(tx); }
             }
             if !accepted_txs.is_empty() {

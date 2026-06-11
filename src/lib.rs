@@ -199,6 +199,26 @@ pub struct Settings { pub network: NetworkSettings, pub node: NodeSettings, pub 
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct P2PSettings { pub enabled: bool, pub bind: String, pub advertise_addr: String, pub max_inbound_peers: usize, pub max_outbound_peers: usize, pub max_message_bytes: usize, pub max_blocks_per_message: usize, pub max_peer_errors: u32, pub connect_interval_secs: u64, pub peer_file: String, pub bootnodes: Vec<String> }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct RpcSettings { pub enabled: bool, pub bind: String, pub auth_token: String }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct MempoolSettings { pub max_transactions: usize, pub min_relay_fee_atoms: u64 }
+
+// HF115/v1.7.3 local policy caps. These are not consensus rules. They keep a
+// public-sale/Library/mempool burst from turning every block-template rebuild or
+// peer mempool exchange into a long CPU/network stall. Transactions not retained
+// locally can be rebroadcast by wallets; valid mined blocks remain consensus-valid.
+pub const HF115_EFFECTIVE_MEMPOOL_MAX_TRANSACTIONS: usize = 20_000;
+pub const HF115_MAX_TEMPLATE_SCAN_TXS: usize = 2_048;
+
+pub fn effective_mempool_max_transactions(settings: &Settings) -> usize {
+    settings.mempool.max_transactions.max(1).min(HF115_EFFECTIVE_MEMPOOL_MAX_TRANSACTIONS)
+}
+
+pub fn hf115_template_scan_limit(settings: &Settings) -> usize {
+    settings
+        .consensus
+        .max_block_transactions
+        .saturating_mul(2)
+        .max(256)
+        .min(HF115_MAX_TEMPLATE_SCAN_TXS)
+}
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct MiningSettings { pub enabled: bool, pub threads: usize, pub duty_cycle_percent: u8, pub miner_address: String, pub auto_mine_mempool: bool }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct WalletSettings { pub plaintext_keys_allowed: bool }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct ConsensusSettings { pub version: u32, pub max_money_atoms: u64, pub subsidy_halving_interval: u64, pub initial_subsidy_atoms: u64, pub coinbase_maturity: u32, pub target_spacing_secs: u32, pub difficulty_adjustment_interval: u32, pub difficulty_max_adjustment_factor: u32, pub max_future_time_secs: u32, pub max_block_transactions: usize, pub pow_bits: String, pub genesis_time: u32, pub genesis_bits: String, pub genesis_nonce: u32 }
@@ -583,7 +603,7 @@ impl ChainState {
     }
 
     pub fn accept_transaction_to_mempool(&mut self, tx: Transaction, settings: &Settings) -> Result<Hash256> {
-        if self.mempool.len() >= settings.mempool.max_transactions { bail!("mempool full"); }
+        if self.mempool.len() >= effective_mempool_max_transactions(settings) { bail!("mempool full"); }
         let txid = tx.txid();
         if self.mempool.iter().any(|t| t.txid() == txid) { bail!("duplicate mempool tx"); }
         hf106_jin_sale_standardness_policy(&tx, settings)?;
@@ -614,13 +634,14 @@ impl ChainState {
         I: IntoIterator<Item = Transaction>,
     {
         let old_len = self.mempool.len();
-        let mut candidates = Vec::with_capacity(old_len);
+        let mempool_cap = effective_mempool_max_transactions(settings);
+        let mut candidates = Vec::with_capacity(old_len.min(mempool_cap));
         candidates.extend(txs);
-        candidates.sort_by_key(|tx| (mempool_template_priority(settings, tx), tx.txid().to_string()));
+        candidates.sort_by_cached_key(|tx| (mempool_template_priority(settings, tx), tx.txid().to_string()));
         self.mempool.clear();
         let mut seen = HashSet::<Hash256>::new();
         let mut retained = 0usize;
-        for tx in candidates.into_iter().take(settings.mempool.max_transactions) {
+        for tx in candidates.into_iter().take(mempool_cap) {
             let txid = tx.txid();
             if !seen.insert(txid) { continue; }
             if self.accept_transaction_to_mempool(tx, settings).is_ok() {
@@ -1226,8 +1247,9 @@ fn candidate_mempool_transactions(chain: &ChainState, settings: &Settings, heigh
     // must be selected/revalidated in the same priority order everywhere, instead
     // of bouncing between mempool/block-template positions during fast blocks.
     let mut ordered_mempool = chain.mempool.iter().collect::<Vec<_>>();
-    ordered_mempool.sort_by_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
-    for tx in ordered_mempool {
+    ordered_mempool.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
+    let template_scan_limit = hf115_template_scan_limit(settings);
+    for tx in ordered_mempool.into_iter().take(template_scan_limit) {
         if txs.len() + 1 >= settings.consensus.max_block_transactions { break; }
 
         if hf106_jin_sale_standardness_policy(tx, settings).is_err() { continue; }
@@ -2459,7 +2481,7 @@ fn jin_sale_sold_by_listing_with_mempool_except(settings: &Settings, chain: &Cha
     // appear/drop/reappear and causing miners to build inconsistent high-fee blocks.
     let mut spent = HashSet::<OutPoint>::new();
     let mut pending = chain.mempool.iter().collect::<Vec<_>>();
-    pending.sort_by_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
+    pending.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
     for tx in pending {
         let txid = tx.txid();
         if exclude_txid == Some(txid) { continue; }

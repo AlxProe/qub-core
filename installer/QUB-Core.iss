@@ -16,10 +16,10 @@
 #define MyAppId "{{8E24D6B6-51BE-4C5C-9C01-0B3F3A000100}"
 #endif
 
-#define MyAppVersion "1.7.2"
+#define MyAppVersion "1.7.3"
 #define MyAppPublisher "Alexander Proestakis"
 #ifndef MyAppSource
-#define MyAppSource "..\dist\QUB-Core-v1.7.2-windows-x64-regtest-lan"
+#define MyAppSource "..\dist\QUB-Core-v1.7.3-windows-x64-regtest-lan"
 #endif
 
 [Setup]

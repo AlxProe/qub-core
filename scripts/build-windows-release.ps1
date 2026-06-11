@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.7.2'
+$Version = '1.7.3'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
@@ -64,13 +64,13 @@ Copy-Item (Join-Path $ReleaseDir 'qubd.exe') (Join-Path $Dist 'tools\qubd.exe')
 Copy-Item (Join-Path $Root 'config\*.toml') (Join-Path $Dist 'config')
 if (Test-Path (Join-Path $Root 'README-MINER-WINDOWS.md')) { Copy-Item (Join-Path $Root 'README-MINER-WINDOWS.md') $Dist }
 foreach ($Doc in @(
-    'QUB-Public-Release-Checksums-and-Signing-v1.7.2.md',
+    'QUB-Public-Release-Checksums-and-Signing-v1.7.3.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
-    'QUB-Windows-Code-Signing-v1.7.2.md',
+    'QUB-Windows-Code-Signing-v1.7.3.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
-    'QUB-Mainnet-Release-Readiness-v1.7.2.md',
+    'QUB-Mainnet-Release-Readiness-v1.7.3.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',
-    'QUB-Automatic-Discovery-Production-Runbook-v1.7.2.md',
+    'QUB-Automatic-Discovery-Production-Runbook-v1.7.3.md',
     'QUB-Automatic-Discovery-Production-Runbook-v1.0.0.md'
 )) {
     $DocPath = Join-Path $Root $Doc
@@ -277,7 +277,7 @@ foreach ($Asset in @(
     if (Test-Path $Path) { Copy-Item -Force $Path (Join-Path $Dist 'assets') }
 }
 
-# HF102/v1.7.2: copy every runtime asset that exists, not only the legacy allow-list.
+# HF102/v1.7.3: copy every runtime asset that exists, not only the legacy allow-list.
 # This prevents new bridge/UI icons (eth/usdt/usdc/usdj/enj/subscan/nftio/verified/etc.)
 # from appearing in local smoke but missing from live update bundles.
 $AssetRoot = Join-Path $Root 'assets'

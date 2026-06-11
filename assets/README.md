@@ -4,7 +4,7 @@ Runtime image/audio/font assets are not included in this source repository yet.
 
 QUB Core can be built from source, but some UI icons may fall back to text placeholders unless assets are provided.
 
-For HF114/v1.7.2 public builds, provide at least:
+For HF114/HF115 public builds, provide at least:
 - qub-explorer.png
 - qub-explorer-white.png
 
