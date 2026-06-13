@@ -6,7 +6,7 @@ It is a from-scratch Rust implementation of a non-EVM, UTXO-based, CPU/GPU Proof
 
 Current open-source baseline:
 
-QUB Core v1.7.3 HF115
+QUB Core v1.7.4 HF116
 
 ## What is included
 

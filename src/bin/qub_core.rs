@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.3";
+const APP_VERSION: &str = "v1.7.4";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -981,6 +981,13 @@ struct ChainSnapshot {
     target_spacing_secs: u32,
     block_reward: String,
     mined_qub_supply: String,
+    melted_qub_supply: String,
+    true_max_qub_supply: String,
+    active_jin_infused_into_qub: String,
+    lifetime_jin_infused_into_qub: String,
+    jin_per_qub_infusion: String,
+    qub_jin_infusion_activation_height: u32,
+    qub_jin_infusion_active: bool,
     halving_interval: u64,
     pow_bits: String,
     data_dir: String,
@@ -1035,6 +1042,13 @@ impl Default for ChainSnapshot {
             target_spacing_secs: 0,
             block_reward: "0".to_string(),
             mined_qub_supply: "0".to_string(),
+            melted_qub_supply: "0 QUB".to_string(),
+            true_max_qub_supply: "21,000,000 QUB".to_string(),
+            active_jin_infused_into_qub: "0 JIN".to_string(),
+            lifetime_jin_infused_into_qub: "0 JIN".to_string(),
+            jin_per_qub_infusion: "0 JIN/QUB".to_string(),
+            qub_jin_infusion_activation_height: 16777,
+            qub_jin_infusion_active: false,
             halving_interval: 0,
             pow_bits: String::new(),
             data_dir: String::new(),
@@ -7729,9 +7743,10 @@ impl QubCoreApp {
                 let qub_spendable = self.snapshot.spendable.to_string();
                 let qub_immature = format!("{} QUB", self.snapshot.immature);
                 let jin_total = self.snapshot.jin_total.to_string();
+                let jin_per_qub_infusion = self.snapshot.jin_per_qub_infusion.clone();
                 let jin_confirmed_infusion = confirmed_jin_total_infusion_display(&jin_total, &self.enjin_metrics.per_jin_infusion);
 
-                self.ui_crypto_balance_card(ui, "qub", "QUB", &qub_spendable, &qub_immature, "0 JIN", true);
+                self.ui_crypto_balance_card(ui, "qub", "QUB", &qub_spendable, &qub_immature, &jin_per_qub_infusion, true);
                 ui.add_space(8.0);
                 self.ui_jin_balance_card_hf99(ui, &jin_total, &jin_confirmed_infusion);
                 ui.add_space(8.0);
@@ -7789,7 +7804,7 @@ impl QubCoreApp {
                 ui.separator();
                 if is_qub {
                     ui.small(format!("Infusion per {}: {}", symbol, infusion));
-                    self.ui_info_tip(ui, "Infusion is the recoverable backing value attached to an asset. QUB will later be meltable to reclaim JIN.");
+                    self.ui_info_tip(ui, "HF116: QUB can be melted for native JIN Coin after activation. The displayed ratio is JIN per QUB from consensus infusion accounting.");
                 } else {
                     ui.small(format!("Infusion: {}", infusion));
                     self.ui_info_tip(ui, "Total confirmed ENJ infusion for your displayed JIN balance: confirmed JIN balance multiplied by the Live Chain Data per-JIN ENJ infusion. Pending or <2-confirmation JIN is not included.");
@@ -8462,10 +8477,11 @@ impl QubCoreApp {
                     self.metric_info(ui, "verified", "Report cases", self.snapshot.report_cases_count.to_string(), "On-chain report cases. Reports are signals, not automatic slashes; moderator/governance review is required.");
                     self.metric_info(ui, "qub", "Initial max QUB supply", "21,000,000", "The original QUB hard cap before future QUB melt mechanics.");
                     self.metric_info(ui, "next-reward", "Mined QUB supply", &self.snapshot.mined_qub_supply, "Cumulative QUB block subsidy minted up to the current local chain height. Transaction fees are not newly minted supply.");
-                    self.metric_info(ui, "melt", "Melted QUB supply", "0 QUB", "QUB permanently melted/redeemed so far. This is 0 until the QUB melt feature is activated.");
-                    self.metric_info(ui, "qub", "True max QUB supply", "21,000,000 QUB", "Initial max QUB supply minus melted QUB. This will decrease if QUB melt is activated.");
-                    self.metric_info(ui, "infuse", "Total infused JIN into all QUB", "0 JIN", "Total JIN currently infused into QUB. QUB infusion accounting is not activated yet.");
-                    self.metric_info(ui, "infuse", "Per QUB infusion", "0 JIN/QUB", "Average JIN backing currently infused into each QUB. This is 0 until the QUB infusion system is activated.");
+                    self.metric_info(ui, "melt", "Melted QUB supply", &self.snapshot.melted_qub_supply, "QUB permanently melted/redeemed for native JIN Coin after HF116 activation.");
+                    self.metric_info(ui, "qub", "True max QUB supply", &self.snapshot.true_max_qub_supply, "Initial max QUB supply minus melted QUB.");
+                    self.metric_info(ui, "infuse", "Active JIN inside QUB", &self.snapshot.active_jin_infused_into_qub, "Claimable native JIN Coin currently inside the true QUB supply container.");
+                    self.metric_info(ui, "infuse", "Lifetime JIN infused into QUB", &self.snapshot.lifetime_jin_infused_into_qub, "Cumulative JIN Coin ever infused into QUB. This is monotonic and does not decrease on QUB melts.");
+                    self.metric_info(ui, "infuse", "Per QUB infusion", &self.snapshot.jin_per_qub_infusion, "Average native JIN Coin backing per QUB. Melting QUB reduces QUB supply and active JIN proportionally, so this ratio does not drop from the melt itself.");
                     self.metric_info(ui, "jin", "Initial max JIN supply", "105,000,000 JIN", "Native JIN Coin fixed supply on QUB. JIN Token on Enjin Matrixchain is fetched separately for tokenomics telemetry.");
                     self.metric_info(ui, "melt", "Melted JIN supply", &self.enjin_metrics.melted_jin_supply, "JIN Token supply melted/redeemed on Enjin Matrixchain. Fetched directly from Matrixchain RPC when available; this is telemetry, not QUB consensus.");
                     self.metric_info(ui, "jin", "True max JIN supply", &self.enjin_metrics.true_max_jin_supply, "Current JIN Token max supply after melts on Enjin Matrixchain. Direct Matrixchain telemetry; QUB consensus still treats native JIN Coin separately.");
@@ -9453,6 +9469,16 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     // Pending mempool JIN purchases/transfers still appear in Address Activity,
     // but the spendable JIN balance no longer jumps optimistically on buy.
     let jin_total = if display_address_for_jin.is_empty() { 0 } else { jin_balance_units_for_address_confirmed(&settings, &chain, &display_address_for_jin, 2).unwrap_or(0) };
+    let qub_jin_state = qub_jin_infusion_state(&settings, &chain).unwrap_or_else(|_| QubJinInfusionState {
+        active: false,
+        activation_height: qub_jin_infusion_activation_height(&settings),
+        melted_qub_atoms: 0,
+        true_max_qub_atoms: MAX_MONEY_ATOMS,
+        lifetime_infused_jin_units: 0,
+        active_infused_jin_units: 0,
+        units_per_qub_atom: 0,
+        bootstrap_units: qub_jin_bootstrap_units(&settings),
+    });
 
     let wallet_addresses = wallet.keys.iter().map(|k| k.address.clone()).collect::<std::collections::HashSet<_>>();
     let mut pools = pools_registry.values().map(|pool| {
@@ -9611,6 +9637,13 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
         target_spacing_secs: settings.consensus.target_spacing_secs,
         block_reward: Amount::from_atoms(block_subsidy(chain.height() as u64 + 1, &settings))?.to_string(),
         mined_qub_supply: mined_qub_supply_display(chain.height(), &settings)?,
+        melted_qub_supply: format!("{} QUB", Amount::from_atoms(qub_jin_state.melted_qub_atoms)?.to_string()),
+        true_max_qub_supply: format!("{} QUB", Amount::from_atoms(qub_jin_state.true_max_qub_atoms)?.to_string()),
+        active_jin_infused_into_qub: format!("{} JIN", format_jin_amount(qub_jin_state.active_infused_jin_units)),
+        lifetime_jin_infused_into_qub: format!("{} JIN", format_jin_amount(qub_jin_state.lifetime_infused_jin_units)),
+        jin_per_qub_infusion: format!("{} JIN/QUB", format_jin_amount(qub_jin_state.units_per_qub_atom.saturating_mul(ATOMS_PER_QUB as u128))),
+        qub_jin_infusion_activation_height: qub_jin_infusion_activation_height(&settings),
+        qub_jin_infusion_active: qub_jin_infusion_active(&settings, chain.height() + 1),
         halving_interval: settings.consensus.subsidy_halving_interval,
         pow_bits: settings.consensus.pow_bits.clone(),
         data_dir: settings.node.data_dir.clone(),

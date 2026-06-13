@@ -357,6 +357,22 @@ pub const MAINNET_LIBRARY_ACTIVATION_HEIGHT: u32 = 10550;
 pub const TESTNET_LIBRARY_ACTIVATION_HEIGHT: u32 = 3440;
 pub const MAINNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 21000;
 pub const TESTNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 5000;
+
+// HF116/v1.7.4: JIN Coin infusion into QUB Coin. This is a mainnet
+// consensus activation. Bootstrap moves the final 42 public-sale batches into
+// the QUB infusion vault at #16777, creating an exact 2 JIN/QUB starting ratio.
+// Accounting is intentionally per QUB atom to avoid fractional-claim drift:
+// every future JIN infusion must divide exactly across the current true max
+// QUB atom supply, and every QUB melt pays atoms * units_per_qub_atom.
+pub const MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT: u32 = 16777;
+// Safety pre-lock: stop selling the final 42 public-sale batches before the
+// bootstrap height, so the #16777 42M JIN infusion cannot be drained by late
+// manual buys while the mandatory upgrade is rolling out.
+pub const MAINNET_QUB_JIN_SALE_RESERVE_LOCK_HEIGHT: u32 = 16666;
+pub const QUB_JIN_RESERVED_SALE_BATCHES: u32 = 42;
+pub const QUB_JIN_BOOTSTRAP_INFUSION_JIN_COINS: u128 = 42_000_000u128;
+pub const QUB_JIN_BOOTSTRAP_INFUSION_UNITS: u128 = QUB_JIN_BOOTSTRAP_INFUSION_JIN_COINS * JIN_UNITS_PER_COIN;
+pub const QUB_JIN_INFUSION_VAULT: &str = "__qub_jin_infusion_vault__";
 pub const DAA_V2_WINDOW_BLOCKS: usize = 20;
 pub const DAA_V2_MAX_ADJUSTMENT_FACTOR: u64 = 4;
 
@@ -596,6 +612,7 @@ impl ChainState {
         validate_tx_contextual(tx, &self.utxos, self.height() + 1, settings, true).map(|_| ())?;
         validate_qns_transaction_against_chain(tx, self, self.height() + 1, settings)?;
         validate_jin_transaction_against_chain(tx, self, self.height() + 1, settings).map(|_| ())?;
+        validate_qub_jin_infusion_transaction_against_chain(tx, self, self.height() + 1, settings)?;
         validate_jin_sale_transaction_against_chain(tx, self, self.height() + 1, settings).map(|_| ())?;
         validate_pools_transaction_against_chain(tx, self, self.height() + 1, settings)?;
         validate_library_transaction_against_chain(tx, self, self.height() + 1, settings)?;
@@ -607,12 +624,17 @@ impl ChainState {
         let txid = tx.txid();
         if self.mempool.iter().any(|t| t.txid() == txid) { bail!("duplicate mempool tx"); }
         hf106_jin_sale_standardness_policy(&tx, settings)?;
-        let fee = validate_tx_contextual(&tx, &self.utxos, self.height() + 1, settings, true)?;
-        validate_pools_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
-        let jin_fee_units = validate_jin_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
-        let swap_miner_fee = validate_jin_sale_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
-        let qns_miner_fee = qns_miner_fee_required_in_tx(settings, &tx, self.height() + 1)?;
-        let library_miner_fee = library_miner_fee_required_in_tx(settings, &tx, self.height() + 1)?;
+        let spend_height = self.height() + 1;
+        let raw_fee = validate_tx_contextual(&tx, &self.utxos, spend_height, settings, true)?;
+        let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, &tx, spend_height)?;
+        if raw_fee < qub_melt_burn { bail!("QUB melt burn exceeds transaction input-output delta"); }
+        let fee = raw_fee - qub_melt_burn;
+        validate_pools_transaction_against_chain(&tx, self, spend_height, settings)?;
+        let jin_fee_units = validate_jin_transaction_against_chain(&tx, self, spend_height, settings)?;
+        validate_qub_jin_infusion_transaction_against_chain(&tx, self, spend_height, settings)?;
+        let swap_miner_fee = validate_jin_sale_transaction_against_chain(&tx, self, spend_height, settings)?;
+        let qns_miner_fee = qns_miner_fee_required_in_tx(settings, &tx, spend_height)?;
+        let library_miner_fee = library_miner_fee_required_in_tx(settings, &tx, spend_height)?;
         let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?;
         if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); }
         if !is_pool_share_transaction(&tx) && !is_blast_claim_transaction(&tx, settings) && fee < settings.mempool.min_relay_fee_atoms && jin_fee_units == 0 { bail!("fee below min relay fee"); }
@@ -1209,7 +1231,7 @@ pub fn block_subsidy(height: u64, settings: &Settings) -> u64 { if height == 0 {
 pub fn validate_tx_stateless(tx: &Transaction, settings: &Settings) -> Result<()> { if is_pool_share_transaction(tx) { return Ok(()); } if tx.inputs.is_empty() || tx.outputs.is_empty() { if tx.is_coinbase() { return Ok(()); } bail!("tx must have inputs and outputs"); } if !tx.is_coinbase() && tx.outputs.len() > MAX_SEND_ENTRIES_PER_TX + 4 { bail!("tx has too many outputs; max send/blast entries is 256"); } let mut seen = HashSet::new(); for input in &tx.inputs { if !seen.insert(input.previous_output.clone()) { bail!("duplicate input"); } } let mut total = 0u128; for output in &tx.outputs { let v = output.value.atoms(); if v == 0 || v > settings.consensus.max_money_atoms || v > MAX_MONEY_ATOMS { bail!("amount out of range"); } total += v as u128; if total > settings.consensus.max_money_atoms as u128 { bail!("output total exceeds max money"); } } Ok(()) }
 pub fn validate_tx_contextual(tx: &Transaction, utxos: &HashMap<OutPoint, CoinRecord>, spend_height: u32, settings: &Settings, verify_scripts: bool) -> Result<u64> { validate_tx_stateless(tx, settings)?; if tx.is_coinbase() || is_pool_share_transaction(tx) { return Ok(0); } validate_blast_create_outputs(tx, spend_height, settings)?; if is_blast_claim_transaction(tx, settings) { return validate_blast_claim_contextual(tx, utxos, spend_height, settings); } let mut total_in = 0u128; let total_out: u128 = tx.outputs.iter().map(|o| o.value.atoms() as u128).sum(); for (idx, input) in tx.inputs.iter().enumerate() { let coin = utxos.get(&input.previous_output).with_context(|| format!("missing UTXO {}", input.previous_output.key()))?; if coin.is_coinbase && spend_height.saturating_sub(coin.height) < settings.consensus.coinbase_maturity { bail!("premature coinbase spend"); } if verify_scripts { verify_p2pkh_input(tx, idx, coin)?; } total_in += coin.tx_out.value.atoms() as u128; } if total_in < total_out { bail!("insufficient input value"); } Ok((total_in - total_out) as u64) }
 fn verify_p2pkh_input(tx: &Transaction, idx: usize, coin: &CoinRecord) -> Result<()> { let expected = p2pkh_payload(&coin.tx_out.script_pubkey).context("unsupported script_pubkey")?; let (pk, sig) = decode_sig_script(&tx.inputs[idx].signature_script)?; if public_key_hash(&pk) != expected { bail!("pubkey hash mismatch"); } let sighash = tx.sighash_all(idx, &coin.tx_out.script_pubkey)?; if !verify_hash(&pk, &sig, sighash) { bail!("signature verification failed"); } Ok(()) }
-fn validate_block(block: &Block, base_utxos: &HashMap<OutPoint, CoinRecord>, expected_prev: Hash256, height: u32, required_bits: u32, settings: &Settings) -> Result<HashSet<Hash256>> { if block.transactions.is_empty() { bail!("empty block"); } if block.transactions.len() > settings.consensus.max_block_transactions { bail!("too many block transactions"); } if block.header.version != settings.consensus.version { bail!("bad block version"); } if block.header.prev_block_hash != expected_prev { bail!("bad prev hash"); } if block.header.bits != required_bits { bail!("bad bits: expected {required_bits:#x}, got {:#x}", block.header.bits); } if block.compute_merkle_root() != block.header.merkle_root { bail!("merkle mismatch"); } if !verify_header_pow(&block.header)? { bail!("insufficient PoW"); } if block.header.time > unix_time_u32().saturating_add(settings.consensus.max_future_time_secs) { bail!("future timestamp"); } if !block.transactions[0].is_coinbase() { bail!("missing coinbase"); } for tx in block.transactions.iter().skip(1) { if tx.is_coinbase() { bail!("extra coinbase"); } } let mut ids = HashSet::new(); for tx in &block.transactions { if !ids.insert(tx.txid()) { bail!("duplicate txid"); } } let mut scratch = base_utxos.clone(); let mut fees = 0u128; for tx in block.transactions.iter().skip(1) { let fee = validate_tx_contextual(tx, &scratch, height, settings, true)?; let qns_miner_fee = qns_miner_fee_required_in_tx(settings, tx, height)?; let library_miner_fee = library_miner_fee_required_in_tx(settings, tx, height)?; let swap_miner_fee = jin_swap_miner_fee_required_in_tx(settings, tx, height)?; let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?; if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); } fees += fee as u128; connect_tx_utxos(tx, &mut scratch, height, false)?; } validate_tx_stateless(&block.transactions[0], settings)?; let claim: u128 = block.transactions[0].outputs.iter().map(|o| o.value.atoms() as u128).sum(); if claim > block_subsidy(height as u64, settings) as u128 + fees { bail!("coinbase overclaim"); } Ok(ids) }
+fn validate_block(block: &Block, base_utxos: &HashMap<OutPoint, CoinRecord>, expected_prev: Hash256, height: u32, required_bits: u32, settings: &Settings) -> Result<HashSet<Hash256>> { if block.transactions.is_empty() { bail!("empty block"); } if block.transactions.len() > settings.consensus.max_block_transactions { bail!("too many block transactions"); } if block.header.version != settings.consensus.version { bail!("bad block version"); } if block.header.prev_block_hash != expected_prev { bail!("bad prev hash"); } if block.header.bits != required_bits { bail!("bad bits: expected {required_bits:#x}, got {:#x}", block.header.bits); } if block.compute_merkle_root() != block.header.merkle_root { bail!("merkle mismatch"); } if !verify_header_pow(&block.header)? { bail!("insufficient PoW"); } if block.header.time > unix_time_u32().saturating_add(settings.consensus.max_future_time_secs) { bail!("future timestamp"); } if !block.transactions[0].is_coinbase() { bail!("missing coinbase"); } for tx in block.transactions.iter().skip(1) { if tx.is_coinbase() { bail!("extra coinbase"); } } let mut ids = HashSet::new(); for tx in &block.transactions { if !ids.insert(tx.txid()) { bail!("duplicate txid"); } } let mut scratch = base_utxos.clone(); let mut fees = 0u128; for tx in block.transactions.iter().skip(1) { let raw_fee = validate_tx_contextual(tx, &scratch, height, settings, true)?; let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, tx, height)?; if raw_fee < qub_melt_burn { bail!("QUB melt burn exceeds transaction input-output delta"); } let fee = raw_fee - qub_melt_burn; let qns_miner_fee = qns_miner_fee_required_in_tx(settings, tx, height)?; let library_miner_fee = library_miner_fee_required_in_tx(settings, tx, height)?; let swap_miner_fee = jin_swap_miner_fee_required_in_tx(settings, tx, height)?; let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?; if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); } fees += fee as u128; connect_tx_utxos(tx, &mut scratch, height, false)?; } validate_tx_stateless(&block.transactions[0], settings)?; let claim: u128 = block.transactions[0].outputs.iter().map(|o| o.value.atoms() as u128).sum(); if claim > block_subsidy(height as u64, settings) as u128 + fees { bail!("coinbase overclaim"); } Ok(ids) }
 fn connect_block_utxos(block: &Block, utxos: &mut HashMap<OutPoint, CoinRecord>, height: u32) -> Result<()> { for (idx, tx) in block.transactions.iter().enumerate() { connect_tx_utxos(tx, utxos, height, idx == 0)?; } Ok(()) }
 pub(crate) fn connect_tx_utxos(tx: &Transaction, utxos: &mut HashMap<OutPoint, CoinRecord>, height: u32, is_coinbase: bool) -> Result<()> { if is_pool_share_transaction(tx) { return Ok(()); } if !is_coinbase { for input in &tx.inputs { if utxos.remove(&input.previous_output).is_none() { bail!("missing UTXO during connect"); } } } let txid = tx.txid(); for (vout, output) in tx.outputs.iter().enumerate() { let old = utxos.insert(OutPoint { txid, vout: vout as u32 }, CoinRecord { tx_out: output.clone(), height, is_coinbase }); if old.is_some() { bail!("duplicate created outpoint"); } } Ok(()) }
 pub fn is_immature_coinbase(coin: &CoinRecord, current_height: u32, settings: &Settings) -> bool { coin.is_coinbase && current_height.saturating_sub(coin.height) < settings.consensus.coinbase_maturity }
@@ -1228,6 +1250,8 @@ pub fn create_coinbase(height: u32, value_atoms: u64, address: &Address, extra_n
 fn candidate_mempool_transactions(chain: &ChainState, settings: &Settings, height: u32, solo_miner_for_legacy_jin: Option<&str>) -> Result<(Vec<Transaction>, u64)> {
     let mut scratch = chain.utxos.clone();
     let mut jin_ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
+    let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
+    qub_jin_apply_bootstrap_for_context(settings, &mut jin_ledger, &mut qub_jin_state, chain.height(), height)?;
     let mut txs = Vec::new();
     let mut fees = 0u64;
     let qns_registry = qns_registry_from_blocks(settings, &chain.blocks)?;
@@ -1253,7 +1277,10 @@ fn candidate_mempool_transactions(chain: &ChainState, settings: &Settings, heigh
         if txs.len() + 1 >= settings.consensus.max_block_transactions { break; }
 
         if hf106_jin_sale_standardness_policy(tx, settings).is_err() { continue; }
-        let Ok(fee) = validate_tx_contextual(tx, &scratch, height, settings, true) else { continue; };
+        let Ok(raw_fee) = validate_tx_contextual(tx, &scratch, height, settings, true) else { continue; };
+        let Ok(qub_melt_burn) = qub_jin_melt_burn_atoms_for_fee(settings, tx, height) else { continue; };
+        if raw_fee < qub_melt_burn { continue; }
+        let fee = raw_fee - qub_melt_burn;
         let qns_fee = qns_miner_fee_required_in_tx(settings, tx, height).unwrap_or(u64::MAX);
         let library_fee = library_miner_fee_required_in_tx(settings, tx, height).unwrap_or(u64::MAX);
         let swap_fee = jin_swap_miner_fee_required_in_tx(settings, tx, height).unwrap_or(u64::MAX);
@@ -1266,6 +1293,8 @@ fn candidate_mempool_transactions(chain: &ChainState, settings: &Settings, heigh
 
         let mut jin_trial = jin_ledger.clone();
         if validate_jin_transaction_with_ledger(tx, &mut jin_trial, &scratch, height, settings, solo_miner_for_legacy_jin).is_err() { continue; }
+        let mut qub_jin_trial = qub_jin_state.clone();
+        if validate_qub_jin_infusion_transaction_with_state(tx, &mut jin_trial, &mut qub_jin_trial, &scratch, height, settings).is_err() { continue; }
 
         let purchases = jin_sale_purchases_in_tx(tx, settings);
         let mut jin_sale_sold_trial = jin_sale_sold.clone();
@@ -1284,6 +1313,7 @@ fn candidate_mempool_transactions(chain: &ChainState, settings: &Settings, heigh
 
         qns_seen = qns_seen_trial;
         jin_ledger = jin_trial;
+        qub_jin_state = qub_jin_trial;
         jin_sale_sold = jin_sale_sold_trial;
         library_state = library_trial;
         verified_governance_state = verified_governance_trial;
@@ -1730,6 +1760,49 @@ impl WalletFile {
         let tx = Transaction { version: 1, inputs: selected.iter().map(|(outpoint, _, _)| TxIn { previous_output: outpoint.clone(), signature_script: ScriptBuf::empty(), sequence: u32::MAX }).collect(), outputs, locktime: 0 };
         let tx = self.sign_selected_transaction(tx, &selected)?;
         validate_jin_sale_transaction_against_chain(&tx, chain, spend_height, settings)?;
+        Ok(tx)
+    }
+
+    pub fn create_qub_jin_infuse_transaction(&self, chain: &ChainState, settings: &Settings, amount_units: u128, fee: Amount) -> Result<Transaction> {
+        let spend_height = chain.height() + 1;
+        if !qub_jin_infusion_active(settings, spend_height) { bail!("QUB/JIN infusion activates at block #{}", qub_jin_infusion_activation_height(settings)); }
+        let state = qub_jin_infusion_state(settings, chain)?;
+        if amount_units == 0 { bail!("JIN->QUB infusion amount must be non-zero"); }
+        if state.true_max_qub_atoms == 0 { bail!("cannot infuse JIN after all QUB has been melted"); }
+        let step = state.true_max_qub_atoms as u128;
+        if amount_units % step != 0 {
+            bail!("JIN->QUB infusion amount must be a multiple of {} JIN units ({}) so every QUB atom receives an exact increment", step, format_jin_amount(step));
+        }
+        let marker_atoms = settings.jin.marker_output_atoms;
+        let target_qub = marker_atoms.checked_add(fee.atoms()).context("QUB infusion fee overflow")?;
+        let (from_address, selected, total) = self.select_jin_source_for_payment(chain, settings, amount_units, target_qub)?;
+        let marker_script = qub_jin_infuse_marker_script(settings, &from_address, amount_units)?;
+        let mut outputs = vec![TxOut { value: Amount::from_atoms(marker_atoms)?, script_pubkey: marker_script }];
+        let change = total - target_qub;
+        if change > 0 { outputs.push(TxOut { value: Amount::from_atoms(change)?, script_pubkey: from_address.script_pubkey() }); }
+        let tx = Transaction { version: 1, inputs: selected.iter().map(|(outpoint, _, _)| TxIn { previous_output: outpoint.clone(), signature_script: ScriptBuf::empty(), sequence: u32::MAX }).collect(), outputs, locktime: 0 };
+        let tx = self.sign_selected_transaction(tx, &selected)?;
+        validate_qub_jin_infusion_transaction_against_chain(&tx, chain, spend_height, settings)?;
+        Ok(tx)
+    }
+
+    pub fn create_qub_melt_for_jin_transaction(&self, chain: &ChainState, settings: &Settings, qub_amount: Amount, fee: Amount, min_jin_units: u128) -> Result<Transaction> {
+        let spend_height = chain.height() + 1;
+        if !qub_jin_infusion_active(settings, spend_height) { bail!("QUB/JIN infusion activates at block #{}", qub_jin_infusion_activation_height(settings)); }
+        let qub_atoms = qub_amount.atoms();
+        if qub_atoms == 0 { bail!("QUB melt amount must be non-zero"); }
+        let payout = qub_jin_melt_payout_units_for_atoms(settings, chain, qub_atoms)?;
+        if payout < min_jin_units { bail!("QUB melt payout is below minimum JIN units"); }
+        let marker_atoms = settings.jin.marker_output_atoms;
+        let target_qub = qub_atoms.checked_add(marker_atoms).context("QUB melt target overflow")?.checked_add(fee.atoms()).context("QUB melt target overflow")?;
+        let (from_address, selected, total) = self.select_wallet_address_inputs_for_target(chain, settings, target_qub)?;
+        let marker_script = qub_jin_melt_marker_script(settings, &from_address, qub_atoms, min_jin_units)?;
+        let mut outputs = vec![TxOut { value: Amount::from_atoms(marker_atoms)?, script_pubkey: marker_script }];
+        let change = total - target_qub;
+        if change > 0 { outputs.push(TxOut { value: Amount::from_atoms(change)?, script_pubkey: from_address.script_pubkey() }); }
+        let tx = Transaction { version: 1, inputs: selected.iter().map(|(outpoint, _, _)| TxIn { previous_output: outpoint.clone(), signature_script: ScriptBuf::empty(), sequence: u32::MAX }).collect(), outputs, locktime: 0 };
+        let tx = self.sign_selected_transaction(tx, &selected)?;
+        validate_qub_jin_infusion_transaction_against_chain(&tx, chain, spend_height, settings)?;
         Ok(tx)
     }
 
@@ -2301,6 +2374,291 @@ pub fn jin_conversions_in_tx(tx: &Transaction, settings: &Settings) -> Vec<(usiz
 }
 
 
+const QUB_JIN_INFUSION_SCRIPT_PREFIX: &[u8] = b"QUBJIN1|";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QubJinInfusionMarker {
+    InfuseJin { from: String, amount_units: u128 },
+    MeltQub { from: String, qub_atoms: u64, min_jin_units: u128 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QubJinInfusionState {
+    pub active: bool,
+    pub activation_height: u32,
+    pub melted_qub_atoms: u64,
+    pub true_max_qub_atoms: u64,
+    pub lifetime_infused_jin_units: u128,
+    pub active_infused_jin_units: u128,
+    pub units_per_qub_atom: u128,
+    pub bootstrap_units: u128,
+}
+
+impl QubJinInfusionState {
+    fn inactive(settings: &Settings) -> Self {
+        Self {
+            active: false,
+            activation_height: qub_jin_infusion_activation_height(settings),
+            melted_qub_atoms: 0,
+            true_max_qub_atoms: MAX_MONEY_ATOMS,
+            lifetime_infused_jin_units: 0,
+            active_infused_jin_units: 0,
+            units_per_qub_atom: 0,
+            bootstrap_units: qub_jin_bootstrap_units(settings),
+        }
+    }
+}
+
+pub fn qub_jin_infusion_activation_height(settings: &Settings) -> u32 {
+    if settings.network.name == "mainnet" { MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT } else { u32::MAX }
+}
+
+pub fn qub_jin_sale_reserve_lock_height(settings: &Settings) -> u32 {
+    if settings.network.name == "mainnet" { MAINNET_QUB_JIN_SALE_RESERVE_LOCK_HEIGHT } else { u32::MAX }
+}
+
+pub fn qub_jin_bootstrap_units(settings: &Settings) -> u128 {
+    if settings.network.name == "mainnet" { QUB_JIN_BOOTSTRAP_INFUSION_UNITS } else { 0 }
+}
+
+pub fn qub_jin_infusion_active(settings: &Settings, height: u32) -> bool {
+    settings.jin.enabled
+        && settings.features.jin_native_coin_enabled
+        && settings.network.name == "mainnet"
+        && height >= qub_jin_infusion_activation_height(settings)
+}
+
+pub fn qub_jin_bootstrap_units_per_atom(settings: &Settings) -> Result<u128> {
+    let units = qub_jin_bootstrap_units(settings);
+    if units == 0 { return Ok(0); }
+    let denom = MAX_MONEY_ATOMS as u128;
+    if units % denom != 0 { bail!("HF116 bootstrap JIN infusion is not exact per QUB atom"); }
+    Ok(units / denom)
+}
+
+pub fn qub_jin_infuse_marker_script(settings: &Settings, from: &Address, amount_units: u128) -> Result<ScriptBuf> {
+    if from.prefix != settings.network.address_prefix { bail!("JIN->QUB infusion source address network mismatch"); }
+    if amount_units == 0 { bail!("JIN->QUB infusion amount must be non-zero"); }
+    if amount_units > JIN_TOTAL_SUPPLY_UNITS { bail!("JIN->QUB infusion amount exceeds JIN supply"); }
+    Ok(ScriptBuf(format!("QUBJIN1|infuse-jin|v1|{}|{}", from, amount_units).into_bytes()))
+}
+
+pub fn qub_jin_melt_marker_script(settings: &Settings, from: &Address, qub_atoms: u64, min_jin_units: u128) -> Result<ScriptBuf> {
+    if from.prefix != settings.network.address_prefix { bail!("QUB melt source address network mismatch"); }
+    if qub_atoms == 0 { bail!("QUB melt amount must be non-zero"); }
+    if qub_atoms > MAX_MONEY_ATOMS { bail!("QUB melt amount exceeds QUB max supply"); }
+    Ok(ScriptBuf(format!("QUBJIN1|melt-qub|v1|{}|{}|{}", from, qub_atoms, min_jin_units).into_bytes()))
+}
+
+pub fn parse_qub_jin_infusion_script(script: &ScriptBuf, settings: &Settings) -> Option<QubJinInfusionMarker> {
+    let raw = std::str::from_utf8(script.as_bytes()).ok()?;
+    if !raw.as_bytes().starts_with(QUB_JIN_INFUSION_SCRIPT_PREFIX) { return None; }
+    let mut parts = raw.split('|');
+    if parts.next()? != "QUBJIN1" { return None; }
+    let op = parts.next()?;
+    if parts.next()? != "v1" { return None; }
+    match op {
+        "infuse-jin" => {
+            let from = Address::parse_with_prefix(parts.next()?, &settings.network.address_prefix).ok()?.to_string();
+            let amount_units = parts.next()?.parse::<u128>().ok()?;
+            if parts.next().is_some() { return None; }
+            Some(QubJinInfusionMarker::InfuseJin { from, amount_units })
+        }
+        "melt-qub" => {
+            let from = Address::parse_with_prefix(parts.next()?, &settings.network.address_prefix).ok()?.to_string();
+            let qub_atoms = parts.next()?.parse::<u64>().ok()?;
+            let min_jin_units = parts.next()?.parse::<u128>().ok()?;
+            if parts.next().is_some() { return None; }
+            Some(QubJinInfusionMarker::MeltQub { from, qub_atoms, min_jin_units })
+        }
+        _ => None,
+    }
+}
+
+pub fn qub_jin_infusion_markers_in_tx(tx: &Transaction, settings: &Settings) -> Vec<(usize, QubJinInfusionMarker, u64)> {
+    tx.outputs.iter().enumerate().filter_map(|(idx, out)| parse_qub_jin_infusion_script(&out.script_pubkey, settings).map(|m| (idx, m, out.value.atoms()))).collect()
+}
+
+pub fn is_qub_jin_infusion_transaction(tx: &Transaction, settings: &Settings) -> bool {
+    !qub_jin_infusion_markers_in_tx(tx, settings).is_empty()
+}
+
+fn qub_jin_apply_bootstrap(settings: &Settings, ledger: &mut HashMap<String, u128>, state: &mut QubJinInfusionState) -> Result<()> {
+    if state.active { return Ok(()); }
+    let bootstrap = qub_jin_bootstrap_units(settings);
+    state.active = true;
+    if bootstrap == 0 { return Ok(()); }
+    let per_atom = qub_jin_bootstrap_units_per_atom(settings)?;
+    jin_debit(ledger, &settings.jin.protocol_address, bootstrap)?;
+    jin_credit(ledger, QUB_JIN_INFUSION_VAULT, bootstrap)?;
+    state.lifetime_infused_jin_units = state.lifetime_infused_jin_units.checked_add(bootstrap).context("HF116 bootstrap lifetime overflow")?;
+    state.active_infused_jin_units = state.active_infused_jin_units.checked_add(bootstrap).context("HF116 bootstrap active overflow")?;
+    state.units_per_qub_atom = state.units_per_qub_atom.checked_add(per_atom).context("HF116 bootstrap per-atom overflow")?;
+    Ok(())
+}
+
+fn qub_jin_apply_bootstrap_for_context(settings: &Settings, ledger: &mut HashMap<String, u128>, state: &mut QubJinInfusionState, prior_visible_height: u32, spend_height: u32) -> Result<()> {
+    let activation = qub_jin_infusion_activation_height(settings);
+    if qub_jin_infusion_active(settings, spend_height) && prior_visible_height < activation {
+        qub_jin_apply_bootstrap(settings, ledger, state)?;
+    }
+    Ok(())
+}
+
+fn qub_jin_apply_infuse_units(state: &mut QubJinInfusionState, amount_units: u128) -> Result<u128> {
+    if amount_units == 0 { bail!("JIN->QUB infusion amount must be non-zero"); }
+    let denom = state.true_max_qub_atoms as u128;
+    if denom == 0 { bail!("cannot infuse JIN after all QUB has been melted"); }
+    if amount_units % denom != 0 {
+        bail!(
+            "JIN->QUB infusion amount must divide exactly across the current true max QUB atom supply; minimum/current step is {} JIN units ({})",
+            denom,
+            format_jin_amount(denom)
+        );
+    }
+    let delta_per_atom = amount_units / denom;
+    if delta_per_atom == 0 { bail!("JIN->QUB infusion amount is below one unit per current true QUB atom"); }
+    state.units_per_qub_atom = state.units_per_qub_atom.checked_add(delta_per_atom).context("JIN per-QUB-atom infusion overflow")?;
+    state.lifetime_infused_jin_units = state.lifetime_infused_jin_units.checked_add(amount_units).context("JIN lifetime infusion overflow")?;
+    state.active_infused_jin_units = state.active_infused_jin_units.checked_add(amount_units).context("JIN active infusion overflow")?;
+    Ok(delta_per_atom)
+}
+
+fn qub_jin_apply_melt_atoms(state: &mut QubJinInfusionState, qub_atoms: u64, min_jin_units: u128) -> Result<u128> {
+    if qub_atoms == 0 { bail!("QUB melt amount must be non-zero"); }
+    if qub_atoms > state.true_max_qub_atoms { bail!("QUB melt amount exceeds current true max QUB supply"); }
+    if state.units_per_qub_atom == 0 { bail!("QUB melt is unavailable because no JIN is infused into QUB"); }
+    let payout_units = (qub_atoms as u128).checked_mul(state.units_per_qub_atom).context("QUB melt payout overflow")?;
+    if payout_units == 0 { bail!("QUB melt payout would be zero"); }
+    if payout_units < min_jin_units { bail!("QUB melt slippage check failed: payout below minimum JIN units"); }
+    if state.active_infused_jin_units < payout_units { bail!("QUB melt exceeds active infused JIN reserve"); }
+    state.melted_qub_atoms = state.melted_qub_atoms.checked_add(qub_atoms).context("melted QUB overflow")?;
+    state.true_max_qub_atoms = state.true_max_qub_atoms.checked_sub(qub_atoms).context("true max QUB underflow")?;
+    state.active_infused_jin_units = state.active_infused_jin_units.checked_sub(payout_units).context("active infused JIN underflow")?;
+    Ok(payout_units)
+}
+
+fn qub_jin_apply_marker_to_state_only(state: &mut QubJinInfusionState, marker: &QubJinInfusionMarker) -> Result<()> {
+    match marker {
+        QubJinInfusionMarker::InfuseJin { amount_units, .. } => {
+            qub_jin_apply_infuse_units(state, *amount_units)?;
+        }
+        QubJinInfusionMarker::MeltQub { qub_atoms, min_jin_units, .. } => {
+            let _ = qub_jin_apply_melt_atoms(state, *qub_atoms, *min_jin_units)?;
+        }
+    }
+    Ok(())
+}
+
+fn qub_jin_apply_marker_unchecked(settings: &Settings, ledger: &mut HashMap<String, u128>, state: &mut QubJinInfusionState, marker: &QubJinInfusionMarker) -> Result<()> {
+    match marker {
+        QubJinInfusionMarker::InfuseJin { from, amount_units } => {
+            qub_jin_apply_infuse_units(state, *amount_units)?;
+            jin_debit(ledger, from, *amount_units)?;
+            jin_credit(ledger, QUB_JIN_INFUSION_VAULT, *amount_units)?;
+        }
+        QubJinInfusionMarker::MeltQub { from, qub_atoms, min_jin_units } => {
+            let payout_units = qub_jin_apply_melt_atoms(state, *qub_atoms, *min_jin_units)?;
+            jin_debit(ledger, QUB_JIN_INFUSION_VAULT, payout_units)?;
+            jin_credit(ledger, from, payout_units)?;
+        }
+    }
+    if settings.network.name == "mainnet" && state.active_infused_jin_units > state.lifetime_infused_jin_units {
+        bail!("HF116 infusion accounting invariant failed");
+    }
+    Ok(())
+}
+
+pub fn qub_jin_infusion_state_from_blocks(settings: &Settings, blocks: &[Block]) -> Result<QubJinInfusionState> {
+    let mut state = QubJinInfusionState::inactive(settings);
+    for (height, block) in blocks.iter().enumerate().skip(1) {
+        let height = height as u32;
+        if height == qub_jin_infusion_activation_height(settings) {
+            state.active = true;
+            let bootstrap = qub_jin_bootstrap_units(settings);
+            let per_atom = qub_jin_bootstrap_units_per_atom(settings)?;
+            state.lifetime_infused_jin_units = state.lifetime_infused_jin_units.checked_add(bootstrap).context("HF116 bootstrap lifetime overflow")?;
+            state.active_infused_jin_units = state.active_infused_jin_units.checked_add(bootstrap).context("HF116 bootstrap active overflow")?;
+            state.units_per_qub_atom = state.units_per_qub_atom.checked_add(per_atom).context("HF116 bootstrap per-atom overflow")?;
+        }
+        if !qub_jin_infusion_active(settings, height) { continue; }
+        for tx in block.transactions.iter().skip(1) {
+            for (_, marker, marker_atoms) in qub_jin_infusion_markers_in_tx(tx, settings) {
+                if marker_atoms != settings.jin.marker_output_atoms { bail!("QUB/JIN infusion marker output must be exactly {} atom(s)", settings.jin.marker_output_atoms); }
+                qub_jin_apply_marker_to_state_only(&mut state, &marker)?;
+            }
+        }
+    }
+    Ok(state)
+}
+
+pub fn qub_jin_infusion_state(settings: &Settings, chain: &ChainState) -> Result<QubJinInfusionState> {
+    qub_jin_infusion_state_from_blocks(settings, &chain.blocks)
+}
+
+pub fn qub_jin_melt_payout_units_for_atoms(settings: &Settings, chain: &ChainState, qub_atoms: u64) -> Result<u128> {
+    let state = qub_jin_infusion_state(settings, chain)?;
+    if qub_atoms == 0 { bail!("QUB melt amount must be non-zero"); }
+    (qub_atoms as u128).checked_mul(state.units_per_qub_atom).context("QUB melt payout overflow")
+}
+
+pub fn qub_jin_infusion_minimum_step_units(settings: &Settings, chain: &ChainState) -> Result<u128> {
+    Ok(qub_jin_infusion_state(settings, chain)?.true_max_qub_atoms as u128)
+}
+
+fn qub_jin_melt_burn_atoms_for_fee(settings: &Settings, tx: &Transaction, height: u32) -> Result<u64> {
+    let markers = qub_jin_infusion_markers_in_tx(tx, settings);
+    if markers.is_empty() { return Ok(0); }
+    if !qub_jin_infusion_active(settings, height) { bail!("QUB/JIN infusion activates at block #{}", qub_jin_infusion_activation_height(settings)); }
+    if markers.len() != 1 { bail!("a transaction may contain exactly one QUB/JIN infusion marker"); }
+    match &markers[0].1 {
+        QubJinInfusionMarker::MeltQub { qub_atoms, .. } => Ok(*qub_atoms),
+        QubJinInfusionMarker::InfuseJin { .. } => Ok(0),
+    }
+}
+
+fn validate_qub_jin_infusion_transaction_with_state(tx: &Transaction, ledger: &mut HashMap<String, u128>, state: &mut QubJinInfusionState, base_utxos: &HashMap<OutPoint, CoinRecord>, height: u32, settings: &Settings) -> Result<()> {
+    let markers = qub_jin_infusion_markers_in_tx(tx, settings);
+    if markers.is_empty() { return Ok(()); }
+    if !qub_jin_infusion_active(settings, height) { bail!("QUB/JIN infusion activates at block #{}", qub_jin_infusion_activation_height(settings)); }
+    if tx.is_coinbase() { bail!("coinbase cannot contain QUB/JIN infusion actions"); }
+    if markers.len() != 1 { bail!("a transaction may contain exactly one QUB/JIN infusion marker"); }
+    if !jin_transfers_in_tx(tx, settings).is_empty() || !jin_conversions_in_tx(tx, settings).is_empty() || !jin_sale_purchases_in_tx(tx, settings).is_empty() {
+        bail!("QUB/JIN infusion actions must be standalone JIN-accounting transactions");
+    }
+    let (_idx, marker, marker_atoms) = &markers[0];
+    if *marker_atoms != settings.jin.marker_output_atoms { bail!("QUB/JIN infusion marker output must be exactly {} atom(s)", settings.jin.marker_output_atoms); }
+    let from_text = match marker {
+        QubJinInfusionMarker::InfuseJin { from, .. } => from,
+        QubJinInfusionMarker::MeltQub { from, .. } => from,
+    };
+    let from = Address::parse_with_prefix(from_text, &settings.network.address_prefix)?;
+    if !input_authorizes_address(tx, base_utxos, &from) { bail!("QUB/JIN infusion action is not authorized by a QUB input from the source address"); }
+    if let QubJinInfusionMarker::MeltQub { qub_atoms, .. } = marker {
+        let raw_fee_plus_burn = validate_tx_contextual(tx, base_utxos, height, settings, true)?;
+        if raw_fee_plus_burn < *qub_atoms { bail!("QUB melt transaction must burn the declared QUB amount in addition to miner fee"); }
+    }
+    qub_jin_apply_marker_unchecked(settings, ledger, state, marker)
+}
+
+fn validate_qub_jin_infusion_transaction_against_chain(tx: &Transaction, chain: &ChainState, spend_height: u32, settings: &Settings) -> Result<()> {
+    let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
+    let mut state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
+    qub_jin_apply_bootstrap_for_context(settings, &mut ledger, &mut state, chain.height(), spend_height)?;
+    let mut scratch = chain.utxos.clone();
+    let mut pending = chain.mempool.iter().collect::<Vec<_>>();
+    pending.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
+    for mem in pending {
+        if mem.txid() == tx.txid() { continue; }
+        if validate_jin_transaction_with_ledger(mem, &mut ledger, &scratch, spend_height, settings, None).is_ok() {
+            let _ = validate_qub_jin_infusion_transaction_with_state(mem, &mut ledger, &mut state, &scratch, spend_height, settings);
+            let _ = connect_tx_utxos(mem, &mut scratch, spend_height, false);
+        }
+    }
+    validate_qub_jin_infusion_transaction_with_state(tx, &mut ledger, &mut state, &scratch, spend_height, settings)
+}
+
+
 const JIN_SWAP_SCRIPT_PREFIX: &[u8] = b"JINSWAP1|";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2357,6 +2715,18 @@ pub fn jin_swap_sale_listing_total_units(settings: &Settings, listing_id: u32) -
     Ok((total - start).min(batch))
 }
 
+pub fn jin_swap_sale_listing_total_units_at_height(settings: &Settings, listing_id: u32, height: u32) -> Result<u128> {
+    let batches = jin_swap_sale_batch_count(settings)?;
+    if listing_id >= batches { bail!("invalid JIN sale listing id"); }
+    if settings.network.name == "mainnet" && height >= qub_jin_sale_reserve_lock_height(settings) {
+        let reserved_start = batches.saturating_sub(QUB_JIN_RESERVED_SALE_BATCHES);
+        if listing_id >= reserved_start {
+            return Ok(0);
+        }
+    }
+    jin_swap_sale_listing_total_units(settings, listing_id)
+}
+
 pub fn jin_swap_sale_price_atoms(settings: &Settings, listing_id: u32, amount_units: u128) -> Result<u64> {
     if amount_units == 0 { bail!("JIN sale amount must be non-zero"); }
     if amount_units % JIN_UNITS_PER_COIN != 0 { bail!("JIN public sale uses whole JIN units only"); }
@@ -2409,6 +2779,7 @@ pub fn is_jin_sale_purchase_transaction(tx: &Transaction, settings: &Settings) -
 
 pub fn is_jin_protocol_transaction(tx: &Transaction, settings: &Settings) -> bool {
     is_jin_sale_purchase_transaction(tx, settings)
+        || is_qub_jin_infusion_transaction(tx, settings)
         || !jin_transfers_in_tx(tx, settings).is_empty()
         || !jin_conversions_in_tx(tx, settings).is_empty()
 }
@@ -2416,9 +2787,10 @@ pub fn is_jin_protocol_transaction(tx: &Transaction, settings: &Settings) -> boo
 pub fn mempool_template_priority(settings: &Settings, tx: &Transaction) -> u8 {
     if is_pool_share_transaction(tx) { return 0; }
     if is_jin_sale_purchase_transaction(tx, settings) { return 1; }
-    if is_jin_protocol_transaction(tx, settings) { return 2; }
-    if is_blast_claim_transaction(tx, settings) { return 3; }
-    if !library_markers_in_tx(tx, settings).is_empty() { return 4; }
+    if is_qub_jin_infusion_transaction(tx, settings) { return 2; }
+    if is_jin_protocol_transaction(tx, settings) { return 3; }
+    if is_blast_claim_transaction(tx, settings) { return 4; }
+    if !library_markers_in_tx(tx, settings).is_empty() { return 5; }
     16
 }
 
@@ -2513,9 +2885,10 @@ fn jin_sale_sold_by_listing_with_mempool(settings: &Settings, chain: &ChainState
 pub fn jin_sale_listings(settings: &Settings, chain: &ChainState) -> Result<Vec<JinSaleListing>> {
     let sold = jin_sale_sold_by_listing_with_mempool(settings, chain)?;
     let count = jin_swap_sale_batch_count(settings)?;
+    let display_height = chain.height() + 1;
     let mut out = Vec::new();
     for listing_id in 0..count {
-        let total_units = jin_swap_sale_listing_total_units(settings, listing_id)?;
+        let total_units = jin_swap_sale_listing_total_units_at_height(settings, listing_id, display_height)?;
         let sold_units = sold.get(&listing_id).copied().unwrap_or(0).min(total_units);
         let remaining_units = total_units.saturating_sub(sold_units);
         out.push(JinSaleListing {
@@ -2546,7 +2919,7 @@ fn validate_jin_sale_purchase_state(purchases: &[(usize, JinSalePurchase, u64)],
     if !input_authorizes_address(tx, utxos, &buyer) { bail!("JIN sale purchase must be authorized by a QUB input from buyer address"); }
     if purchase.amount_units == 0 { bail!("JIN sale amount must be non-zero"); }
     if purchase.amount_units % JIN_UNITS_PER_COIN != 0 { bail!("JIN public sale uses whole JIN units only"); }
-    let listing_total = jin_swap_sale_listing_total_units(settings, purchase.listing_id)?;
+    let listing_total = jin_swap_sale_listing_total_units_at_height(settings, purchase.listing_id, spend_height)?;
     let already_sold = sold.get(&purchase.listing_id).copied().unwrap_or(0);
     let remaining = listing_total.saturating_sub(already_sold);
     if purchase.amount_units > remaining { bail!("JIN sale listing has insufficient remaining JIN"); }
@@ -2645,8 +3018,12 @@ pub fn jin_ledger_from_blocks(settings: &Settings, blocks: &[Block]) -> Result<H
     let visible_height = blocks.len().saturating_sub(1) as u32;
     if visible_height < settings.jin.activation_height { return Ok(ledger); }
     jin_credit(&mut ledger, &settings.jin.protocol_address, JIN_TOTAL_SUPPLY_UNITS)?;
+    let mut qub_jin_state = QubJinInfusionState::inactive(settings);
     for (height, block) in blocks.iter().enumerate().skip(1) {
         let height = height as u32;
+        if height == qub_jin_infusion_activation_height(settings) {
+            qub_jin_apply_bootstrap(settings, &mut ledger, &mut qub_jin_state)?;
+        }
         if height < settings.jin.activation_height { continue; }
         let pool_block = parse_pool_block_marker(block).is_some();
         let miner = if pool_block { None } else { coinbase_miner_address(settings, block) };
@@ -2668,6 +3045,11 @@ pub fn jin_ledger_from_blocks(settings: &Settings, blocks: &[Block]) -> Result<H
                 if pool_block && conversion.fee_asset == "JIN" { block_jin_fees = block_jin_fees.checked_add(conversion.fee_units).context("JIN conversion fee overflow")?; }
                 apply_jin_conversion(&mut ledger, &conversion, settings, miner.as_deref())?;
             }
+            for (_, marker, marker_atoms) in qub_jin_infusion_markers_in_tx(tx, settings) {
+                if !qub_jin_infusion_active(settings, height) { bail!("QUB/JIN infusion activates at block #{}", qub_jin_infusion_activation_height(settings)); }
+                if marker_atoms != settings.jin.marker_output_atoms { bail!("QUB/JIN infusion marker output must be exactly {} atom(s)", settings.jin.marker_output_atoms); }
+                qub_jin_apply_marker_unchecked(settings, &mut ledger, &mut qub_jin_state, &marker)?;
+            }
         }
         if pool_block && block_jin_fees > 0 {
             for (addr, units) in jin_fee_receivers_for_block(settings, &blocks[..height as usize], block, block_jin_fees)? {
@@ -2682,6 +3064,9 @@ pub fn jin_ledger_from_blocks(settings: &Settings, blocks: &[Block]) -> Result<H
 pub fn jin_balance_units_for_address(settings: &Settings, chain: &ChainState, address: &str) -> Result<u128> {
     Address::parse_with_prefix(address, &settings.network.address_prefix)?;
     let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
+    let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
+    let spend_height = chain.height() + 1;
+    let _ = qub_jin_apply_bootstrap_for_context(settings, &mut ledger, &mut qub_jin_state, chain.height(), spend_height);
     // Show local mempool effects optimistically for the selected address.
     for tx in &chain.mempool {
         for (_, purchase, _) in jin_sale_purchases_in_tx(tx, settings) {
@@ -2692,6 +3077,14 @@ pub fn jin_balance_units_for_address(settings: &Settings, chain: &ChainState, ad
         }
         for (_, conversion, _) in jin_conversions_in_tx(tx, settings) {
             let _ = apply_jin_conversion(&mut ledger, &conversion, settings, None);
+        }
+        for (_, marker, _) in qub_jin_infusion_markers_in_tx(tx, settings) {
+            let mut ledger_trial = ledger.clone();
+            let mut state_trial = qub_jin_state.clone();
+            if qub_jin_apply_marker_unchecked(settings, &mut ledger_trial, &mut state_trial, &marker).is_ok() {
+                ledger = ledger_trial;
+                qub_jin_state = state_trial;
+            }
         }
     }
     Ok(ledger.get(address).copied().unwrap_or(0))
@@ -2735,15 +3128,22 @@ fn validate_jin_transaction_with_ledger(tx: &Transaction, ledger: &mut HashMap<S
 
 fn validate_jin_transaction_against_chain(tx: &Transaction, chain: &ChainState, spend_height: u32, settings: &Settings) -> Result<u128> {
     let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
+    let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
+    qub_jin_apply_bootstrap_for_context(settings, &mut ledger, &mut qub_jin_state, chain.height(), spend_height)?;
     for mem in &chain.mempool {
         if mem.txid() == tx.txid() { continue; }
-        let _ = validate_jin_transaction_with_ledger(mem, &mut ledger, &chain.utxos, spend_height, settings, None);
+        if validate_jin_transaction_with_ledger(mem, &mut ledger, &chain.utxos, spend_height, settings, None).is_ok() {
+            let _ = validate_qub_jin_infusion_transaction_with_state(mem, &mut ledger, &mut qub_jin_state, &chain.utxos, spend_height, settings);
+        }
     }
     validate_jin_transaction_with_ledger(tx, &mut ledger, &chain.utxos, spend_height, settings, None)
 }
 
 fn validate_jin_block(block: &Block, prior_blocks: &[Block], base_utxos: &HashMap<OutPoint, CoinRecord>, height: u32, settings: &Settings) -> Result<()> {
     let mut ledger = jin_ledger_from_blocks(settings, prior_blocks)?;
+    let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, prior_blocks)?;
+    let prior_visible_height = prior_blocks.len().saturating_sub(1) as u32;
+    qub_jin_apply_bootstrap_for_context(settings, &mut ledger, &mut qub_jin_state, prior_visible_height, height)?;
     let mut scratch = base_utxos.clone();
     let pool_block = parse_pool_block_marker(block).is_some();
     let miner = if pool_block { None } else { coinbase_miner_address(settings, block) };
@@ -2753,6 +3153,7 @@ fn validate_jin_block(block: &Block, prior_blocks: &[Block], base_utxos: &HashMa
         if !jin_conversion_active(settings, height) && !jin_conversions_in_tx(tx, settings).is_empty() { bail!("JIN Coin -> Token conversion is disabled until the Enjin bridge is live"); }
         validate_tx_contextual(tx, &scratch, height, settings, true)?;
         let fee_units = validate_jin_transaction_with_ledger(tx, &mut ledger, &scratch, height, settings, miner.as_deref())?;
+        validate_qub_jin_infusion_transaction_with_state(tx, &mut ledger, &mut qub_jin_state, &scratch, height, settings)?;
         if pool_block { block_jin_fees = block_jin_fees.checked_add(fee_units).context("JIN block fee overflow")?; }
         connect_tx_utxos(tx, &mut scratch, height, false)?;
     }

@@ -38,6 +38,9 @@ fn run() -> Result<()> {
         "jin-balance" => cmd_jin_balance(&settings, args.get(1).map(String::as_str)),
         "jin-sale-list" => cmd_jin_sale_list(&settings),
         "buy-jin" => cmd_buy_jin(&settings, args.get(1).context("usage: buy-jin <listing-id> <amount_jin> [fee]")?, args.get(2).context("usage: buy-jin <listing-id> <amount_jin> [fee]")?, args.get(3).map(String::as_str).unwrap_or("0.00001")),
+        "qub-jin-infusion" => cmd_qub_jin_infusion(&settings),
+        "infuse-jin-qub" => cmd_infuse_jin_qub(&settings, args.get(1).context("usage: infuse-jin-qub <amount_jin> [fee]")?, args.get(2).map(String::as_str).unwrap_or("0.00001")),
+        "melt-qub-jin" => cmd_melt_qub_jin(&settings, args.get(1).context("usage: melt-qub-jin <amount_qub> [fee] [min_jin]")?, args.get(2).map(String::as_str).unwrap_or("0.00001"), args.get(3).map(String::as_str)),
         "mempool" => cmd_mempool(&settings),
         "relay-mempool" => cmd_relay_mempool(&settings),
         "send" => cmd_send(&settings, args.get(1).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(2).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(3).map(String::as_str).unwrap_or("0.00001")),
@@ -87,6 +90,7 @@ fn cmd_info(settings: &Settings) -> Result<()> {
     let spendable = wallet.balance_atoms(&chain, settings, false)?;
     let total = wallet.balance_atoms(&chain, settings, true)?;
     let wallet_total_jin = wallet.jin_balance_units(&chain, settings).unwrap_or(0);
+    let qub_jin_state = qub_jin_infusion_state(settings, &chain).ok();
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "chain": settings.network.name,
         "height": chain.height(),
@@ -100,6 +104,17 @@ fn cmd_info(settings: &Settings) -> Result<()> {
         "jin_activation_height": settings.jin.activation_height,
         "jin_conversion_activation_height": settings.jin.conversion_activation_height,
         "jin_protocol_address": settings.jin.protocol_address,
+        "qub_jin_infusion_activation_height": qub_jin_infusion_activation_height(settings),
+        "qub_jin_sale_reserve_lock_height": qub_jin_sale_reserve_lock_height(settings),
+        "qub_jin_infusion_active": qub_jin_infusion_active(settings, chain.height() + 1),
+        "qub_jin_infusion": qub_jin_state.as_ref().map(|st| serde_json::json!({
+            "melted_qub": Amount::from_atoms(st.melted_qub_atoms).map(|a| a.to_string()).unwrap_or_else(|_| st.melted_qub_atoms.to_string()),
+            "true_max_qub": Amount::from_atoms(st.true_max_qub_atoms).map(|a| a.to_string()).unwrap_or_else(|_| st.true_max_qub_atoms.to_string()),
+            "lifetime_infused_jin": format_jin_amount(st.lifetime_infused_jin_units),
+            "active_infused_jin": format_jin_amount(st.active_infused_jin_units),
+            "jin_per_qub": format_jin_amount(st.units_per_qub_atom.saturating_mul(ATOMS_PER_QUB as u128)),
+            "units_per_qub_atom": st.units_per_qub_atom.to_string(),
+        })),
         "feature_notice": v1_feature_notice(settings),
         "qns_enabled": settings.qns.enabled,
         "qns_activation_height": settings.qns.activation_height,
@@ -203,6 +218,75 @@ fn cmd_buy_jin(settings: &Settings, listing_id_s: &str, amount: &str, fee: &str)
         "txid": txid.to_string(),
         "listing_id": listing_id,
         "amount_jin": format_jin_amount(units),
+        "relayed_to_peers": relayed,
+        "local_mempooltx": chain.mempool.len()
+    }))?);
+    Ok(())
+}
+
+fn cmd_qub_jin_infusion(settings: &Settings) -> Result<()> {
+    let chain = load_or_init_chain(settings)?;
+    let st = qub_jin_infusion_state(settings, &chain)?;
+    let per_qub_units = st.units_per_qub_atom.saturating_mul(ATOMS_PER_QUB as u128);
+    let min_step_units = qub_jin_infusion_minimum_step_units(settings, &chain).unwrap_or(st.true_max_qub_atoms as u128);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "height": chain.height(),
+        "activation_height": qub_jin_infusion_activation_height(settings),
+        "sale_reserve_lock_height": qub_jin_sale_reserve_lock_height(settings),
+        "active_next_block": qub_jin_infusion_active(settings, chain.height() + 1),
+        "bootstrap_jin": format_jin_amount(st.bootstrap_units),
+        "reserved_sale_batches": QUB_JIN_RESERVED_SALE_BATCHES,
+        "melted_qub_atoms": st.melted_qub_atoms,
+        "melted_qub": Amount::from_atoms(st.melted_qub_atoms)?.to_string(),
+        "true_max_qub_atoms": st.true_max_qub_atoms,
+        "true_max_qub": Amount::from_atoms(st.true_max_qub_atoms)?.to_string(),
+        "lifetime_infused_jin_units": st.lifetime_infused_jin_units.to_string(),
+        "lifetime_infused_jin": format_jin_amount(st.lifetime_infused_jin_units),
+        "active_infused_jin_units": st.active_infused_jin_units.to_string(),
+        "active_infused_jin": format_jin_amount(st.active_infused_jin_units),
+        "units_per_qub_atom": st.units_per_qub_atom.to_string(),
+        "jin_per_qub": format!("{} JIN/QUB", format_jin_amount(per_qub_units)),
+        "minimum_infuse_step_jin_units": min_step_units.to_string(),
+        "minimum_infuse_step_jin": format_jin_amount(min_step_units),
+    }))?);
+    Ok(())
+}
+
+fn cmd_infuse_jin_qub(settings: &Settings, amount: &str, fee: &str) -> Result<()> {
+    let mut chain = load_or_init_chain(settings)?;
+    let wallet = load_or_init_wallet(settings)?;
+    let units = parse_jin_amount(amount.trim())?;
+    let tx = wallet.create_qub_jin_infuse_transaction(&chain, settings, units, Amount::from_str(fee.trim())?)?;
+    let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
+    save_chain(settings, &chain)?;
+    let relayed = p2p::broadcast_tx_limited(settings, &tx, 24, 850).unwrap_or(0);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "txid": txid.to_string(),
+        "amount_jin": format_jin_amount(units),
+        "relayed_to_peers": relayed,
+        "local_mempooltx": chain.mempool.len()
+    }))?);
+    Ok(())
+}
+
+fn cmd_melt_qub_jin(settings: &Settings, amount: &str, fee: &str, min_jin: Option<&str>) -> Result<()> {
+    let mut chain = load_or_init_chain(settings)?;
+    let wallet = load_or_init_wallet(settings)?;
+    let qub_amount = Amount::from_str(amount.trim())?;
+    let expected = qub_jin_melt_payout_units_for_atoms(settings, &chain, qub_amount.atoms())?;
+    let min_units = match min_jin {
+        Some(v) => parse_jin_amount(v.trim())?,
+        None => expected,
+    };
+    let tx = wallet.create_qub_melt_for_jin_transaction(&chain, settings, qub_amount, Amount::from_str(fee.trim())?, min_units)?;
+    let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
+    save_chain(settings, &chain)?;
+    let relayed = p2p::broadcast_tx_limited(settings, &tx, 24, 850).unwrap_or(0);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "txid": txid.to_string(),
+        "melt_qub": qub_amount.to_string(),
+        "expected_jin": format_jin_amount(expected),
+        "min_jin": format_jin_amount(min_units),
         "relayed_to_peers": relayed,
         "local_mempooltx": chain.mempool.len()
     }))?);
@@ -1026,6 +1110,24 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_blast_activation_10600", MAINNET_BLAST_ACTIVATION_HEIGHT == 10600, "Blast activates at #10600".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_library_activation_10550", MAINNET_LIBRARY_ACTIVATION_HEIGHT == 10550 && settings.library.activation_height == 10550, "Library activates at #10550".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_jin_sale_activation_10720", MAINNET_JIN_SWAP_ACTIVATION_HEIGHT == 10720 && settings.jin_swap.activation_height == 10720, "JIN public sale activates at #10720".to_string());
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_infusion_activation_16777", MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT == 16777 && qub_jin_infusion_activation_height(settings) == 16777, "HF116 JIN Coin infusion into QUB activates at #16777".to_string());
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_sale_reserve_lock_16666", MAINNET_QUB_JIN_SALE_RESERVE_LOCK_HEIGHT == 16666 && qub_jin_sale_reserve_lock_height(settings) == 16666, "HF116 locks the final 42 JIN sale batches at #16666 so the #16777 bootstrap reserve cannot be drained".to_string());
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_bootstrap_exact", qub_jin_bootstrap_units_per_atom(settings).map(|v| v == 20_000_000_000u128).unwrap_or(false), "HF116 bootstrap must be exactly 2 JIN/QUB = 20,000,000,000 JIN units per QUB atom".to_string());
+        let hf116_activation = qub_jin_infusion_activation_height(settings);
+        let hf116_activation_detail = if current_height < hf116_activation {
+            format!("HF116 activation is {} block(s) ahead: current #{} -> activation #{}", hf116_activation.saturating_sub(current_height), current_height, hf116_activation)
+        } else {
+            format!("HF116 already active or at activation: current #{} activation #{}", current_height, hf116_activation)
+        };
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_infusion_activation_not_missed", current_height <= hf116_activation || qub_jin_infusion_state(settings, &chain).map(|st| st.active && st.lifetime_infused_jin_units >= qub_jin_bootstrap_units(settings)).unwrap_or(false), hf116_activation_detail);
+        let bootstrap_reserve_ok = if current_height < hf116_activation {
+            jin_ledger_from_blocks(settings, &chain.blocks)
+                .map(|ledger| ledger.get(&settings.jin.protocol_address).copied().unwrap_or(0) >= qub_jin_bootstrap_units(settings))
+                .unwrap_or(false)
+        } else {
+            qub_jin_infusion_state(settings, &chain).map(|st| st.lifetime_infused_jin_units >= qub_jin_bootstrap_units(settings)).unwrap_or(false)
+        };
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_bootstrap_protocol_reserve", bootstrap_reserve_ok, "protocol JIN reserve must cover the 42,000,000 JIN HF116 bootstrap before activation, or chain state must already show the bootstrap after activation".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_jin_conversion_disabled_10720", MAINNET_JIN_CONVERSION_DISABLE_HEIGHT == 10720, "JIN Coin -> Token conversion disabled from #10720 until bridge is live".to_string());
     } else if settings.network.name == "testnet" {
         let seeds = p2p::release_bootnodes(settings);
@@ -1209,6 +1311,7 @@ fn explorer_summary(settings: &Settings, chain: &ChainState) -> serde_json::Valu
     let tx_count: usize = chain.blocks.iter().map(|b| b.transactions.len()).sum();
     let supply_atoms: u64 = chain.utxos.values().map(|c| c.tx_out.value.atoms()).sum();
     let peers = p2p::peer_status(settings).ok();
+    let qub_jin = qub_jin_infusion_state(settings, chain).ok();
     serde_json::json!({
         "network": settings.network.name,
         "height": chain.height(),
@@ -1219,6 +1322,21 @@ fn explorer_summary(settings: &Settings, chain: &ChainState) -> serde_json::Valu
         "utxo_count": chain.utxos.len(),
         "supply_atoms": supply_atoms,
         "supply_qub": amount_string(supply_atoms),
+        "qub_jin_infusion": qub_jin.as_ref().map(|st| serde_json::json!({
+            "activation_height": qub_jin_infusion_activation_height(settings),
+            "sale_reserve_lock_height": qub_jin_sale_reserve_lock_height(settings),
+            "active_next_block": qub_jin_infusion_active(settings, chain.height() + 1),
+            "melted_qub_atoms": st.melted_qub_atoms,
+            "melted_qub": amount_string(st.melted_qub_atoms),
+            "true_max_qub_atoms": st.true_max_qub_atoms,
+            "true_max_qub": amount_string(st.true_max_qub_atoms),
+            "lifetime_infused_jin_units": st.lifetime_infused_jin_units.to_string(),
+            "lifetime_infused_jin": format_jin_amount(st.lifetime_infused_jin_units),
+            "active_infused_jin_units": st.active_infused_jin_units.to_string(),
+            "active_infused_jin": format_jin_amount(st.active_infused_jin_units),
+            "units_per_qub_atom": st.units_per_qub_atom.to_string(),
+            "jin_per_qub": format_jin_amount(st.units_per_qub_atom.saturating_mul(ATOMS_PER_QUB as u128)),
+        })),
         "target_spacing_secs": settings.consensus.target_spacing_secs,
         "initial_subsidy_qub": amount_string(settings.consensus.initial_subsidy_atoms),
         "halving_interval": settings.consensus.subsidy_halving_interval,
@@ -1500,6 +1618,10 @@ fn tx_json(settings: &Settings, chain: &ChainState, tx: &Transaction, confirmed_
             "pool_top_up": parse_pool_topup_marker_script(&out.script_pubkey, settings).map(|p| serde_json::json!({"pool_id": p.pool_id.to_string(), "manager_address": p.manager_address, "extra_capacity_slots": p.extra_capacity_slots})),
             "pool_commission": parse_pool_commission_marker_script(&out.script_pubkey, settings).map(|p| serde_json::json!({"pool_id": p.pool_id.to_string(), "manager_address": p.manager_address, "new_commission_bps": p.new_commission_bps})),
             "pool_rename": parse_pool_rename_marker_script(&out.script_pubkey, settings).map(|p| serde_json::json!({"pool_id": p.pool_id.to_string(), "manager_address": p.manager_address, "new_name": p.new_name})),
+            "qub_jin_infusion": parse_qub_jin_infusion_script(&out.script_pubkey, settings).map(|m| match m {
+                QubJinInfusionMarker::InfuseJin { from, amount_units } => serde_json::json!({"kind":"infuse_jin_into_qub", "from": from, "amount_units": amount_units.to_string(), "amount_jin": format_jin_amount(amount_units)}),
+                QubJinInfusionMarker::MeltQub { from, qub_atoms, min_jin_units } => serde_json::json!({"kind":"melt_qub_for_jin", "from": from, "qub_atoms": qub_atoms, "qub": amount_string(qub_atoms), "min_jin_units": min_jin_units.to_string(), "min_jin": format_jin_amount(min_jin_units)}),
+            }),
             "spent_by": spent_by,
         })
     }).collect::<Vec<_>>();
@@ -1662,4 +1784,4 @@ fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &st
     Ok(())
 }
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> { let pos = args.iter().position(|a| a == flag)?; args.remove(pos); if pos >= args.len() { None } else { Some(args.remove(pos)) } }
-fn help(config: &str) { println!("QUB Core v1.7.3\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }
+fn help(config: &str) { println!("QUB Core v1.7.4\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }

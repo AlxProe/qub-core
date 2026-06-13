@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.3/"; // HF115
+const USER_AGENT: &str = "/QUB Core:1.7.4/"; // HF116
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -899,7 +899,7 @@ fn hf114_official_tip_is_local_ancestor(settings: &Settings, local: &ChainState,
 }
 
 
-/// HF115/v1.7.3: liveness-preserving exact HTTP acknowledgement. HF114 made
+/// HF116/v1.7.4: liveness-preserving exact HTTP acknowledgement. HF114 made
 /// live mainnet mining depend on exact TCP seed/direct peer acknowledgement. If
 /// seed TCP is unavailable or stale while the official published snapshot tip is
 /// exactly our local tip, all honest GUI miners can deadlock at the public tip.
@@ -1015,7 +1015,7 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
     // least one official/direct TCP seed sample so a stale published tip cannot
     // green-light an old local parent while the live seed already moved ahead.
     if direct_contacted == 0 || best_height == 0 {
-        // HF115: exact official HTTP/public-snapshot acknowledgement is enough to
+        // HF116: exact official HTTP/public-snapshot acknowledgement is enough to
         // keep mainnet alive when TCP seeds are unreachable. HF114 rejected this
         // and could freeze every honest miner at the public tip until a seed or
         // two exact peers came back. This remains exact-tip only and is vetoed by
@@ -1039,7 +1039,7 @@ fn hf104_canonical_greenlight(settings: &Settings, report: &mut P2PSyncReport, l
     // official/direct tip, do not hash on that suffix; the repair/re-anchor path
     // will roll back or replace it before mining resumes.
     if !hf114_official_tip_acknowledges_local(settings, local, best_height, &best_tip) {
-        // HF115: if an official TCP seed is reachable but stale/lower, do not let
+        // HF116: if an official TCP seed is reachable but stale/lower, do not let
         // it freeze the network after the next public block. Exact HTTP/public
         // snapshot acknowledgement wins, and if the published snapshot also lags,
         // two direct peers acknowledging our exact local tip are enough to keep
@@ -1226,7 +1226,7 @@ pub fn hf113_live_tip_pause_reason(settings: &Settings, parent_height: u32, pare
                 {
                     return None;
                 }
-                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF115 canonical acknowledgement/re-anchor", parent_height, official_h));
+                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF116 canonical acknowledgement/re-anchor", parent_height, official_h));
             }
             if official_h == parent_height {
                 if official_tip.trim().is_empty() && settings.network.name == "mainnet" {
@@ -3520,7 +3520,7 @@ fn direct_parent_view(settings: &Settings, parent_height: u32, expected_parent_h
         }
     }
 
-    // HF115: on mainnet, one noisy/future/private peer must not pause every
+    // HF116: on mainnet, one noisy/future/private peer must not pause every
     // miner or make a found block miss the submit window. Only a two-peer quorum
     // is returned as an actionable ahead/conflict signal. Non-mainnet keeps the
     // old more aggressive direct-peer behavior for tests/dev networks.
@@ -3682,7 +3682,7 @@ fn force_official_tip_if_ahead(settings: &Settings, report: &mut P2PSyncReport, 
             && !hf114_official_tip_acknowledges_local(settings, local, latest_official_height, &latest_official_tip)
         {
             bail!(
-                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF115 prevents extending this stale suffix.",
+                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF116 prevents extending this stale suffix.",
                 local.height(),
                 latest_official_height
             );
@@ -3744,7 +3744,7 @@ pub fn mining_parent_guard(settings: &Settings, parent_height: u32, expected_par
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_PARENT_GATE_MS)?;
     if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
-        bail!("mining candidate paused by HF115: local parent #{} is not acknowledged by official/direct canonical view or exact peer quorum.", local.height());
+        bail!("mining candidate paused by HF116: local parent #{} is not acknowledged by official/direct canonical view or exact peer quorum.", local.height());
     }
 
     if local.height() != parent_height || local.tip_hash() != expected_parent_hash {
@@ -3964,7 +3964,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_FAST_GATE_MS)?;
     if settings.network.name == "mainnet" && !hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
-        bail!("mining paused by HF115: local tip #{} is not acknowledged by official/direct canonical view or exact peer quorum. This prevents all-self-mined local stale branches.", local.height());
+        bail!("mining paused by HF116: local tip #{} is not acknowledged by official/direct canonical view or exact peer quorum. This prevents all-self-mined local stale branches.", local.height());
     }
     if hf97_uncatchable_tip_quarantined(settings, &local, report.best_peer_height) {
         report.best_peer_height = local.height();
@@ -4072,11 +4072,11 @@ fn prioritized_outbound_peers(settings: &Settings, max_count: usize) -> Result<V
 }
 
 
-const HF115_MEMPOOL_RELAY_BATCH_TXS: usize = 512;
-const HF115_MEMPOOL_INBOUND_BATCH_TXS: usize = 2_048;
+const HF116_MEMPOOL_RELAY_BATCH_TXS: usize = 512;
+const HF116_MEMPOOL_INBOUND_BATCH_TXS: usize = 2_048;
 
 fn hf115_mempool_inbound_limit(settings: &Settings) -> usize {
-    effective_mempool_max_transactions(settings).min(HF115_MEMPOOL_INBOUND_BATCH_TXS).max(1)
+    effective_mempool_max_transactions(settings).min(HF116_MEMPOOL_INBOUND_BATCH_TXS).max(1)
 }
 
 fn hf115_mempool_relay_batch(settings: &Settings, mempool: &[Transaction]) -> Vec<Transaction> {
@@ -4086,7 +4086,7 @@ fn hf115_mempool_relay_batch(settings: &Settings, mempool: &[Transaction]) -> Ve
         .collect::<Vec<_>>();
     txs.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
     txs.into_iter()
-        .take(hf115_mempool_inbound_limit(settings).min(HF115_MEMPOOL_RELAY_BATCH_TXS))
+        .take(hf115_mempool_inbound_limit(settings).min(HF116_MEMPOOL_RELAY_BATCH_TXS))
         .cloned()
         .collect::<Vec<_>>()
 }
@@ -4118,7 +4118,7 @@ pub fn rebroadcast_local_mempool(settings: &Settings, max_txs: usize) -> Result<
     // network while ordinary traffic is relayed first.
     txs.sort_by_cached_key(|tx| (mempool_template_priority(settings, *tx), tx.txid().to_string()));
     let mut sent = 0usize;
-    for tx in txs.into_iter().filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok()).take(max_txs.max(1).min(HF115_MEMPOOL_RELAY_BATCH_TXS)) {
+    for tx in txs.into_iter().filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok()).take(max_txs.max(1).min(HF116_MEMPOOL_RELAY_BATCH_TXS)) {
         sent = sent.saturating_add(relay_tx_to_known_peers(settings, tx, None).unwrap_or(0));
     }
     Ok(sent)
@@ -4128,7 +4128,7 @@ pub fn broadcast_block(settings: &Settings, block: &Block) -> Result<usize> {
     if !settings.p2p.enabled { return Ok(0); }
     let chain = load_chain_for_hf90_catchup(settings)?;
     let mut sent = 0usize;
-    // HF115: relay the found block plus a small recent suffix, not the entire
+    // HF116: relay the found block plus a small recent suffix, not the entire
     // chain to every peer. HF114 could spend the submit window serializing/sending
     // the whole chain repeatedly, which amplified JIN/Library/mempool load and
     // made block propagation look stalled on weak links. Peers that are far behind
