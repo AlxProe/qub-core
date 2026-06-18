@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.4/"; // HF116
+const USER_AGENT: &str = "/QUB Core:1.7.5/"; // HF117
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -514,8 +514,12 @@ pub fn run_node(settings: Settings) -> Result<()> {
                 // network #N but staying frozen at local #(N-k).
                 if disk_chain.height() > local.height() {
                     let mut adopted = disk_chain.clone();
-                    relay_after_merge.extend(merge_mempool_from_chain(&mut adopted, &local, &settings));
-                    relay_after_merge.extend(merge_mempool_from_chain(&mut adopted, &disk_chain, &settings));
+                    // HF117: if disk was advanced by a catch-up worker while the
+                    // embedded node still held a stale in-memory suffix, resurrect
+                    // txs from that replaced suffix before overwriting memory.
+                    let keep_mempool = local.reorg_mempool_candidates_for(&adopted);
+                    adopted.rebuild_mempool_from(keep_mempool, &settings);
+                    relay_after_merge.extend(adopted.mempool.iter().take(64).cloned());
                     *local = adopted;
                     let _ = save_chain(&settings, &local);
                 } else {
@@ -543,6 +547,12 @@ pub fn run_node(settings: Settings) -> Result<()> {
             }
             let mempool_for_periodic = if last_mempool_relay.elapsed() >= Duration::from_secs(6) {
                 last_mempool_relay = Instant::now();
+                // HF117: recover exact wallet-created txs from the persistent
+                // outbox before the periodic relay snapshot. This covers the case
+                // where a tx left mempool in a stale block and the GUI is idle.
+                if let Ok(report) = reconcile_pending_txs(&settings, &mut local) {
+                    if report.reaccepted > 0 { let _ = save_chain(&settings, &local); }
+                }
                 let mut txs = local.mempool.iter()
                     .filter(|tx| hf106_jin_sale_standardness_policy(tx, &settings).is_ok())
                     .cloned()
@@ -2521,10 +2531,9 @@ fn apply_official_tail_snapshot_hf114_reanchor(settings: &Settings, local_before
     }
     validate_chain_consensus_checkpoints(settings, &candidate.blocks)?;
 
-    // Keep valid local mempool transactions, but rebuild them against the
-    // canonical re-anchored chain so transactions already mined on the abandoned
-    // local suffix are either reaccepted safely or dropped by normal policy.
-    let keep_mempool = local_before.mempool.clone();
+    // HF117: rebuild with disconnected local suffix txs too, so QUB sends
+    // mined in a losing local branch return to the mempool after re-anchor.
+    let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
     candidate.rebuild_mempool_from(keep_mempool, settings);
     let rolled_back = local_height.saturating_sub(candidate.height()) as usize;
     Ok((candidate, rolled_back.saturating_add(appended_from_tail)))
@@ -2666,8 +2675,7 @@ fn sync_official_http_snapshot_reanchor_hf114(settings: &Settings, official_heig
             || candidate.height() > local_height_before
             || (candidate.height() == local_height_before && candidate.tip_hash().to_string() != local_tip_before)
         {
-            let mut keep_mempool = local_before.mempool.clone();
-            keep_mempool.extend(candidate.mempool.clone());
+            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
             save_chain(settings, &candidate)?;
             mark_fresh_tip_trusted(settings, &candidate);
@@ -2737,8 +2745,7 @@ pub fn sync_official_http_tail(settings: &Settings, total_timeout_ms: u64) -> Re
         if candidate.height() > local_height_before
             || (candidate.height() == local_height_before && candidate.tip_hash().to_string() != local_tip_before)
         {
-            let mut keep_mempool = local_before.mempool.clone();
-            keep_mempool.extend(candidate.mempool.clone());
+            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
             save_chain(settings, &candidate)?;
             mark_fresh_tip_trusted(settings, &candidate);
@@ -2792,8 +2799,7 @@ pub fn sync_official_http_snapshot(settings: &Settings, total_timeout_ms: u64) -
         if candidate.height() > local_height_before
             || (candidate.height() == local_height_before && candidate.tip_hash().to_string() != local_tip_before)
         {
-            let mut keep_mempool = local_before.mempool.clone();
-            keep_mempool.extend(candidate.mempool.clone());
+            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
             save_chain(settings, &candidate)?;
             mark_fresh_tip_trusted(settings, &candidate);
@@ -2917,8 +2923,7 @@ fn sync_official_direct_full_chain(settings: &Settings, total_timeout_ms: u64) -
                         let repairs_same_height = candidate_height_now == local_height_before && candidate_tip_now != local_tip_before;
                         let matches_peer_tip = peer_tip.trim().is_empty() || candidate_height_now >= peer_height || candidate_tip_now == peer_tip;
                         if matches_peer_tip && (candidate_height_now > local_height_before || repairs_same_height) {
-                            let mut keep_mempool = local_before.mempool.clone();
-                            keep_mempool.extend(candidate.mempool.clone());
+                            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
                             candidate.rebuild_mempool_from(keep_mempool, settings);
                             save_chain(settings, &candidate)?;
                             mark_fresh_tip_trusted(settings, &candidate);
@@ -3478,8 +3483,8 @@ fn try_adopt_overlapping_blocks(local: &mut ChainState, start_height: u32, block
             && local.blocks.len() > cp
             && candidate.blocks[cp].block_hash() == local.blocks[cp].block_hash();
         if checkpoint_matches && candidate.height() > local_height_before {
-            let keep_mempool = local.mempool.clone();
             let mut candidate = candidate;
+            let keep_mempool = local.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
             *local = candidate;
             return Ok(true);
@@ -4200,9 +4205,13 @@ pub fn broadcast_tx_limited(settings: &Settings, tx: &Transaction, max_peers: us
 pub fn rebroadcast_txid_limited(settings: &Settings, txid: &Hash256, max_peers: usize, timeout_ms: u64) -> Result<usize> {
     if !settings.p2p.enabled { return Ok(0); }
     let chain = load_chain_for_hf90_catchup(settings)?;
-    let Some(tx) = chain.mempool.iter().find(|tx| tx.txid() == *txid).cloned() else {
-        return Ok(0);
-    };
+    let tx = chain
+        .mempool
+        .iter()
+        .find(|tx| tx.txid() == *txid)
+        .cloned()
+        .or_else(|| pending_tx_raw(settings, *txid).ok().flatten());
+    let Some(tx) = tx else { return Ok(0); };
     broadcast_tx_limited(settings, &tx, max_peers, timeout_ms)
 }
 

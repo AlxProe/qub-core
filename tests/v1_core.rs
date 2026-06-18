@@ -119,6 +119,58 @@ fn equal_work_forks_do_not_flip_without_explicit_preference() {
     assert_eq!(higher_tip_chain.tip_hash().to_string(), c1_tip.min(c2_tip));
 }
 
+
+#[test]
+fn reorg_resurrects_tx_from_abandoned_suffix_into_mempool() {
+    let s = regtest();
+    let opts = MiningOptions { duty_cycle_percent: 100, max_hashes: Some(5_000_000) };
+
+    let mut funder_wallet = WalletFile::new(&s.network.name);
+    let funder_key = funder_wallet.create_key(&s, "funder", 0).unwrap();
+    let funder = Address::parse_with_prefix(&funder_key.address, &s.network.address_prefix).unwrap();
+
+    let mut recipient_wallet = WalletFile::new(&s.network.name);
+    let recipient_key = recipient_wallet.create_key(&s, "recipient", 0).unwrap();
+    let recipient = Address::parse_with_prefix(&recipient_key.address, &s.network.address_prefix).unwrap();
+
+    let mut other_wallet = WalletFile::new(&s.network.name);
+    let other_key = other_wallet.create_key(&s, "other", 0).unwrap();
+    let other = Address::parse_with_prefix(&other_key.address, &s.network.address_prefix).unwrap();
+
+    let mut base = ChainState::new_with_genesis(&s).unwrap();
+    for _ in 0..3 {
+        let b = mine_next_block(&base, &s, &funder, opts).unwrap();
+        base.connect_block(b, &s).unwrap();
+    }
+
+    let tx = funder_wallet
+        .create_signed_transaction(
+            &base,
+            &s,
+            &recipient,
+            Amount::from_str("1.00").unwrap(),
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let txid = tx.txid();
+
+    let mut stale = base.clone();
+    stale.accept_transaction_to_mempool(tx.clone(), &s).unwrap();
+    let stale_block = mine_next_block(&stale, &s, &funder, opts).unwrap();
+    assert!(stale_block.transactions.iter().any(|t| t.txid() == txid));
+    stale.connect_block(stale_block, &s).unwrap();
+    assert!(!stale.tx_in_mempool(txid));
+
+    let mut winning = base.clone();
+    for _ in 0..2 {
+        let b = mine_next_block(&winning, &s, &other, opts).unwrap();
+        winning.connect_block(b, &s).unwrap();
+    }
+
+    assert!(stale.try_adopt_peer_chain(winning.blocks.clone(), &s, false).unwrap());
+    assert!(stale.tx_in_mempool(txid));
+}
+
 #[test]
 fn qns_price_and_registration_are_deterministic() {
     let s = regtest();
@@ -437,4 +489,48 @@ fn jin_public_sale_buy_is_consensus_valid() {
     assert_eq!(jin_balance_units_for_address(&s, &chain, &buyer.to_string()).unwrap(), amount_units);
     let listings = jin_sale_listings(&s, &chain).unwrap();
     assert!(listings[0].sold_units >= amount_units);
+}
+
+#[test]
+fn hf117_reorg_resurrects_qub_tx_from_stale_block() {
+    let s = regtest();
+    let mut base = ChainState::new_with_genesis(&s).unwrap();
+    let mut miner_wallet = WalletFile::new(&s.network.name);
+    let miner_key = miner_wallet.create_key(&s, "miner", 0).unwrap();
+    let miner = Address::parse_with_prefix(&miner_key.address, &s.network.address_prefix).unwrap();
+    let mut other_wallet = WalletFile::new(&s.network.name);
+    let other = Address::parse_with_prefix(&other_wallet.create_key(&s, "other", 0).unwrap().address, &s.network.address_prefix).unwrap();
+    let mut recipient_wallet = WalletFile::new(&s.network.name);
+    let recipient = Address::parse_with_prefix(&recipient_wallet.create_key(&s, "recipient", 0).unwrap().address, &s.network.address_prefix).unwrap();
+    let opts = MiningOptions { duty_cycle_percent: 100, max_hashes: Some(5_000_000) };
+
+    for _ in 0..s.consensus.coinbase_maturity.saturating_add(2) {
+        let b = mine_next_block(&base, &s, &miner, opts).unwrap();
+        base.connect_block(b, &s).unwrap();
+    }
+
+    let tx = miner_wallet.create_signed_transaction(
+        &base,
+        &s,
+        &recipient,
+        Amount::from_str("1.0").unwrap(),
+        Amount::from_str("0.00001").unwrap(),
+    ).unwrap();
+    let txid = tx.txid();
+
+    let mut stale_local = base.clone();
+    stale_local.accept_transaction_to_mempool(tx.clone(), &s).unwrap();
+    let stale_block = mine_next_block(&stale_local, &s, &miner, opts).unwrap();
+    assert!(stale_block.transactions.iter().any(|t| t.txid() == txid));
+    stale_local.connect_block(stale_block, &s).unwrap();
+    assert!(!stale_local.tx_in_mempool(txid));
+
+    let mut winning = base.clone();
+    for _ in 0..2 {
+        let b = mine_next_block(&winning, &s, &other, opts).unwrap();
+        winning.connect_block(b, &s).unwrap();
+    }
+    assert!(winning.height() > stale_local.height());
+    assert!(stale_local.try_adopt_peer_chain(winning.blocks.clone(), &s, false).unwrap());
+    assert!(stale_local.tx_in_mempool(txid), "HF117 should reaccept the QUB tx from the disconnected stale block");
 }

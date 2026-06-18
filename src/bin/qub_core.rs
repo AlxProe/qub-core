@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.4";
+const APP_VERSION: &str = "v1.7.5";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -879,7 +879,7 @@ impl Default for GuiPrefs {
             mining_peak_gpu_hash_rate_hps: 0.0,
             confirm_plaintext_wallet_risk: false,
             benchmark_seconds: 3,
-            pace_to_target_spacing: false,
+            pace_to_target_spacing: true,
             peer_view_mode: PeerViewMode::Web,
             peer_zoom: 1.0,
             left_mining_controls_expanded: true,
@@ -1890,7 +1890,10 @@ impl QubCoreApp {
             hf88_snapshot_timeout_count: 0,
             hf88_last_snapshot_success: Instant::now(),
         };
-        app.prefs.pace_to_target_spacing = false;
+        if !app.prefs.pace_to_target_spacing {
+            app.prefs.pace_to_target_spacing = true;
+            app.prefs_dirty = true;
+        }
         if app.prefs.gpu_device_selector.trim().is_empty() {
             app.prefs.gpu_device_selector = gpu_miner::GPU_DEVICE_ALL.to_string();
         }
@@ -1983,7 +1986,10 @@ impl QubCoreApp {
                 self.prefs_dirty = true;
             }
         }
-        self.prefs.pace_to_target_spacing = false;
+        if !self.prefs.pace_to_target_spacing {
+            self.prefs.pace_to_target_spacing = true;
+            self.prefs_dirty = true;
+        }
     }
 
     fn is_mainnet_network(&self) -> bool {
@@ -3417,8 +3423,14 @@ del "%~f0"
         self.gpu_workers = 0;
         self.gpu_device.clear();
         self.gpu_device_rates.clear();
-        self.prefs.pace_to_target_spacing = false;
-        let pace_to_target_spacing = false;
+        // HF117/v1.7.5: target-spacing pacing is policy, not consensus. It reduces
+        // last-winner head-start streaks and coinbase-only burst races without any
+        // chain upgrade or seed update. Keep the persisted preference defaulted ON.
+        if !self.prefs.pace_to_target_spacing {
+            self.prefs.pace_to_target_spacing = true;
+            self.prefs_dirty = true;
+        }
+        let pace_to_target_spacing = self.prefs.pace_to_target_spacing;
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
@@ -10021,7 +10033,9 @@ fn hf79_pre_tx_fast_sync(settings: &Settings) {
     // bounded self-healing catch-up path as mining so sends and normal actions are signed
     // against a fresh ledger even when the local node was parked behind.
     let _ = p2p::hf90_auto_catchup(settings, 45_000);
-    let _ = p2p::rebroadcast_local_mempool(settings, 8);
+    // HF117: recover/rebroadcast exact wallet outbox txs only. Avoid a generic
+    // whole-mempool burst right before signing/sending a new transaction.
+    hf117_pre_tx_outbox_recovery(settings);
 }
 
 fn hf114_pre_jin_buy_sync(settings: &Settings) {
@@ -10030,6 +10044,54 @@ fn hf114_pre_jin_buy_sync(settings: &Settings) {
     // whole-mempool rebroadcast burst that competes with mining relay right after
     // the user presses Buy. Exact-tx relay happens after the buy is accepted.
     let _ = p2p::hf90_auto_catchup(settings, 30_000);
+}
+
+fn hf117_relay_exact_wallet_tx(settings: &Settings, tx: &Transaction, txid: &Hash256) -> usize {
+    if !settings.p2p.enabled { return 0; }
+    // HF117/v1.7.5: exact, bounded relay for GUI-created wallet txs. This uses
+    // the same safe path as JIN buys, but applies it to normal QUB, MultiSend,
+    // QNS, Library, Blast and Pool-management txs too.
+    let mut relayed = p2p::broadcast_tx_limited(settings, tx, 24, 850).unwrap_or(0);
+    for _ in 0..2 {
+        relayed = relayed.saturating_add(p2p::rebroadcast_txid_limited(settings, txid, 24, 850).unwrap_or(0));
+        thread::sleep(Duration::from_millis(120));
+    }
+    relayed
+}
+
+fn hf117_remember_pending_tx(settings: &Settings, tx: &Transaction, label: &str) -> Result<()> {
+    // The canonical implementation lives in lib.rs and writes
+    // wallet-pending-txs.json beside chain.json/wallet.json. Keeping one format
+    // lets P2P heartbeat, tx-status queries and future CLI commands recover the
+    // same raw txs. Height is used only for operator diagnostics, so an already
+    // persisted fast snapshot is enough here.
+    let chain = load_or_init_chain_for_ui_fast(settings).or_else(|_| load_or_init_chain(settings))?;
+    remember_pending_tx(settings, &chain, tx, label)
+}
+
+fn hf117_recover_pending_tx_outbox(settings: &Settings, chain: &mut ChainState, only_txid: Option<&str>) -> Result<(usize, usize, usize)> {
+    let report = reconcile_pending_txs(settings, chain)?;
+    let mut relayed = 0usize;
+    if settings.p2p.enabled {
+        if let Ok(pending) = load_pending_txs(settings) {
+            for rec in pending.txs {
+                let txid_s = rec.txid.to_string();
+                if only_txid.map(|wanted| wanted != txid_s.as_str()).unwrap_or(false) { continue; }
+                if chain.tx_confirmations(rec.txid).map(|(_, c)| c >= rec.confirmations_required.max(1)).unwrap_or(false) { continue; }
+                if chain.tx_in_mempool(rec.txid) {
+                    relayed = relayed.saturating_add(hf117_relay_exact_wallet_tx(settings, &rec.tx, &rec.txid));
+                }
+            }
+        }
+    }
+    Ok((report.reaccepted, relayed, report.confirmed))
+}
+
+fn hf117_pre_tx_outbox_recovery(settings: &Settings) {
+    let Ok(mut chain) = load_or_init_chain(settings) else { return; };
+    if let Ok((reaccepted, _relayed, _confirmed)) = hf117_recover_pending_tx_outbox(settings, &mut chain, None) {
+        if reaccepted > 0 { let _ = save_chain(settings, &chain); }
+    }
 }
 
 fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fee: &str) -> Result<(String, usize, usize)> {
@@ -10043,15 +10105,9 @@ fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fe
     let tx = wallet.create_jin_public_sale_buy_transaction(&chain, &settings, listing_id, units, Amount::from_str(fee.trim())?)?;
     let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
     let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-buy-jin")?;
     save_chain(&settings, &chain)?;
-    // HF114: relay the exact JIN buy tx, not the whole mempool repeatedly. HF113's
-    // full-mempool rebroadcast helped reliability but could load relay sockets hard
-    // enough that users perceived slower block cadence right after a buy attempt.
-    let mut relayed = p2p::broadcast_tx_limited(&settings, &tx, 24, 850).unwrap_or(0);
-    for _ in 0..2 {
-        relayed = relayed.saturating_add(p2p::rebroadcast_txid_limited(&settings, &txid_h, 24, 850).unwrap_or(0));
-        thread::sleep(Duration::from_millis(120));
-    }
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10081,10 +10137,11 @@ fn execute_gui_send_transaction(config_path: &str, recipient: &str, amount: &str
             Amount::from_str(fee.trim())?,
         )?
     };
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10130,10 +10187,11 @@ fn execute_gui_multi_send_transaction(config_path: &str, entries: &str, fee: &st
         let payments = parsed.iter().map(|(a, amt)| Amount::from_str(amt).map(|q| (a.clone(), q))).collect::<Result<Vec<_>>>()?;
         wallet.create_multi_signed_transaction(&chain, &settings, &payments, Amount::from_str(fee.trim())?)?
     };
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10198,10 +10256,11 @@ fn execute_gui_blast_create(config_path: &str, total: &str, per_claim: &str, max
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let code = private_code.trim().to_string();
     let tx = wallet.create_blast_create_transaction_qub(&chain, &settings, Amount::from_str(total.trim())?, Amount::from_str(per_claim.trim())?, max_claims.trim().parse::<u32>()?, &code, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10218,10 +10277,11 @@ fn execute_gui_blast_claim(config_path: &str, claim_code: &str, claimant: &str) 
         Some(Address::parse_with_prefix(claimant.trim(), &settings.network.address_prefix)?)
     };
     let tx = wallet.create_blast_claim_transaction_qub(&chain, &settings, claim_code.trim(), claimant.as_ref())?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10247,10 +10307,11 @@ fn execute_gui_library_create(config_path: &str, title: &str, category: &str, bo
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let tx = wallet.create_library_post_transaction(&chain, &settings, title, category, body, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10260,10 +10321,11 @@ fn execute_gui_library_comment(config_path: &str, post_id: &str, parent: Option<
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let tx = wallet.create_library_comment_transaction(&chain, &settings, post_id, parent, body, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10273,10 +10335,11 @@ fn execute_gui_library_vote(config_path: &str, kind: &str, id: &str, up: bool, f
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let tx = wallet.create_library_vote_transaction(&chain, &settings, kind, id, up, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10286,10 +10349,11 @@ fn execute_gui_library_edit(config_path: &str, kind: &str, id: &str, title: &str
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let tx = wallet.create_library_edit_transaction(&chain, &settings, kind, id, title, category, body, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10299,10 +10363,11 @@ fn execute_gui_library_delete(config_path: &str, kind: &str, id: &str, fee: &str
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let tx = wallet.create_library_delete_transaction(&chain, &settings, kind, id, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10320,10 +10385,11 @@ fn execute_gui_qns_register(config_path: &str, name: &str, target: &str, fee: &s
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
     let target = Address::parse_with_prefix(target.trim(), &settings.network.address_prefix)?;
     let tx = wallet.create_qns_registration_transaction(&chain, &settings, name.trim(), &target, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10340,10 +10406,11 @@ fn execute_gui_jin_token_conversion(config_path: &str, matrix_address: &str, amo
         (Amount::from_atoms(0)?, parse_jin_amount(fee.trim())?)
     };
     let tx = wallet.create_jin_token_conversion_transaction(&chain, &settings, matrix_address.trim(), parse_jin_amount(amount.trim())?, qub_fee, jin_fee_units, &fee_asset)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok((txid, relayed, chain.mempool.len()))
 }
 
@@ -10376,10 +10443,11 @@ fn execute_gui_pool_create(config_path: &str, name: &str, commission_bps: &str, 
     let bps = commission_bps.trim().parse::<u16>()?;
     let price = pool_create_price_atoms(&settings, capacity_slots)?;
     let tx = wallet.create_pool_create_transaction(&chain, &settings, &normalized, &manager, bps, capacity_slots, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok(PoolGuiEvent::Created {
         action: "create".to_string(),
         txid: txid.clone(),
@@ -10398,10 +10466,11 @@ fn execute_gui_pool_topup(config_path: &str, pool_id: &str, extra_slots: u32, fe
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
     let price = pool_topup_price_atoms(&settings, extra_slots)?;
     let tx = wallet.create_pool_topup_transaction(&chain, &settings, pool_id_h, extra_slots, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok(PoolGuiEvent::Created {
         action: "capacity top-up".to_string(),
         txid,
@@ -10420,10 +10489,11 @@ fn execute_gui_pool_set_commission(config_path: &str, pool_id: &str, new_bps: &s
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
     let bps = new_bps.trim().parse::<u16>()?;
     let tx = wallet.create_pool_set_commission_transaction(&chain, &settings, pool_id_h, bps, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok(PoolGuiEvent::Created {
         action: "commission decrease".to_string(),
         txid,
@@ -10442,10 +10512,11 @@ fn execute_gui_pool_rename(config_path: &str, pool_id: &str, new_name: &str, fee
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
     let normalized = normalize_pool_name(new_name, settings.pools.max_name_chars, settings.pools.max_name_bytes)?;
     let tx = wallet.create_pool_rename_transaction(&chain, &settings, pool_id_h, &normalized, Amount::from_str(fee.trim())?)?;
-    let txid = chain.accept_transaction_to_mempool(tx.clone(), &settings)?.to_string();
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-transaction")?;
     save_chain(&settings, &chain)?;
-    let relayed = p2p::broadcast_tx(&settings, &tx).unwrap_or(0);
-    let relayed = relayed.saturating_add(p2p::rebroadcast_local_mempool(&settings, 16).unwrap_or(0));
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
     Ok(PoolGuiEvent::Created {
         action: "rename".to_string(),
         txid,
@@ -10482,8 +10553,9 @@ fn create_gui_local_pool_share(settings: &Settings, chain: &mut ChainState, pool
     let nonce = find_gui_pool_share_nonce(settings, pool_id, &miner_key.address, parent_height, parent_hash, start_nonce)?;
     let tx = create_pool_share_transaction(settings, pool_id, miner_key, parent_height, parent_hash, nonce)?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
+    let _ = hf117_remember_pending_tx(settings, &tx, "gui-pool-share");
     save_chain(settings, chain)?;
-    let relayed = p2p::broadcast_tx(settings, &tx).unwrap_or(0);
+    let relayed = hf117_relay_exact_wallet_tx(settings, &tx, &txid);
     Ok((txid, nonce, relayed))
 }
 
@@ -10507,7 +10579,10 @@ fn execute_gui_pool_join(config_path: &str, pool_id: &str, miner_address: &str) 
 
 fn query_gui_tx_status(config_path: &str, txid: &str) -> Result<TxUiStatus> {
     let settings = load_gui_settings(config_path)?;
-    let chain = load_or_init_chain(&settings)?;
+    let mut chain = load_or_init_chain(&settings)?;
+    if let Ok((reaccepted, _relayed, _confirmed)) = hf117_recover_pending_tx_outbox(&settings, &mut chain, Some(txid)) {
+        if reaccepted > 0 { save_chain(&settings, &chain)?; }
+    }
     for (height, block) in chain.blocks.iter().enumerate().skip(1) {
         if block.transactions.iter().any(|tx| tx.txid().to_string() == txid) {
             let h = height as u32;
@@ -10703,6 +10778,14 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             continue;
         }
 
+        if !wait_for_target_spacing(&chain, &settings, events, &stop)? { continue; }
+        if stop.load(Ordering::Relaxed) { break; }
+        if let Ok(current) = load_or_init_chain(&settings) {
+            if current.tip_hash() != chain.tip_hash() {
+                let _ = events.send(MinerEvent::Status("Network tip moved during HF117 pool target-spacing wait; rebuilding pool candidate.".to_string()));
+                continue;
+            }
+        }
         let target_height = chain.height() + 1;
         let base_mempool_fingerprint = mempool_fingerprint(&chain);
         let _ = events.send(MinerEvent::Started { threads, duty, target_height });
@@ -10772,7 +10855,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, chain.height(), chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF115 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool candidate paused immediately by HF117 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -10815,7 +10898,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF115 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool block discarded before submit by the HF117 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -10863,7 +10946,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
     Ok(())
 }
 
-fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, _pace_to_target_spacing: bool, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
+fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, pace_to_target_spacing: bool, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
     let logical = logical_cpus();
     let (threads, duty) = resource_plan(logical, cpu_percent);
     let mut total_hashes = 0u64;
@@ -10902,6 +10985,16 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                         if stop.load(Ordering::Relaxed) { break; }
                         thread::sleep(Duration::from_millis(100));
                     }
+                    continue;
+                }
+            }
+        }
+        if pace_to_target_spacing {
+            if !wait_for_target_spacing(&base_chain, &settings, events, &stop)? { continue; }
+            if stop.load(Ordering::Relaxed) { break; }
+            if let Ok(current) = load_or_init_chain(&settings) {
+                if current.tip_hash() != base_chain.tip_hash() {
+                    let _ = events.send(MinerEvent::Status("Network tip moved during HF117 target-spacing wait; rebuilding candidate.".to_string()));
                     continue;
                 }
             }
@@ -11006,7 +11099,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             }
             if settings.p2p.enabled && last_network_check.elapsed() >= Duration::from_secs(5) {
                 if let Some(reason) = p2p::hf113_live_tip_pause_reason(&settings, base_chain.height(), base_chain.tip_hash(), 520) {
-                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF115 canonical watcher: {reason}. Rebuilding after catch-up.")));
+                    let _ = events.send(MinerEvent::Status(format!("Mining candidate paused immediately by HF117 canonical watcher: {reason}. Rebuilding after catch-up.")));
                     round_stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -11049,7 +11142,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             let candidate_parent_height = target_height.saturating_sub(1);
             if settings.p2p.enabled {
                 if let Err(err) = p2p::mining_parent_submit_guard(&settings, candidate_parent_height, candidate_parent_hash) {
-                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF115 fast canonical submit guard: {err:#}")));
+                    let _ = events.send(MinerEvent::Status(format!("Block discarded before submit by the HF117 fast canonical submit guard: {err:#}")));
                     continue;
                 }
             }
@@ -11097,12 +11190,15 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
     Ok(())
 }
 
-fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mpsc::Sender<MinerEvent>, stop: &Arc<AtomicBool>) -> Result<()> {
-    if chain.height() == 0 { return Ok(()); }
-    let Some(tip) = chain.blocks.last() else { return Ok(()); };
+fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mpsc::Sender<MinerEvent>, stop: &Arc<AtomicBool>) -> Result<bool> {
+    if settings.network.name != "mainnet" { return Ok(true); }
+    if chain.height() == 0 { return Ok(true); }
+    let Some(tip) = chain.blocks.last() else { return Ok(true); };
     let jitter_secs = if settings.p2p.enabled && !settings.mining.miner_address.trim().is_empty() {
-        // Spread GUI miners across a small per-height slot window so LAN/testnet miners do not
-        // all start hashing the same height in the same second. This is only mining policy, not consensus.
+        // HF117/v1.7.5: spread GUI miners across a small deterministic per-height
+        // window. This is local mining policy only; it does not change block validity
+        // or DAA. It removes the last-winner head-start without making seeds a
+        // hard dependency.
         let mut seed = Vec::new();
         seed.extend_from_slice(settings.mining.miner_address.as_bytes());
         seed.extend_from_slice(&chain.height().saturating_add(1).to_le_bytes());
@@ -11110,22 +11206,33 @@ fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mps
         Hash256::double_sha256(&seed).0[0] as u32 % slot_window
     } else { 0 };
     let next_allowed = tip.header.time.saturating_add(settings.consensus.target_spacing_secs).saturating_add(jitter_secs);
+    let mut last_probe = Instant::now() - Duration::from_secs(10);
     loop {
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        if stop.load(Ordering::Relaxed) { return Ok(true); }
         let now = unix_time_u32();
-        if now >= next_allowed { return Ok(()); }
+        if now >= next_allowed { return Ok(true); }
         let remaining = next_allowed.saturating_sub(now);
-        let _ = events.send(MinerEvent::Status(format!("Target spacing: next block opens in {remaining}s.")));
-        if settings.p2p.enabled {
-            if let Ok(report) = p2p::sync_until_converged(settings, 2, 150) {
-                if report.chains_adopted > 0 || report.blocks_connected > 0 || report.height > chain.height() {
-                    let _ = events.send(MinerEvent::Status(format!("Network tip moved to #{} during wait.", report.height)));
-                    return Ok(());
+        let _ = events.send(MinerEvent::Status(format!("HF117 target spacing: next block opens in {remaining}s.")));
+
+        // Do not run a heavy repair/sync loop while the miner is merely pacing.
+        // A lightweight live-tip probe is enough to abort this candidate when
+        // official/direct quorum moved. The next outer mining iteration performs
+        // the normal canonical guard/repair before hashing again.
+        if settings.p2p.enabled && last_probe.elapsed() >= Duration::from_secs(5) {
+            last_probe = Instant::now();
+            if let Some(reason) = p2p::hf113_live_tip_pause_reason(settings, chain.height(), chain.tip_hash(), 520) {
+                let _ = events.send(MinerEvent::Status(format!("HF117 target-spacing wait cancelled: {reason}")));
+                return Ok(false);
+            }
+            if let Ok(current) = load_or_init_chain(settings) {
+                if current.height() != chain.height() || current.tip_hash() != chain.tip_hash() {
+                    let _ = events.send(MinerEvent::Status("HF117 target-spacing wait cancelled because local tip changed.".to_string()));
+                    return Ok(false);
                 }
             }
         }
         for _ in 0..10 {
-            if stop.load(Ordering::Relaxed) { return Ok(()); }
+            if stop.load(Ordering::Relaxed) { return Ok(true); }
             thread::sleep(Duration::from_millis(100));
         }
     }

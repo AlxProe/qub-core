@@ -219,6 +219,14 @@ pub fn hf115_template_scan_limit(settings: &Settings) -> usize {
         .max(256)
         .min(HF115_MAX_TEMPLATE_SCAN_TXS)
 }
+
+// HF117/v1.7.5 is a non-consensus hotfix. It protects locally-created
+// transactions against stale-chain replacement by keeping exact raw txs in a
+// wallet outbox until finality, and by resurrecting non-coinbase txs from
+// disconnected suffix blocks during reorg/adoption.
+pub const HF117_PENDING_TX_CONFIRMATIONS: u32 = 2;
+pub const HF117_PENDING_TX_MAX_RECORDS: usize = 512;
+pub const HF117_PENDING_TX_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct MiningSettings { pub enabled: bool, pub threads: usize, pub duty_cycle_percent: u8, pub miner_address: String, pub auto_mine_mempool: bool }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct WalletSettings { pub plaintext_keys_allowed: bool }
 #[derive(Debug, Clone, Serialize, Deserialize)] pub struct ConsensusSettings { pub version: u32, pub max_money_atoms: u64, pub subsidy_halving_interval: u64, pub initial_subsidy_atoms: u64, pub coinbase_maturity: u32, pub target_spacing_secs: u32, pub difficulty_adjustment_interval: u32, pub difficulty_max_adjustment_factor: u32, pub max_future_time_secs: u32, pub max_block_transactions: usize, pub pow_bits: String, pub genesis_time: u32, pub genesis_bits: String, pub genesis_nonce: u32 }
@@ -596,16 +604,81 @@ impl ChainState {
             || (candidate_work == current_work && candidate_height == current_height && candidate_tip != current_tip
                 && prefer_peer_on_equal_work);
         if should_adopt {
-            // HF76/v1.5.8: preserve pending wallet actions across fork/snapshot adoption,
-            // but rebuild the mempool in order against the new canonical UTXO/feature state.
-            // Filtering with a stateless preview can keep mutually-conflicting txs or drop
-            // valid JIN/Library txs whose contextual state depends on earlier mempool txs.
-            let keep_mempool = self.mempool.clone();
+            // HF117/v1.7.5: preserve wallet/p2p mempool entries AND resurrect
+            // non-coinbase transactions from any local suffix that becomes stale.
+            // Before HF117, a QUB tx mined into a losing local block could be
+            // removed from mempool by connect_block(), then disappear after the
+            // node adopted the winning branch. Rebuild against the candidate tip
+            // from the union of: old mempool, candidate mempool, and disconnected
+            // local block transactions. Full mempool admission still resolves
+            // double-spends and feature-state conflicts deterministically.
+            let keep_mempool = self.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
             *self = candidate;
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub fn tx_confirmations(&self, txid: Hash256) -> Option<(u32, u32)> {
+        for (height, block) in self.blocks.iter().enumerate().skip(1) {
+            if block.transactions.iter().any(|tx| tx.txid() == txid) {
+                let h = height as u32;
+                let confirmations = self.height().saturating_sub(h).saturating_add(1);
+                return Some((h, confirmations));
+            }
+        }
+        None
+    }
+
+    pub fn tx_in_mempool(&self, txid: Hash256) -> bool {
+        self.mempool.iter().any(|tx| tx.txid() == txid)
+    }
+
+    fn common_prefix_height_with(&self, other: &ChainState) -> u32 {
+        let max = self.height().min(other.height()) as usize;
+        let mut common = 0usize;
+        for height in 0..=max {
+            if self.blocks.get(height).map(|b| b.block_hash()) == other.blocks.get(height).map(|b| b.block_hash()) {
+                common = height;
+            } else {
+                break;
+            }
+        }
+        common as u32
+    }
+
+    pub fn disconnected_non_coinbase_transactions_for(&self, candidate: &ChainState) -> Vec<Transaction> {
+        let common = self.common_prefix_height_with(candidate);
+        let candidate_canonical_txids = candidate
+            .blocks
+            .iter()
+            .flat_map(|block| block.transactions.iter().map(|tx| tx.txid()))
+            .collect::<HashSet<_>>();
+        let mut seen = HashSet::<Hash256>::new();
+        let mut out = Vec::<Transaction>::new();
+        for block in self.blocks.iter().skip(common.saturating_add(1) as usize) {
+            for tx in block.transactions.iter().skip(1) {
+                let txid = tx.txid();
+                if candidate_canonical_txids.contains(&txid) { continue; }
+                if seen.insert(txid) { out.push(tx.clone()); }
+            }
+        }
+        out
+    }
+
+    pub fn reorg_mempool_candidates_for(&self, candidate: &ChainState) -> Vec<Transaction> {
+        let mut seen = HashSet::<Hash256>::new();
+        let mut out = Vec::<Transaction>::new();
+        for tx in self.mempool.iter().chain(candidate.mempool.iter()) {
+            let txid = tx.txid();
+            if seen.insert(txid) { out.push(tx.clone()); }
+        }
+        for tx in self.disconnected_non_coinbase_transactions_for(candidate) {
+            let txid = tx.txid();
+            if seen.insert(txid) { out.push(tx); }
+        }
+        out
     }
 
     fn accept_transaction_preview(&self, tx: &Transaction, settings: &Settings) -> Result<()> {
@@ -624,6 +697,26 @@ impl ChainState {
         let txid = tx.txid();
         if self.mempool.iter().any(|t| t.txid() == txid) { bail!("duplicate mempool tx"); }
         hf106_jin_sale_standardness_policy(&tx, settings)?;
+
+        // HF117/v1.7.5: reject mempool input conflicts before the expensive
+        // JIN/QUB-JIN/Library/QNS contextual validators. This does not change
+        // consensus; it makes local mempool behavior deterministic under fast
+        // reorg/rebuild pressure and avoids misleading late failures for normal
+        // QUB sends.
+        if !is_pool_share_transaction(&tx) {
+            let spent = self.mempool
+                .iter()
+                .flat_map(|t| t.inputs.iter()
+                    .filter(|i| i.previous_output != OutPoint::null())
+                    .map(|i| i.previous_output.clone()))
+                .collect::<HashSet<_>>();
+            for input in &tx.inputs {
+                if input.previous_output != OutPoint::null() && spent.contains(&input.previous_output) {
+                    bail!("mempool double spend");
+                }
+            }
+        }
+
         let spend_height = self.height() + 1;
         let raw_fee = validate_tx_contextual(&tx, &self.utxos, spend_height, settings, true)?;
         let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, &tx, spend_height)?;
@@ -638,8 +731,6 @@ impl ChainState {
         let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?;
         if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); }
         if !is_pool_share_transaction(&tx) && !is_blast_claim_transaction(&tx, settings) && fee < settings.mempool.min_relay_fee_atoms && jin_fee_units == 0 { bail!("fee below min relay fee"); }
-        if !is_pool_share_transaction(&tx) { let spent = self.mempool.iter().flat_map(|t| t.inputs.iter().filter(|i| i.previous_output != OutPoint::null()).map(|i| i.previous_output.clone())).collect::<HashSet<_>>();
-        for input in &tx.inputs { if input.previous_output != OutPoint::null() && spent.contains(&input.previous_output) { bail!("mempool double spend"); } } }
         validate_qns_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
         validate_library_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
         validate_verified_governance_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
@@ -662,13 +753,31 @@ impl ChainState {
         candidates.sort_by_cached_key(|tx| (mempool_template_priority(settings, tx), tx.txid().to_string()));
         self.mempool.clear();
         let mut seen = HashSet::<Hash256>::new();
-        let mut retained = 0usize;
+        let mut pending = Vec::<Transaction>::new();
         for tx in candidates.into_iter().take(mempool_cap) {
             let txid = tx.txid();
-            if !seen.insert(txid) { continue; }
-            if self.accept_transaction_to_mempool(tx, settings).is_ok() {
-                retained = retained.saturating_add(1);
+            if seen.insert(txid) { pending.push(tx); }
+        }
+
+        // HF117/v1.7.5: dependency-aware rebuild. A stale-block suffix can contain
+        // parent/child wallet txs. The old one-pass rebuild could drop a valid child
+        // if its parent was reaccepted later in the sorted candidate order. Keep this
+        // bounded and policy-only: every successful admission still uses the normal
+        // mempool validator against the current overlay.
+        let mut retained = 0usize;
+        for _ in 0..8 {
+            if pending.is_empty() { break; }
+            let before = pending.len();
+            let mut next = Vec::<Transaction>::new();
+            for tx in pending.into_iter() {
+                if self.accept_transaction_to_mempool(tx.clone(), settings).is_ok() {
+                    retained = retained.saturating_add(1);
+                } else {
+                    next.push(tx);
+                }
             }
+            if next.len() == before { break; }
+            pending = next;
         }
         retained
     }
@@ -2151,8 +2260,8 @@ impl WalletFile {
 }
 pub fn ensure_plaintext_wallet_allowed(settings: &Settings) -> Result<()> { if settings.wallet.plaintext_keys_allowed || std::env::var("QUB_ALLOW_PLAINTEXT_WALLET").ok().as_deref() == Some("1") { Ok(()) } else { bail!("plaintext local wallet keys disabled; set QUB_ALLOW_PLAINTEXT_WALLET=1 only if you accept the v1 risk") } }
 
-#[derive(Debug, Clone)] pub struct NodePaths { pub data_dir: PathBuf, pub chain_file: PathBuf, pub wallet_file: PathBuf }
-impl NodePaths { pub fn from_settings(settings: &Settings) -> Self { let data_dir = PathBuf::from(&settings.node.data_dir); Self { chain_file: data_dir.join("chain.json"), wallet_file: data_dir.join("wallet.json"), data_dir } } pub fn ensure_dirs(&self) -> Result<()> { fs::create_dir_all(&self.data_dir)?; Ok(()) } }
+#[derive(Debug, Clone)] pub struct NodePaths { pub data_dir: PathBuf, pub chain_file: PathBuf, pub wallet_file: PathBuf, pub pending_txs_file: PathBuf }
+impl NodePaths { pub fn from_settings(settings: &Settings) -> Self { let data_dir = PathBuf::from(&settings.node.data_dir); Self { chain_file: data_dir.join("chain.json"), wallet_file: data_dir.join("wallet.json"), pending_txs_file: data_dir.join("wallet-pending-txs.json"), data_dir } } pub fn ensure_dirs(&self) -> Result<()> { fs::create_dir_all(&self.data_dir)?; Ok(()) } }
 fn storage_lock() -> &'static StdMutex<()> { static LOCK: OnceLock<StdMutex<()>> = OnceLock::new(); LOCK.get_or_init(|| StdMutex::new(())) }
 
 pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
@@ -2229,7 +2338,128 @@ fn write_text_replace(path: &Path, body: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, body)?;
     if path.exists() { let _ = fs::remove_file(path); }
-    fs::rename(&tmp, path).or_else(|_| { fs::write(path, body)?; let _ = fs::remove_file(&tmp); Ok(()) })
+    if fs::rename(&tmp, path).is_err() {
+        fs::write(path, body)?;
+        let _ = fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTxRecord {
+    pub txid: Hash256,
+    pub tx: Transaction,
+    pub label: String,
+    pub created_height: u32,
+    pub created_unix: u64,
+    pub last_rebroadcast_unix: u64,
+    pub confirmations_required: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTxFile { pub version: u32, pub network: String, pub txs: Vec<PendingTxRecord> }
+
+impl PendingTxFile {
+    pub fn new(network: &str) -> Self { Self { version: 1, network: network.to_string(), txs: Vec::new() } }
+    pub fn ensure_network(&self, settings: &Settings) -> Result<()> {
+        if self.network != settings.network.name { bail!("pending tx network mismatch"); }
+        Ok(())
+    }
+}
+
+pub fn load_pending_txs(settings: &Settings) -> Result<PendingTxFile> {
+    let _guard = storage_lock().lock().expect("storage mutex poisoned");
+    let paths = NodePaths::from_settings(settings);
+    paths.ensure_dirs()?;
+    if !paths.pending_txs_file.exists() { return Ok(PendingTxFile::new(&settings.network.name)); }
+    let raw = fs::read_to_string(&paths.pending_txs_file)?;
+    let file: PendingTxFile = serde_json::from_str(&raw)?;
+    file.ensure_network(settings)?;
+    Ok(file)
+}
+
+pub fn save_pending_txs(settings: &Settings, pending: &PendingTxFile) -> Result<()> {
+    let _guard = storage_lock().lock().expect("storage mutex poisoned");
+    let paths = NodePaths::from_settings(settings);
+    paths.ensure_dirs()?;
+    write_text_replace(&paths.pending_txs_file, &serde_json::to_string_pretty(pending)?)
+}
+
+pub fn remember_pending_tx(settings: &Settings, chain: &ChainState, tx: &Transaction, label: impl Into<String>) -> Result<()> {
+    let mut pending = load_pending_txs(settings).unwrap_or_else(|_| PendingTxFile::new(&settings.network.name));
+    pending.ensure_network(settings)?;
+    let txid = tx.txid();
+    pending.txs.retain(|rec| rec.txid != txid);
+    pending.txs.push(PendingTxRecord {
+        txid,
+        tx: tx.clone(),
+        label: label.into(),
+        created_height: chain.height(),
+        created_unix: unix_time_u32() as u64,
+        last_rebroadcast_unix: 0,
+        confirmations_required: HF117_PENDING_TX_CONFIRMATIONS,
+    });
+    if pending.txs.len() > HF117_PENDING_TX_MAX_RECORDS {
+        let excess = pending.txs.len().saturating_sub(HF117_PENDING_TX_MAX_RECORDS);
+        pending.txs.drain(0..excess);
+    }
+    save_pending_txs(settings, &pending)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingTxReconcileReport { pub retained: usize, pub confirmed: usize, pub reaccepted: usize, pub dropped: usize }
+
+pub fn reconcile_pending_txs(settings: &Settings, chain: &mut ChainState) -> Result<PendingTxReconcileReport> {
+    let mut pending = load_pending_txs(settings).unwrap_or_else(|_| PendingTxFile::new(&settings.network.name));
+    pending.ensure_network(settings)?;
+    let now = unix_time_u32() as u64;
+    let mut report = PendingTxReconcileReport::default();
+    let mut next = Vec::<PendingTxRecord>::new();
+    let mut seen = HashSet::<Hash256>::new();
+    for mut rec in pending.txs.into_iter() {
+        if !seen.insert(rec.txid) { continue; }
+        if let Some((_height, confirmations)) = chain.tx_confirmations(rec.txid) {
+            if confirmations >= rec.confirmations_required.max(1) {
+                report.confirmed = report.confirmed.saturating_add(1);
+                continue;
+            }
+            report.retained = report.retained.saturating_add(1);
+            next.push(rec);
+            continue;
+        }
+        if chain.tx_in_mempool(rec.txid) {
+            report.retained = report.retained.saturating_add(1);
+            next.push(rec);
+            continue;
+        }
+        if now.saturating_sub(rec.created_unix) > HF117_PENDING_TX_MAX_AGE_SECS {
+            report.dropped = report.dropped.saturating_add(1);
+            continue;
+        }
+        match chain.accept_transaction_to_mempool(rec.tx.clone(), settings) {
+            Ok(_) => {
+                rec.last_rebroadcast_unix = now;
+                report.reaccepted = report.reaccepted.saturating_add(1);
+                next.push(rec);
+            }
+            Err(_) => {
+                // Keep still-recent records in the outbox. A stale local view can
+                // temporarily reject the tx; it should not be forgotten until it
+                // is confirmed, reaccepted after catch-up, or ages out.
+                report.retained = report.retained.saturating_add(1);
+                next.push(rec);
+            }
+        }
+    }
+    pending = PendingTxFile { version: 1, network: settings.network.name.clone(), txs: next };
+    save_pending_txs(settings, &pending)?;
+    Ok(report)
+}
+
+pub fn pending_tx_raw(settings: &Settings, txid: Hash256) -> Result<Option<Transaction>> {
+    let pending = load_pending_txs(settings)?;
+    Ok(pending.txs.into_iter().find(|rec| rec.txid == txid).map(|rec| rec.tx))
 }
 
 
