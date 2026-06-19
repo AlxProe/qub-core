@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.7.5"
+version = "1.7.6"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.7.5 full-node core with HF117 mempool reorg recovery and GUI mining reliability hotfix"
+description = "Qubit Coin v1.7.6 full-node core with HF118 mainnet QUB/JIN melt-infuse GUI enablement and HF117 recovery"
 readme = "README.md"
 
 [features]

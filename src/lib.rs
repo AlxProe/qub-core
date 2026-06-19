@@ -2338,10 +2338,15 @@ fn write_text_replace(path: &Path, body: &str) -> Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, body)?;
     if path.exists() { let _ = fs::remove_file(path); }
+
+    // HF117 compile-safe fallback: keep the fast atomic replace path when the
+    // platform allows rename-over-target, but fall back to a direct write on
+    // Windows/AV edge cases without introducing ambiguous Result<T, E> inference.
     if fs::rename(&tmp, path).is_err() {
         fs::write(path, body)?;
         let _ = fs::remove_file(&tmp);
     }
+
     Ok(())
 }
 

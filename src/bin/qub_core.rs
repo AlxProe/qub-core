@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.5";
+const APP_VERSION: &str = "v1.7.6";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -711,6 +711,59 @@ impl Default for UsdjVaultDialog {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QubJinMode { Infuse, Melt }
+
+impl QubJinMode {
+    fn title(&self) -> &'static str { match self { Self::Infuse => "Infuse JIN into QUB", Self::Melt => "Melt QUB for JIN" } }
+    fn action_label(&self) -> &'static str { match self { Self::Infuse => "Infuse", Self::Melt => "Melt" } }
+    fn icon(&self) -> &'static str { match self { Self::Infuse => "infuse", Self::Melt => "melt" } }
+    fn pending_label(&self) -> &'static str { match self { Self::Infuse => "JIN infusion", Self::Melt => "QUB melt" } }
+}
+
+#[derive(Debug, Clone)]
+struct QubJinDialog {
+    open: bool,
+    mode: QubJinMode,
+    amount: String,
+    fee: String,
+    min_jin: String,
+    status: SendDialogStatus,
+    txid: String,
+    message: String,
+    relayed_to_peers: usize,
+    local_mempooltx: usize,
+    preview_key: String,
+    preview_lines: Vec<String>,
+    last_checked_height: u32,
+}
+
+impl Default for QubJinDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mode: QubJinMode::Infuse,
+            amount: "0".to_string(),
+            fee: "0.00001".to_string(),
+            min_jin: String::new(),
+            status: SendDialogStatus::Editing,
+            txid: String::new(),
+            message: String::new(),
+            relayed_to_peers: 0,
+            local_mempooltx: 0,
+            preview_key: String::new(),
+            preview_lines: Vec::new(),
+            last_checked_height: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum QubJinPreviewEvent {
+    Ready { key: String, lines: Vec<String> },
+    Failed { key: String, message: String },
+}
+
 
 #[derive(Debug)]
 enum EthereumWalletEvent {
@@ -1376,6 +1429,10 @@ struct QubCoreApp {
     usdj_vault_rx: Option<mpsc::Receiver<EthereumWalletEvent>>,
     conversion_dialog: ConversionDialog,
     conversion_rx: Option<mpsc::Receiver<SendEvent>>,
+    qub_jin_dialog: QubJinDialog,
+    qub_jin_rx: Option<mpsc::Receiver<SendEvent>>,
+    qub_jin_preview_rx: Option<mpsc::Receiver<QubJinPreviewEvent>>,
+    qub_jin_preview_in_flight: bool,
     buy_jin_dialog: BuyJinDialog,
     buy_jin_rx: Option<mpsc::Receiver<BuyJinEvent>>,
     qns_dialog: QnsDialog,
@@ -1778,6 +1835,10 @@ impl QubCoreApp {
             usdj_vault_rx: None,
             conversion_dialog: ConversionDialog::default(),
             conversion_rx: None,
+            qub_jin_dialog: QubJinDialog::default(),
+            qub_jin_rx: None,
+            qub_jin_preview_rx: None,
+            qub_jin_preview_in_flight: false,
             buy_jin_dialog: BuyJinDialog::default(),
             buy_jin_rx: None,
             qns_dialog: QnsDialog::default(),
@@ -2704,6 +2765,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         let msg = format!("Status check warning: {err}");
         if self.send_dialog.status == SendDialogStatus::Pending { self.send_dialog.message = msg.clone(); }
         if self.conversion_dialog.status == SendDialogStatus::Pending { self.conversion_dialog.message = msg.clone(); }
+        if self.qub_jin_dialog.status == SendDialogStatus::Pending { self.qub_jin_dialog.message = msg.clone(); }
         if self.buy_jin_dialog.status == SendDialogStatus::Pending { self.buy_jin_dialog.message = msg.clone(); }
         if self.pool_dialog.status == SendDialogStatus::Pending { self.pool_dialog.message = msg.clone(); }
         if !self.library_dialog.pending_txid.is_empty() { self.library_dialog.message = msg.clone(); }
@@ -2743,6 +2805,25 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 }
                 TxUiStatus::NotFound => {
                     self.conversion_dialog.message = "Conversion request is not visible in the local active chain or mempool yet. QUB Core will keep checking in the background.".to_string();
+                }
+            }
+        }
+
+
+        if self.qub_jin_dialog.status == SendDialogStatus::Pending && self.qub_jin_dialog.txid == txid {
+            match &status {
+                TxUiStatus::Confirmed { height, confirmations } => {
+                    self.qub_jin_dialog.status = SendDialogStatus::Confirmed;
+                    self.qub_jin_dialog.last_checked_height = *height;
+                    self.qub_jin_dialog.message = format!("{} confirmed in block #{} with {} confirmation(s). Balances and QUB/JIN infusion metrics update after sync.", self.qub_jin_dialog.mode.pending_label(), height, confirmations);
+                    self.last_success = Some(format!("{} confirmed in block #{}.", self.qub_jin_dialog.mode.pending_label(), height));
+                    self.start_background_snapshot_refresh();
+                }
+                TxUiStatus::PendingMempool => {
+                    self.qub_jin_dialog.message = format!("{} pending in local mempool. relayed_to_peers={}. HF117 exact rebroadcast remains active until confirmation.", self.qub_jin_dialog.mode.pending_label(), self.qub_jin_dialog.relayed_to_peers);
+                }
+                TxUiStatus::NotFound => {
+                    self.qub_jin_dialog.message = format!("{} is not visible locally yet. QUB Core will keep checking and recovering it from wallet-pending-txs.json if it is still valid.", self.qub_jin_dialog.mode.pending_label());
                 }
             }
         }
@@ -3423,7 +3504,7 @@ del "%~f0"
         self.gpu_workers = 0;
         self.gpu_device.clear();
         self.gpu_device_rates.clear();
-        // HF117/v1.7.5: target-spacing pacing is policy, not consensus. It reduces
+        // HF117/v1.7.6: target-spacing pacing is policy, not consensus. It reduces
         // last-winner head-start streaks and coinbase-only burst races without any
         // chain upgrade or seed update. Keep the persisted preference defaulted ON.
         if !self.prefs.pace_to_target_spacing {
@@ -3823,6 +3904,199 @@ del "%~f0"
         {
             self.last_send_status_poll = Instant::now();
             self.start_tx_status_check(self.conversion_dialog.txid.clone());
+        }
+    }
+
+    fn open_qub_jin_dialog(&mut self, mode: QubJinMode) {
+        self.qub_jin_dialog.open = true;
+        self.qub_jin_dialog.mode = mode;
+        self.qub_jin_dialog.status = SendDialogStatus::Editing;
+        self.qub_jin_dialog.txid.clear();
+        self.qub_jin_dialog.message.clear();
+        self.qub_jin_dialog.relayed_to_peers = 0;
+        self.qub_jin_dialog.local_mempooltx = 0;
+        self.qub_jin_dialog.last_checked_height = self.snapshot.height;
+        self.qub_jin_dialog.preview_key.clear();
+        self.qub_jin_dialog.preview_lines = vec!["HF119: loading QUB/JIN preview in the background...".to_string()];
+        self.qub_jin_preview_rx = None;
+        self.qub_jin_preview_in_flight = false;
+        if self.qub_jin_dialog.fee.trim().is_empty() || self.qub_jin_dialog.fee.trim() == "0" {
+            self.qub_jin_dialog.fee = default_fee_for_config(&self.prefs.config_path).unwrap_or_else(|| "0.00001".to_string());
+        }
+        match mode {
+            QubJinMode::Infuse => {
+                if self.qub_jin_dialog.amount.trim().is_empty() || self.qub_jin_dialog.amount.trim() == "0" {
+                    // HF119/v1.7.6: never load/scan the chain on the UI thread just
+                    // because the user pressed the Infuse button. The async preview
+                    // worker below computes the exact consensus step. This immediate
+                    // default keeps the window responsive even on large mainnet data.
+                    self.qub_jin_dialog.amount = "0.0021".to_string();
+                }
+            }
+            QubJinMode::Melt => {
+                if self.qub_jin_dialog.amount.trim().is_empty() || self.qub_jin_dialog.amount.trim() == "0" {
+                    self.qub_jin_dialog.amount = "1".to_string();
+                }
+                if self.qub_jin_dialog.min_jin.trim().is_empty() {
+                    self.qub_jin_dialog.min_jin = "0".to_string();
+                }
+            }
+        }
+        self.request_qub_jin_preview();
+    }
+
+    fn current_qub_jin_preview_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            match self.qub_jin_dialog.mode { QubJinMode::Infuse => "infuse", QubJinMode::Melt => "melt" },
+            self.qub_jin_dialog.amount.trim(),
+            self.qub_jin_dialog.fee.trim(),
+            self.qub_jin_dialog.min_jin.trim(),
+            self.snapshot.height,
+            self.prefs.config_path
+        )
+    }
+
+    fn request_qub_jin_preview(&mut self) {
+        if !self.qub_jin_dialog.open { return; }
+        if matches!(self.qub_jin_dialog.status, SendDialogStatus::Sending | SendDialogStatus::Pending | SendDialogStatus::Confirmed) { return; }
+        let key = self.current_qub_jin_preview_key();
+        if key == self.qub_jin_dialog.preview_key { return; }
+        if self.qub_jin_preview_in_flight { return; }
+
+        let config_path = self.prefs.config_path.clone();
+        let mode = self.qub_jin_dialog.mode;
+        let amount = self.qub_jin_dialog.amount.trim().to_string();
+        let fee = self.qub_jin_dialog.fee.trim().to_string();
+        let min_jin = self.qub_jin_dialog.min_jin.trim().to_string();
+        let (tx, rx) = mpsc::channel();
+        self.qub_jin_preview_rx = Some(rx);
+        self.qub_jin_preview_in_flight = true;
+        self.qub_jin_dialog.preview_key = key.clone();
+        self.qub_jin_dialog.preview_lines = vec!["Calculating QUB/JIN preview without blocking the GUI...".to_string()];
+        thread::spawn(move || {
+            let result = qub_jin_action_preview_for_gui(&config_path, mode, &amount, &fee, &min_jin)
+                .map_err(|err| format!("{err:#}"));
+            let event = match result {
+                Ok(lines) => QubJinPreviewEvent::Ready { key, lines },
+                Err(message) => QubJinPreviewEvent::Failed { key, message },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    fn poll_qub_jin_preview(&mut self, ctx: &egui::Context) {
+        let event = self.qub_jin_preview_rx.as_ref().and_then(|rx| match rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(QubJinPreviewEvent::Failed { key: self.qub_jin_dialog.preview_key.clone(), message: "QUB/JIN preview worker disconnected.".to_string() }),
+        });
+        let Some(event) = event else { return; };
+        self.qub_jin_preview_rx = None;
+        self.qub_jin_preview_in_flight = false;
+        match event {
+            QubJinPreviewEvent::Ready { key, lines } => {
+                if key == self.qub_jin_dialog.preview_key {
+                    self.qub_jin_dialog.preview_lines = lines;
+                }
+            }
+            QubJinPreviewEvent::Failed { key, message } => {
+                if key == self.qub_jin_dialog.preview_key {
+                    self.qub_jin_dialog.preview_lines = vec![format!("Preview unavailable: {message}")];
+                }
+            }
+        }
+        // If the user typed while the previous worker was running, immediately queue
+        // a fresh background preview after applying the stale/current result.
+        self.request_qub_jin_preview();
+        ctx.request_repaint();
+    }
+
+    fn start_qub_jin_dialog(&mut self) {
+        if self.snapshot.wallet_keys == 0 {
+            self.qub_jin_dialog.status = SendDialogStatus::Failed;
+            self.qub_jin_dialog.message = "No local wallet key is available. Create/import a local wallet first, then retry.".to_string();
+            return;
+        }
+        if !self.snapshot.qub_jin_infusion_active {
+            self.qub_jin_dialog.status = SendDialogStatus::Failed;
+            self.qub_jin_dialog.message = format!("QUB/JIN infusion activates at block #{}; current local height is #{}.", self.snapshot.qub_jin_infusion_activation_height, self.snapshot.height);
+            return;
+        }
+        let config_path = self.prefs.config_path.clone();
+        let mode = self.qub_jin_dialog.mode;
+        let amount = self.qub_jin_dialog.amount.trim().to_string();
+        let fee = self.qub_jin_dialog.fee.trim().to_string();
+        let min_jin = self.qub_jin_dialog.min_jin.trim().to_string();
+        if amount.is_empty() || fee.is_empty() {
+            self.qub_jin_dialog.status = SendDialogStatus::Failed;
+            self.qub_jin_dialog.message = "Amount and fee are required.".to_string();
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.qub_jin_rx = Some(rx);
+        self.qub_jin_dialog.status = SendDialogStatus::Sending;
+        self.qub_jin_dialog.txid.clear();
+        self.qub_jin_dialog.relayed_to_peers = 0;
+        self.qub_jin_dialog.local_mempooltx = 0;
+        self.qub_jin_dialog.message = match mode {
+            QubJinMode::Infuse => "Creating JIN -> QUB infusion transaction in a background worker with HF119 non-blocking preview/signing and HF117 pending-tx recovery...".to_string(),
+            QubJinMode::Melt => "Creating QUB melt -> JIN transaction in a background worker with HF119 non-blocking preview/signing and HF117 pending-tx recovery...".to_string(),
+        };
+        thread::spawn(move || {
+            let result = match mode {
+                QubJinMode::Infuse => execute_gui_qub_jin_infuse(&config_path, &amount, &fee),
+                QubJinMode::Melt => execute_gui_qub_jin_melt(&config_path, &amount, &fee, if min_jin.trim().is_empty() { None } else { Some(min_jin.as_str()) }),
+            };
+            match result {
+                Ok((txid, relayed_to_peers, local_mempooltx)) => { let _ = tx.send(SendEvent::Created { txid, relayed_to_peers, local_mempooltx }); }
+                Err(err) => { let _ = tx.send(SendEvent::Failed(format!("{err:#}"))); }
+            }
+        });
+    }
+
+    fn poll_qub_jin_dialog(&mut self) {
+        let mut event = None;
+        if let Some(rx) = &self.qub_jin_rx {
+            match rx.try_recv() {
+                Ok(ev) => event = Some(ev),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => event = Some(SendEvent::Failed("QUB/JIN worker disconnected.".to_string())),
+            }
+        }
+        if let Some(ev) = event {
+            self.qub_jin_rx = None;
+            match ev {
+                SendEvent::Created { txid, relayed_to_peers, local_mempooltx } => {
+                    self.qub_jin_dialog.status = SendDialogStatus::Pending;
+                    self.qub_jin_dialog.txid = txid.clone();
+                    self.qub_jin_dialog.relayed_to_peers = relayed_to_peers;
+                    self.qub_jin_dialog.local_mempooltx = local_mempooltx;
+                    self.qub_jin_dialog.message = format!(
+                        "{} pending. txid={} local mempool={} relayed_to_peers={}. QUB Core will keep exact-rebroadcasting from wallet-pending-txs.json until confirmed.",
+                        self.qub_jin_dialog.mode.pending_label(),
+                        shorten_hash(&txid),
+                        local_mempooltx,
+                        relayed_to_peers
+                    );
+                    self.last_success = Some(format!("{} created: {}", self.qub_jin_dialog.mode.pending_label(), shorten_hash(&txid)));
+                    self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                    self.start_tx_status_check(txid);
+                    self.start_background_snapshot_refresh();
+                }
+                SendEvent::Failed(err) => {
+                    self.qub_jin_dialog.status = SendDialogStatus::Failed;
+                    self.qub_jin_dialog.message = err;
+                }
+            }
+        }
+
+        if self.qub_jin_dialog.status == SendDialogStatus::Pending
+            && !self.qub_jin_dialog.txid.is_empty()
+            && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
+        {
+            self.last_send_status_poll = Instant::now();
+            self.start_tx_status_check(self.qub_jin_dialog.txid.clone());
         }
     }
 
@@ -4645,12 +4919,21 @@ del "%~f0"
 
 
     fn ui_explorer_url_button(&self, ui: &mut egui::Ui, url: &str, tooltip: &str) -> egui::Response {
+        // HF118: compact square explorer button. The icon is no longer circular,
+        // uses only light corner rounding, and almost fills the button while
+        // staying centered in the same footprint everywhere in the GUI.
+        let old_padding = ui.spacing().button_padding;
+        ui.spacing_mut().button_padding = egui::vec2(1.5, 1.5);
         let response = if let Some(texture) = self.icons.get("qub-explorer", ui.visuals().dark_mode) {
-            let sized = egui::load::SizedTexture::new(texture.id(), egui::vec2(21.0, 21.0));
-            ui.add(egui::Button::image_and_text(egui::Image::from_texture(sized).corner_radius(16), "").min_size(egui::vec2(34.0, 32.0)))
+            let sized = egui::load::SizedTexture::new(texture.id(), egui::vec2(27.0, 27.0));
+            ui.add_sized(
+                [31.0, 31.0],
+                egui::Button::image_and_text(egui::Image::from_texture(sized).corner_radius(4), "").min_size(egui::vec2(31.0, 31.0)),
+            )
         } else {
-            ui.add(egui::Button::new("↗").min_size(egui::vec2(34.0, 32.0)))
+            ui.add_sized([31.0, 31.0], egui::Button::new("↗").min_size(egui::vec2(31.0, 31.0)))
         };
+        ui.spacing_mut().button_padding = old_padding;
         let clicked = response.clicked();
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tooltip);
         if clicked { let _ = webbrowser::open(url); }
@@ -5191,6 +5474,137 @@ del "%~f0"
         }
     }
 
+
+    fn ui_qub_jin_window(&mut self, ctx: &egui::Context) {
+        if !self.qub_jin_dialog.open { return; }
+        self.request_qub_jin_preview();
+        let mut open = self.qub_jin_dialog.open;
+        let mut want_close = false;
+        let mut switch_mode: Option<QubJinMode> = None;
+        let mode = self.qub_jin_dialog.mode;
+        let locked = matches!(self.qub_jin_dialog.status, SendDialogStatus::Sending | SendDialogStatus::Pending | SendDialogStatus::Confirmed);
+        egui::Window::new(mode.title())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    self.ui_icon(ui, mode.icon(), 22.0);
+                    ui.label(egui::RichText::new(mode.title()).strong());
+                    self.ui_explorer_route_button(ui, "assets/jin", "Open JIN asset view in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "assets/qub", "Open QUB asset view in QUB Explorer");
+                    self.ui_explorer_route_button(ui, "activity", "Open global activity in QUB Explorer");
+                });
+                ui.small("HF119 keeps the already-active HF116 QUB/JIN mechanics enabled with non-blocking previews, worker-thread signing, wallet-pending-txs.json recovery, and exact rebroadcast until confirmation.");
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Local height #{}", self.snapshot.height));
+                    ui.separator();
+                    ui.label(format!("Activation #{}", self.snapshot.qub_jin_infusion_activation_height));
+                    ui.separator();
+                    if self.snapshot.qub_jin_infusion_active {
+                        ui.colored_label(egui::Color32::from_rgb(80, 220, 130), "Active on mainnet");
+                    } else {
+                        ui.colored_label(egui::Color32::from_rgb(255, 170, 90), "Not active yet");
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(format!("Active JIN inside QUB: {}", self.snapshot.active_jin_infused_into_qub));
+                    ui.separator();
+                    ui.small(format!("Per QUB: {}", self.snapshot.jin_per_qub_infusion));
+                    ui.separator();
+                    ui.small(format!("True max QUB: {}", self.snapshot.true_max_qub_supply));
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if self.ui_icon_selectable_button(ui, mode == QubJinMode::Infuse, "infuse", "Infuse JIN").clicked() && !locked {
+                        switch_mode = Some(QubJinMode::Infuse);
+                    }
+                    if self.ui_icon_selectable_button(ui, mode == QubJinMode::Melt, "melt", "Melt QUB").clicked() && !locked {
+                        switch_mode = Some(QubJinMode::Melt);
+                    }
+                });
+                ui.separator();
+
+                match self.qub_jin_dialog.status {
+                    SendDialogStatus::Editing | SendDialogStatus::Failed => {
+                        if self.qub_jin_dialog.status == SendDialogStatus::Failed && !self.qub_jin_dialog.message.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(255, 105, 105), &self.qub_jin_dialog.message);
+                            ui.add_space(6.0);
+                        }
+                        match mode {
+                            QubJinMode::Infuse => {
+                                ui.label("Amount of native JIN Coin to infuse into QUB");
+                                ui.add_enabled(!locked, egui::TextEdit::singleline(&mut self.qub_jin_dialog.amount).hint_text("e.g. 0.0021 or 1"));
+                                ui.small("The amount must be a valid exact consensus step so every current true QUB atom receives the same additional JIN backing.");
+                            }
+                            QubJinMode::Melt => {
+                                ui.label("Amount of QUB to melt permanently");
+                                ui.add_enabled(!locked, egui::TextEdit::singleline(&mut self.qub_jin_dialog.amount).hint_text("e.g. 1"));
+                                ui.label("Minimum JIN payout / slippage guard");
+                                ui.add_enabled(!locked, egui::TextEdit::singleline(&mut self.qub_jin_dialog.min_jin).hint_text("0 or expected JIN amount"));
+                                ui.small("Melt burns QUB from true max supply and releases the current proportional native JIN Coin backing. Set minimum JIN to protect against stale local preview.");
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.label("Extra QUB miner fee");
+                        ui.add_enabled(!locked, egui::TextEdit::singleline(&mut self.qub_jin_dialog.fee).hint_text("0.00001"));
+                        ui.add_space(8.0);
+                        egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+                            ui.horizontal(|ui| { self.ui_icon(ui, "i", 16.0); ui.label(egui::RichText::new("Preview / safety checks").strong()); });
+                            if self.qub_jin_dialog.preview_lines.is_empty() {
+                                ui.small("Enter an amount to calculate the on-chain preview.");
+                            } else {
+                                for line in &self.qub_jin_dialog.preview_lines { ui.small(line); }
+                            }
+                        });
+                        ui.add_space(8.0);
+                        let can_submit = self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active && self.qub_jin_dialog.status != SendDialogStatus::Sending;
+                        if self.ui_icon_button_enabled(ui, can_submit, mode.icon(), mode.action_label()).clicked() {
+                            self.start_qub_jin_dialog();
+                        }
+                        if ui.button("Close").clicked() { want_close = true; }
+                        if !self.snapshot.qub_jin_infusion_active {
+                            ui.small(format!("Disabled until block #{} on mainnet.", self.snapshot.qub_jin_infusion_activation_height));
+                        }
+                    }
+                    SendDialogStatus::Sending => {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label(&self.qub_jin_dialog.message); });
+                    }
+                    SendDialogStatus::Pending => {
+                        ui.horizontal(|ui| { self.ui_icon(ui, mode.icon(), 18.0); ui.label(egui::RichText::new(format!("{} pending", mode.pending_label())).strong()); });
+                        ui.label(&self.qub_jin_dialog.message);
+                        ui.horizontal(|ui| {
+                            ui.monospace(shorten_hash(&self.qub_jin_dialog.txid));
+                            self.ui_explorer_entity_button(ui, "tx", &self.qub_jin_dialog.txid, "Open pending QUB/JIN transaction in QUB Explorer");
+                        });
+                        ui.small(format!("Local mempool txs: {} | Relayed peers: {}", self.qub_jin_dialog.local_mempooltx, self.qub_jin_dialog.relayed_to_peers));
+                        if ui.button("Keep open / refresh status").clicked() {
+                            self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                        }
+                    }
+                    SendDialogStatus::Confirmed => {
+                        ui.horizontal(|ui| { self.ui_icon(ui, "success", 18.0); ui.colored_label(egui::Color32::from_rgb(80, 220, 130), format!("{} confirmed", mode.pending_label())); });
+                        ui.label(&self.qub_jin_dialog.message);
+                        self.ui_explorer_entity_button(ui, "tx", &self.qub_jin_dialog.txid, "Open confirmed QUB/JIN transaction in QUB Explorer");
+                        ui.horizontal(|ui| {
+                            if ui.button("New action").clicked() {
+                                self.qub_jin_dialog.status = SendDialogStatus::Editing;
+                                self.qub_jin_dialog.txid.clear();
+                                self.qub_jin_dialog.message.clear();
+                                self.qub_jin_dialog.preview_key.clear();
+                            }
+                            if ui.button("Close").clicked() { want_close = true; }
+                        });
+                    }
+                }
+            });
+        if let Some(mode) = switch_mode { self.open_qub_jin_dialog(mode); }
+        if want_close { open = false; }
+        self.qub_jin_dialog.open = open;
+    }
 
     fn ui_buy_jin_window(&mut self, ctx: &egui::Context) {
         if !self.buy_jin_dialog.open { return; }
@@ -6313,6 +6727,8 @@ impl eframe::App for QubCoreApp {
         self.poll_send_dialog();
         self.poll_ethereum_wallet_events();
         self.poll_conversion_dialog();
+        self.poll_qub_jin_dialog();
+        self.poll_qub_jin_preview(ctx);
         self.poll_buy_jin_dialog(ctx);
         self.poll_qns_dialog();
         self.poll_pool_dialog();
@@ -6528,6 +6944,7 @@ impl eframe::App for QubCoreApp {
         });
         self.ui_send_window(ui.ctx());
         self.ui_conversion_window(ui.ctx());
+        self.ui_qub_jin_window(ui.ctx());
         self.ui_buy_jin_window(ui.ctx());
         self.ui_ethereum_send_dialog_window(ui.ctx());
         self.ui_usdj_vault_dialog_window_hf107(ui.ctx());
@@ -7838,9 +8255,13 @@ impl QubCoreApp {
                 self.ui_icon_button_enabled(ui, false, "list-asset", "List");
                 self.ui_icon_button_enabled(ui, false, "offer", "Offer");
                 if is_qub {
-                    self.ui_icon_button_enabled(ui, false, "melt", "Melt");
+                    if self.ui_icon_button_enabled(ui, self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active, "melt", "Melt").clicked() {
+                        self.open_qub_jin_dialog(QubJinMode::Melt);
+                    }
                 } else {
-                    self.ui_icon_button_enabled(ui, false, "infuse", "Infuse");
+                    if self.ui_icon_button_enabled(ui, self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active, "infuse", "Infuse").clicked() {
+                        self.open_qub_jin_dialog(QubJinMode::Infuse);
+                    }
                     self.ui_icon_button_enabled(ui, false, "convert", "Convert disabled until bridge is live");
                 }
             });
@@ -7894,7 +8315,9 @@ impl QubCoreApp {
             self.ui_icon_button_enabled(ui, false, "sell", "Sell");
             self.ui_icon_button_enabled(ui, false, "list-asset", "List");
             self.ui_icon_button_enabled(ui, false, "offer", "Offer");
-            self.ui_icon_button_enabled(ui, false, "infuse", "Infuse");
+            if self.ui_icon_button_enabled(ui, self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active, "infuse", "Infuse").clicked() {
+                self.open_qub_jin_dialog(QubJinMode::Infuse);
+            }
             self.ui_icon_button_enabled(ui, false, "convert", "Convert disabled until bridge is live");
         });
     }
@@ -8124,7 +8547,9 @@ impl QubCoreApp {
                 self.ui_icon_only_button_enabled(ui, false, "sell", "Sell QUB");
                 self.ui_icon_only_button_enabled(ui, false, "list-asset", "List QUB");
                 self.ui_icon_only_button_enabled(ui, false, "offer", "Offer QUB");
-                self.ui_icon_only_button_enabled(ui, false, "melt", "Melt QUB");
+                if self.ui_icon_only_button_enabled(ui, self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active, "melt", "Melt QUB").clicked() {
+                    self.open_qub_jin_dialog(QubJinMode::Melt);
+                }
             });
         });
 
@@ -8157,7 +8582,9 @@ impl QubCoreApp {
                         self.ui_icon_only_button_enabled(ui, false, "sell", "Sell JIN Coin");
                         self.ui_icon_only_button_enabled(ui, false, "list-asset", "List JIN Coin");
                         self.ui_icon_only_button_enabled(ui, false, "offer", "Offer JIN Coin");
-                        self.ui_icon_only_button_enabled(ui, false, "infuse", "Infuse JIN Coin");
+                        if self.ui_icon_only_button_enabled(ui, self.snapshot.wallet_keys > 0 && self.snapshot.qub_jin_infusion_active, "infuse", "Infuse JIN Coin").clicked() {
+                            self.open_qub_jin_dialog(QubJinMode::Infuse);
+                        }
                         self.ui_icon_only_button_enabled(ui, false, "convert", "Convert disabled until bridge is live");
                     });
                 }
@@ -10027,6 +10454,68 @@ fn jin_swap_fee_split_for_ui(config_path: &str, price_atoms: u64) -> Result<(u64
 }
 
 
+fn qub_jin_minimum_step_for_gui(config_path: &str) -> Result<String> {
+    let settings = load_gui_settings(config_path)?;
+    let chain = load_or_init_chain(&settings)?;
+    let step = qub_jin_infusion_minimum_step_units(&settings, &chain)?;
+    Ok(format_jin_amount(step))
+}
+
+fn qub_jin_action_preview_for_gui(config_path: &str, mode: QubJinMode, amount: &str, fee: &str, min_jin: &str) -> Result<Vec<String>> {
+    let settings = load_gui_settings(config_path)?;
+    let chain = load_or_init_chain(&settings)?;
+    let spend_height = chain.height() + 1;
+    if !qub_jin_infusion_active(&settings, spend_height) {
+        anyhow::bail!("QUB/JIN infusion activates at block #{}; local next block would be #{}", qub_jin_infusion_activation_height(&settings), spend_height);
+    }
+    let state = qub_jin_infusion_state(&settings, &chain)?;
+    let fee_amount = Amount::from_str(fee.trim())?;
+    let mut lines = vec![
+        format!("Activation: #{} | local next spend height: #{}", qub_jin_infusion_activation_height(&settings), spend_height),
+        format!("Active JIN inside QUB: {} JIN", format_jin_amount(state.active_infused_jin_units)),
+        format!("Lifetime infused JIN: {} JIN", format_jin_amount(state.lifetime_infused_jin_units)),
+        format!("True max QUB supply: {} QUB", Amount::from_atoms(state.true_max_qub_atoms)?.to_string()),
+        format!("Current per-QUB backing: {} JIN/QUB", format_jin_amount(state.units_per_qub_atom.checked_mul(ATOMS_PER_QUB as u128).context("per-QUB display overflow")?)),
+        format!("Extra QUB miner fee: {} QUB", fee_amount.to_string()),
+    ];
+    match mode {
+        QubJinMode::Infuse => {
+            let units = parse_jin_amount(amount.trim())?;
+            if units == 0 { anyhow::bail!("JIN infusion amount must be non-zero"); }
+            if state.true_max_qub_atoms == 0 { anyhow::bail!("cannot infuse JIN after all QUB has been melted"); }
+            let step = state.true_max_qub_atoms as u128;
+            lines.push(format!("Minimum/current exact infusion step: {} JIN", format_jin_amount(step)));
+            if units % step != 0 {
+                anyhow::bail!("amount must be a multiple of {} JIN so every current QUB atom receives an exact increment", format_jin_amount(step));
+            }
+            let delta_per_atom = units / step;
+            let delta_per_qub = delta_per_atom.checked_mul(ATOMS_PER_QUB as u128).context("per-QUB delta overflow")?;
+            lines.push(format!("Infuse amount: {} JIN", format_jin_amount(units)));
+            lines.push(format!("Per-QUB increase after confirmation: +{} JIN/QUB", format_jin_amount(delta_per_qub)));
+            lines.push(format!("Projected per-QUB backing: {} JIN/QUB", format_jin_amount(state.units_per_qub_atom.checked_mul(ATOMS_PER_QUB as u128).context("per-QUB projection overflow")?.checked_add(delta_per_qub).context("per-QUB projection overflow")?)));
+            lines.push("Native JIN Coin is debited from the signing QUB address and credited into the QUB/JIN infusion vault.".to_string());
+        }
+        QubJinMode::Melt => {
+            let qub_amount = Amount::from_str(amount.trim())?;
+            let qub_atoms = qub_amount.atoms();
+            if qub_atoms == 0 { anyhow::bail!("QUB melt amount must be non-zero"); }
+            let payout = qub_jin_melt_payout_units_for_atoms(&settings, &chain, qub_atoms)?;
+            let parsed_min = if min_jin.trim().is_empty() { 0 } else { parse_jin_amount(min_jin.trim())? };
+            let guard = if parsed_min == 0 { payout } else { parsed_min };
+            if payout < guard { anyhow::bail!("current payout {} JIN is below the minimum guard {} JIN", format_jin_amount(payout), format_jin_amount(guard)); }
+            let projected_true = state.true_max_qub_atoms.saturating_sub(qub_atoms);
+            let projected_active = state.active_infused_jin_units.saturating_sub(payout);
+            lines.push(format!("Melt amount: {} QUB", qub_amount.to_string()));
+            lines.push(format!("Expected native JIN payout: {} JIN", format_jin_amount(payout)));
+            lines.push(format!("Minimum JIN guard used by transaction: {} JIN", format_jin_amount(guard)));
+            lines.push(format!("Projected true max QUB supply: {} QUB", Amount::from_atoms(projected_true)?.to_string()));
+            lines.push(format!("Projected active JIN inside QUB: {} JIN", format_jin_amount(projected_active)));
+            lines.push("The melted QUB is removed from true max QUB supply; native JIN Coin is credited to the same QUB address after confirmation.".to_string());
+        }
+    }
+    Ok(lines)
+}
+
 fn hf79_pre_tx_fast_sync(settings: &Settings) {
     if !settings.p2p.enabled { return; }
     // QUB Core/v1.6.9: transaction builders run in worker threads. Use the same
@@ -10046,9 +10535,18 @@ fn hf114_pre_jin_buy_sync(settings: &Settings) {
     let _ = p2p::hf90_auto_catchup(settings, 30_000);
 }
 
+fn hf119_pre_qub_jin_action_sync(settings: &Settings) {
+    if !settings.p2p.enabled { return; }
+    // HF119/v1.7.6: QUB/JIN Infuse/Melt needs a fresh local ledger, but the GUI
+    // action worker must not sit in the long generic pre-send path. Use a shorter
+    // bounded catch-up and then recover only exact wallet-outbox transactions.
+    let _ = p2p::hf90_auto_catchup(settings, 18_000);
+    hf117_pre_tx_outbox_recovery(settings);
+}
+
 fn hf117_relay_exact_wallet_tx(settings: &Settings, tx: &Transaction, txid: &Hash256) -> usize {
     if !settings.p2p.enabled { return 0; }
-    // HF117/v1.7.5: exact, bounded relay for GUI-created wallet txs. This uses
+    // HF117/v1.7.6: exact, bounded relay for GUI-created wallet txs. This uses
     // the same safe path as JIN buys, but applies it to normal QUB, MultiSend,
     // QNS, Library, Blast and Pool-management txs too.
     let mut relayed = p2p::broadcast_tx_limited(settings, tx, 24, 850).unwrap_or(0);
@@ -10414,6 +10912,44 @@ fn execute_gui_jin_token_conversion(config_path: &str, matrix_address: &str, amo
     Ok((txid, relayed, chain.mempool.len()))
 }
 
+fn execute_gui_qub_jin_infuse(config_path: &str, amount_jin: &str, fee: &str) -> Result<(String, usize, usize)> {
+    let settings = load_gui_settings(config_path)?;
+    hf119_pre_qub_jin_action_sync(&settings);
+    let mut chain = load_or_init_chain(&settings)?;
+    let wallet = load_or_init_wallet(&settings)?;
+    if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
+    let units = parse_jin_amount(amount_jin.trim())?;
+    let tx = wallet.create_qub_jin_infuse_transaction(&chain, &settings, units, Amount::from_str(fee.trim())?)?;
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-qub-jin-infuse")?;
+    save_chain(&settings, &chain)?;
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
+    Ok((txid, relayed, chain.mempool.len()))
+}
+
+fn execute_gui_qub_jin_melt(config_path: &str, amount_qub: &str, fee: &str, min_jin: Option<&str>) -> Result<(String, usize, usize)> {
+    let settings = load_gui_settings(config_path)?;
+    hf119_pre_qub_jin_action_sync(&settings);
+    let mut chain = load_or_init_chain(&settings)?;
+    let wallet = load_or_init_wallet(&settings)?;
+    if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
+    let qub_amount = Amount::from_str(amount_qub.trim())?;
+    let expected = qub_jin_melt_payout_units_for_atoms(&settings, &chain, qub_amount.atoms())?;
+    let parsed_min = match min_jin.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(v) => parse_jin_amount(v)?,
+        None => 0,
+    };
+    let min_units = if parsed_min == 0 { expected } else { parsed_min };
+    let tx = wallet.create_qub_melt_for_jin_transaction(&chain, &settings, qub_amount, Amount::from_str(fee.trim())?, min_units)?;
+    let txid_h = chain.accept_transaction_to_mempool(tx.clone(), &settings)?;
+    let txid = txid_h.to_string();
+    hf117_remember_pending_tx(&settings, &tx, "gui-qub-jin-melt")?;
+    save_chain(&settings, &chain)?;
+    let relayed = hf117_relay_exact_wallet_tx(&settings, &tx, &txid_h);
+    Ok((txid, relayed, chain.mempool.len()))
+}
+
 fn pool_create_price_preview(config_path: &str, capacity_slots: u32) -> String {
     match load_gui_settings(config_path).and_then(|settings| pool_create_price_atoms(&settings, capacity_slots).and_then(Amount::from_atoms)) {
         Ok(amount) => format!("Create cost: {} QUB for {} slots", amount, capacity_slots),
@@ -10716,6 +11252,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
     let (threads, duty) = resource_plan(logical, cpu_percent);
     let mut total_hashes = 0u64;
     let mut share_nonce_start = 0u64;
+    let mut hf119_last_policy_paced_tip: Option<Hash256> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
@@ -10778,7 +11315,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             continue;
         }
 
-        if !wait_for_target_spacing(&chain, &settings, events, &stop)? { continue; }
+        if !wait_for_target_spacing(&chain, &settings, events, &stop, &mut hf119_last_policy_paced_tip)? { continue; }
         if stop.load(Ordering::Relaxed) { break; }
         if let Ok(current) = load_or_init_chain(&settings) {
             if current.tip_hash() != chain.tip_hash() {
@@ -10951,6 +11488,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
     let (threads, duty) = resource_plan(logical, cpu_percent);
     let mut total_hashes = 0u64;
     let mut gpu_total_hashes = 0u64;
+    let mut hf119_last_policy_paced_tip: Option<Hash256> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
@@ -10990,7 +11528,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             }
         }
         if pace_to_target_spacing {
-            if !wait_for_target_spacing(&base_chain, &settings, events, &stop)? { continue; }
+            if !wait_for_target_spacing(&base_chain, &settings, events, &stop, &mut hf119_last_policy_paced_tip)? { continue; }
             if stop.load(Ordering::Relaxed) { break; }
             if let Ok(current) = load_or_init_chain(&settings) {
                 if current.tip_hash() != base_chain.tip_hash() {
@@ -11190,12 +11728,63 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
     Ok(())
 }
 
-fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mpsc::Sender<MinerEvent>, stop: &Arc<AtomicBool>) -> Result<bool> {
+fn hf119_solo_coinbase_address(settings: &Settings, block: &Block) -> Option<String> {
+    if parse_pool_block_marker(block).is_some() { return None; }
+    block.transactions
+        .first()?
+        .outputs
+        .first()
+        .and_then(|out| address_from_script_pubkey(&settings.network.address_prefix, &out.script_pubkey))
+        .map(|addr| addr.to_string())
+}
+
+fn hf119_recent_solo_winner_streak(chain: &ChainState, settings: &Settings) -> u32 {
+    let miner = settings.mining.miner_address.trim();
+    if miner.is_empty() { return 0; }
+    let mut streak = 0u32;
+    for block in chain.blocks.iter().rev().take(64) {
+        let Some(addr) = hf119_solo_coinbase_address(settings, block) else { break; };
+        if addr == miner {
+            streak = streak.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    streak
+}
+
+fn hf119_gui_winner_brake_secs(chain: &ChainState, settings: &Settings) -> Option<(u32, u32)> {
+    if settings.network.name != "mainnet" { return None; }
+    if settings.mining.miner_address.trim().is_empty() { return None; }
+    let streak = hf119_recent_solo_winner_streak(chain, settings);
+    if streak == 0 { return None; }
+    // HF119/v1.7.6: public GUI mining fairness brake. This is local policy only,
+    // not consensus. If the same local payout address is already the latest solo
+    // winner, wait a wall-clock cooldown before hashing the next height. HF117
+    // used block timestamps only; a fast GPU that found a block after a long
+    // hash round could immediately start the next height because the header time
+    // was already old. The one-tip brake below removes that last-winner head-start
+    // from updated public GUI clients without requiring seeds or a chain upgrade.
+    let target = settings.consensus.target_spacing_secs.max(60);
+    let capped = streak.min(20);
+    let mut seed = Vec::new();
+    seed.extend_from_slice(settings.mining.miner_address.as_bytes());
+    seed.extend_from_slice(&chain.height().saturating_add(1).to_le_bytes());
+    seed.extend_from_slice(b"HF119-public-gui-winner-brake");
+    let jitter = (Hash256::double_sha256(&seed).0[1] as u32) % 31;
+    let streak_extra = capped.saturating_mul(15).min(240);
+    let cooldown = target.saturating_add(streak_extra).saturating_add(jitter).min(360);
+    Some((streak, cooldown))
+}
+
+fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mpsc::Sender<MinerEvent>, stop: &Arc<AtomicBool>, last_policy_paced_tip: &mut Option<Hash256>) -> Result<bool> {
     if settings.network.name != "mainnet" { return Ok(true); }
     if chain.height() == 0 { return Ok(true); }
     let Some(tip) = chain.blocks.last() else { return Ok(true); };
+    let tip_hash = chain.tip_hash();
+    let now_at_entry = unix_time_u32();
     let jitter_secs = if settings.p2p.enabled && !settings.mining.miner_address.trim().is_empty() {
-        // HF117/v1.7.5: spread GUI miners across a small deterministic per-height
+        // HF117/v1.7.6: spread GUI miners across a small deterministic per-height
         // window. This is local mining policy only; it does not change block validity
         // or DAA. It removes the last-winner head-start without making seeds a
         // hard dependency.
@@ -11205,14 +11794,29 @@ fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mps
         let slot_window = (settings.consensus.target_spacing_secs / 3).clamp(4, 20);
         Hash256::double_sha256(&seed).0[0] as u32 % slot_window
     } else { 0 };
-    let next_allowed = tip.header.time.saturating_add(settings.consensus.target_spacing_secs).saturating_add(jitter_secs);
+    let mut next_allowed = tip.header.time.saturating_add(settings.consensus.target_spacing_secs).saturating_add(jitter_secs);
+    let mut winner_brake: Option<(u32, u32)> = None;
+    if *last_policy_paced_tip != Some(tip_hash) {
+        if let Some((streak, cooldown)) = hf119_gui_winner_brake_secs(chain, settings) {
+            let wall_clock_allowed = now_at_entry.saturating_add(cooldown);
+            if wall_clock_allowed > next_allowed { next_allowed = wall_clock_allowed; }
+            winner_brake = Some((streak, cooldown));
+        }
+    }
     let mut last_probe = Instant::now() - Duration::from_secs(10);
     loop {
         if stop.load(Ordering::Relaxed) { return Ok(true); }
         let now = unix_time_u32();
-        if now >= next_allowed { return Ok(true); }
+        if now >= next_allowed {
+            *last_policy_paced_tip = Some(tip_hash);
+            return Ok(true);
+        }
         let remaining = next_allowed.saturating_sub(now);
-        let _ = events.send(MinerEvent::Status(format!("HF117 target spacing: next block opens in {remaining}s.")));
+        if let Some((streak, cooldown)) = winner_brake {
+            let _ = events.send(MinerEvent::Status(format!("HF119 public-GUI winner brake: this payout mined the last {streak} solo block(s); waiting {remaining}s before the next height (one-tip cooldown {}s).", cooldown)));
+        } else {
+            let _ = events.send(MinerEvent::Status(format!("HF119 target spacing: next block opens in {remaining}s.")));
+        }
 
         // Do not run a heavy repair/sync loop while the miner is merely pacing.
         // A lightweight live-tip probe is enough to abort this candidate when
@@ -11221,12 +11825,12 @@ fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mps
         if settings.p2p.enabled && last_probe.elapsed() >= Duration::from_secs(5) {
             last_probe = Instant::now();
             if let Some(reason) = p2p::hf113_live_tip_pause_reason(settings, chain.height(), chain.tip_hash(), 520) {
-                let _ = events.send(MinerEvent::Status(format!("HF117 target-spacing wait cancelled: {reason}")));
+                let _ = events.send(MinerEvent::Status(format!("HF119 target-spacing wait cancelled: {reason}")));
                 return Ok(false);
             }
             if let Ok(current) = load_or_init_chain(settings) {
                 if current.height() != chain.height() || current.tip_hash() != chain.tip_hash() {
-                    let _ = events.send(MinerEvent::Status("HF117 target-spacing wait cancelled because local tip changed.".to_string()));
+                    let _ = events.send(MinerEvent::Status("HF119 target-spacing wait cancelled because local tip changed.".to_string()));
                     return Ok(false);
                 }
             }

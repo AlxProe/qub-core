@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "qubd"
-version = "1.7.5"
+version = "1.7.6"
 dependencies = [
  "anyhow",
  "eframe",

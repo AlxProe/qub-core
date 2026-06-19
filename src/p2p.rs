@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.5/"; // HF117
+const USER_AGENT: &str = "/QUB Core:1.7.6/"; // HF119
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -820,7 +820,7 @@ fn force_anchor_from_height(settings: &Settings, local: &ChainState) -> u32 {
 
 fn official_snapshot_peers(settings: &Settings) -> Vec<String> {
     let mut out = Vec::<String>::new();
-    let mut push = |addr: String, out: &mut Vec<String>| {
+    let push = |addr: String, out: &mut Vec<String>| {
         let normalized = normalize_peer_addr(&addr);
         if !normalized.trim().is_empty()
             && !is_self_or_empty_addr(settings, &normalized)
@@ -3405,7 +3405,7 @@ fn merge_sync_reports(into: &mut P2PSyncReport, other: P2PSyncReport) {
 fn adaptive_from_heights(local_height: u32, peer_height: u32, peer_tip_differs: bool) -> Vec<u32> {
     let mut out = Vec::<u32>::new();
     let mut seen = HashSet::<u32>::new();
-    let mut push = |h: u32, out: &mut Vec<u32>, seen: &mut HashSet<u32>| {
+    let push = |h: u32, out: &mut Vec<u32>, seen: &mut HashSet<u32>| {
         if seen.insert(h) { out.push(h); }
     };
 
@@ -4057,7 +4057,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
 
 fn prioritized_outbound_peers(settings: &Settings, max_count: usize) -> Result<Vec<String>> {
     let mut out = Vec::<String>::new();
-    let mut push = |addr: String, out: &mut Vec<String>| {
+    let push = |addr: String, out: &mut Vec<String>| {
         let normalized = normalize_peer_addr(&addr);
         if !normalized.trim().is_empty()
             && !is_self_or_empty_addr(settings, &normalized)
