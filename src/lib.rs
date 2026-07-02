@@ -366,6 +366,14 @@ pub const TESTNET_LIBRARY_ACTIVATION_HEIGHT: u32 = 3440;
 pub const MAINNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 21000;
 pub const TESTNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 5000;
 
+// HF120/v1.7.7: Protocol Epoch 2 is a forward-only mainnet chain upgrade.
+// It does not roll back history, blacklist addresses, change DAA, or change
+// economics. It simply introduces a post-activation block-version gate so all
+// miners must run an updated client to remain on the official QUB mainnet.
+pub const MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT: u32 = 24000;
+pub const PROTOCOL_EPOCH_1_BLOCK_VERSION: u32 = 1;
+pub const PROTOCOL_EPOCH_2_BLOCK_VERSION: u32 = 2;
+
 // HF116/v1.7.4: JIN Coin infusion into QUB Coin. This is a mainnet
 // consensus activation. Bootstrap moves the final 42 public-sale batches into
 // the QUB infusion vault at #16777, creating an exact 2 JIN/QUB starting ratio.
@@ -497,6 +505,30 @@ pub fn daa_v2_active(settings: &Settings, next_height: u32) -> bool {
         "testnet" => next_height >= TESTNET_DAA_V2_ACTIVATION_HEIGHT,
         _ => false,
     }
+}
+
+pub fn protocol_epoch_2_activation_height(settings: &Settings) -> u32 {
+    match settings.network.name.as_str() {
+        "mainnet" => MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT,
+        _ => u32::MAX,
+    }
+}
+
+pub fn protocol_epoch_2_active(settings: &Settings, height: u32) -> bool {
+    let activation = protocol_epoch_2_activation_height(settings);
+    activation != u32::MAX && height >= activation
+}
+
+pub fn expected_block_version(settings: &Settings, height: u32) -> u32 {
+    if protocol_epoch_2_active(settings, height) {
+        PROTOCOL_EPOCH_2_BLOCK_VERSION
+    } else {
+        settings.consensus.version
+    }
+}
+
+pub fn protocol_epoch_name(settings: &Settings, height: u32) -> &'static str {
+    if protocol_epoch_2_active(settings, height) { "Protocol Epoch 2" } else { "Protocol Epoch 1" }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1340,7 +1372,7 @@ pub fn block_subsidy(height: u64, settings: &Settings) -> u64 { if height == 0 {
 pub fn validate_tx_stateless(tx: &Transaction, settings: &Settings) -> Result<()> { if is_pool_share_transaction(tx) { return Ok(()); } if tx.inputs.is_empty() || tx.outputs.is_empty() { if tx.is_coinbase() { return Ok(()); } bail!("tx must have inputs and outputs"); } if !tx.is_coinbase() && tx.outputs.len() > MAX_SEND_ENTRIES_PER_TX + 4 { bail!("tx has too many outputs; max send/blast entries is 256"); } let mut seen = HashSet::new(); for input in &tx.inputs { if !seen.insert(input.previous_output.clone()) { bail!("duplicate input"); } } let mut total = 0u128; for output in &tx.outputs { let v = output.value.atoms(); if v == 0 || v > settings.consensus.max_money_atoms || v > MAX_MONEY_ATOMS { bail!("amount out of range"); } total += v as u128; if total > settings.consensus.max_money_atoms as u128 { bail!("output total exceeds max money"); } } Ok(()) }
 pub fn validate_tx_contextual(tx: &Transaction, utxos: &HashMap<OutPoint, CoinRecord>, spend_height: u32, settings: &Settings, verify_scripts: bool) -> Result<u64> { validate_tx_stateless(tx, settings)?; if tx.is_coinbase() || is_pool_share_transaction(tx) { return Ok(0); } validate_blast_create_outputs(tx, spend_height, settings)?; if is_blast_claim_transaction(tx, settings) { return validate_blast_claim_contextual(tx, utxos, spend_height, settings); } let mut total_in = 0u128; let total_out: u128 = tx.outputs.iter().map(|o| o.value.atoms() as u128).sum(); for (idx, input) in tx.inputs.iter().enumerate() { let coin = utxos.get(&input.previous_output).with_context(|| format!("missing UTXO {}", input.previous_output.key()))?; if coin.is_coinbase && spend_height.saturating_sub(coin.height) < settings.consensus.coinbase_maturity { bail!("premature coinbase spend"); } if verify_scripts { verify_p2pkh_input(tx, idx, coin)?; } total_in += coin.tx_out.value.atoms() as u128; } if total_in < total_out { bail!("insufficient input value"); } Ok((total_in - total_out) as u64) }
 fn verify_p2pkh_input(tx: &Transaction, idx: usize, coin: &CoinRecord) -> Result<()> { let expected = p2pkh_payload(&coin.tx_out.script_pubkey).context("unsupported script_pubkey")?; let (pk, sig) = decode_sig_script(&tx.inputs[idx].signature_script)?; if public_key_hash(&pk) != expected { bail!("pubkey hash mismatch"); } let sighash = tx.sighash_all(idx, &coin.tx_out.script_pubkey)?; if !verify_hash(&pk, &sig, sighash) { bail!("signature verification failed"); } Ok(()) }
-fn validate_block(block: &Block, base_utxos: &HashMap<OutPoint, CoinRecord>, expected_prev: Hash256, height: u32, required_bits: u32, settings: &Settings) -> Result<HashSet<Hash256>> { if block.transactions.is_empty() { bail!("empty block"); } if block.transactions.len() > settings.consensus.max_block_transactions { bail!("too many block transactions"); } if block.header.version != settings.consensus.version { bail!("bad block version"); } if block.header.prev_block_hash != expected_prev { bail!("bad prev hash"); } if block.header.bits != required_bits { bail!("bad bits: expected {required_bits:#x}, got {:#x}", block.header.bits); } if block.compute_merkle_root() != block.header.merkle_root { bail!("merkle mismatch"); } if !verify_header_pow(&block.header)? { bail!("insufficient PoW"); } if block.header.time > unix_time_u32().saturating_add(settings.consensus.max_future_time_secs) { bail!("future timestamp"); } if !block.transactions[0].is_coinbase() { bail!("missing coinbase"); } for tx in block.transactions.iter().skip(1) { if tx.is_coinbase() { bail!("extra coinbase"); } } let mut ids = HashSet::new(); for tx in &block.transactions { if !ids.insert(tx.txid()) { bail!("duplicate txid"); } } let mut scratch = base_utxos.clone(); let mut fees = 0u128; for tx in block.transactions.iter().skip(1) { let raw_fee = validate_tx_contextual(tx, &scratch, height, settings, true)?; let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, tx, height)?; if raw_fee < qub_melt_burn { bail!("QUB melt burn exceeds transaction input-output delta"); } let fee = raw_fee - qub_melt_burn; let qns_miner_fee = qns_miner_fee_required_in_tx(settings, tx, height)?; let library_miner_fee = library_miner_fee_required_in_tx(settings, tx, height)?; let swap_miner_fee = jin_swap_miner_fee_required_in_tx(settings, tx, height)?; let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?; if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); } fees += fee as u128; connect_tx_utxos(tx, &mut scratch, height, false)?; } validate_tx_stateless(&block.transactions[0], settings)?; let claim: u128 = block.transactions[0].outputs.iter().map(|o| o.value.atoms() as u128).sum(); if claim > block_subsidy(height as u64, settings) as u128 + fees { bail!("coinbase overclaim"); } Ok(ids) }
+fn validate_block(block: &Block, base_utxos: &HashMap<OutPoint, CoinRecord>, expected_prev: Hash256, height: u32, required_bits: u32, settings: &Settings) -> Result<HashSet<Hash256>> { if block.transactions.is_empty() { bail!("empty block"); } if block.transactions.len() > settings.consensus.max_block_transactions { bail!("too many block transactions"); } let expected_version = expected_block_version(settings, height); if block.header.version != expected_version { bail!("bad block version for {} at #{}: expected {}, got {}", protocol_epoch_name(settings, height), height, expected_version, block.header.version); } if block.header.prev_block_hash != expected_prev { bail!("bad prev hash"); } if block.header.bits != required_bits { bail!("bad bits: expected {required_bits:#x}, got {:#x}", block.header.bits); } if block.compute_merkle_root() != block.header.merkle_root { bail!("merkle mismatch"); } if !verify_header_pow(&block.header)? { bail!("insufficient PoW"); } if block.header.time > unix_time_u32().saturating_add(settings.consensus.max_future_time_secs) { bail!("future timestamp"); } if !block.transactions[0].is_coinbase() { bail!("missing coinbase"); } for tx in block.transactions.iter().skip(1) { if tx.is_coinbase() { bail!("extra coinbase"); } } let mut ids = HashSet::new(); for tx in &block.transactions { if !ids.insert(tx.txid()) { bail!("duplicate txid"); } } let mut scratch = base_utxos.clone(); let mut fees = 0u128; for tx in block.transactions.iter().skip(1) { let raw_fee = validate_tx_contextual(tx, &scratch, height, settings, true)?; let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, tx, height)?; if raw_fee < qub_melt_burn { bail!("QUB melt burn exceeds transaction input-output delta"); } let fee = raw_fee - qub_melt_burn; let qns_miner_fee = qns_miner_fee_required_in_tx(settings, tx, height)?; let library_miner_fee = library_miner_fee_required_in_tx(settings, tx, height)?; let swap_miner_fee = jin_swap_miner_fee_required_in_tx(settings, tx, height)?; let required_extra_fee = qns_miner_fee.checked_add(library_miner_fee).and_then(|v| v.checked_add(swap_miner_fee)).context("extra miner fee overflow")?; if fee < required_extra_fee { bail!("miner fee underpayment: required {} atoms as block fee, got {}", required_extra_fee, fee); } fees += fee as u128; connect_tx_utxos(tx, &mut scratch, height, false)?; } validate_tx_stateless(&block.transactions[0], settings)?; let claim: u128 = block.transactions[0].outputs.iter().map(|o| o.value.atoms() as u128).sum(); if claim > block_subsidy(height as u64, settings) as u128 + fees { bail!("coinbase overclaim"); } Ok(ids) }
 fn connect_block_utxos(block: &Block, utxos: &mut HashMap<OutPoint, CoinRecord>, height: u32) -> Result<()> { for (idx, tx) in block.transactions.iter().enumerate() { connect_tx_utxos(tx, utxos, height, idx == 0)?; } Ok(()) }
 pub(crate) fn connect_tx_utxos(tx: &Transaction, utxos: &mut HashMap<OutPoint, CoinRecord>, height: u32, is_coinbase: bool) -> Result<()> { if is_pool_share_transaction(tx) { return Ok(()); } if !is_coinbase { for input in &tx.inputs { if utxos.remove(&input.previous_output).is_none() { bail!("missing UTXO during connect"); } } } let txid = tx.txid(); for (vout, output) in tx.outputs.iter().enumerate() { let old = utxos.insert(OutPoint { txid, vout: vout as u32 }, CoinRecord { tx_out: output.clone(), height, is_coinbase }); if old.is_some() { bail!("duplicate created outpoint"); } } Ok(()) }
 pub fn is_immature_coinbase(coin: &CoinRecord, current_height: u32, settings: &Settings) -> bool { coin.is_coinbase && current_height.saturating_sub(coin.height) < settings.consensus.coinbase_maturity }
@@ -1442,7 +1474,7 @@ pub fn build_candidate_block(chain: &ChainState, settings: &Settings, miner: &Ad
     let mut all = vec![coinbase];
     all.extend(txs);
     let merkle = merkle_root(&all.iter().map(|tx| tx.txid()).collect::<Vec<_>>());
-    Ok(Block { header: BlockHeader { version: settings.consensus.version, prev_block_hash: chain.tip_hash(), merkle_root: merkle, time: unix_time_u32(), bits: required_work_bits(settings, &chain.blocks, height)?, nonce: 0 }, transactions: all })
+    Ok(Block { header: BlockHeader { version: expected_block_version(settings, height), prev_block_hash: chain.tip_hash(), merkle_root: merkle, time: unix_time_u32(), bits: required_work_bits(settings, &chain.blocks, height)?, nonce: 0 }, transactions: all })
 }
 
 pub fn build_candidate_pool_block(chain: &ChainState, settings: &Settings, pool_id: Hash256, extra_nonce: u64) -> Result<Block> {
@@ -1457,7 +1489,7 @@ pub fn build_candidate_pool_block(chain: &ChainState, settings: &Settings, pool_
     let mut all = vec![coinbase];
     all.extend(txs);
     let merkle = merkle_root(&all.iter().map(|tx| tx.txid()).collect::<Vec<_>>());
-    Ok(Block { header: BlockHeader { version: settings.consensus.version, prev_block_hash: chain.tip_hash(), merkle_root: merkle, time: unix_time_u32(), bits: required_work_bits(settings, &chain.blocks, height)?, nonce: 0 }, transactions: all })
+    Ok(Block { header: BlockHeader { version: expected_block_version(settings, height), prev_block_hash: chain.tip_hash(), merkle_root: merkle, time: unix_time_u32(), bits: required_work_bits(settings, &chain.blocks, height)?, nonce: 0 }, transactions: all })
 }
 
 pub fn mine_next_block(chain: &ChainState, settings: &Settings, miner: &Address, options: MiningOptions) -> Result<Block> {

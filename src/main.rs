@@ -106,6 +106,9 @@ fn cmd_info(settings: &Settings) -> Result<()> {
         "jin_protocol_address": settings.jin.protocol_address,
         "qub_jin_infusion_activation_height": qub_jin_infusion_activation_height(settings),
         "qub_jin_sale_reserve_lock_height": qub_jin_sale_reserve_lock_height(settings),
+        "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
+        "protocol_epoch_2_active_next_block": protocol_epoch_2_active(settings, chain.height() + 1),
+        "next_block_expected_version": expected_block_version(settings, chain.height() + 1),
         "qub_jin_infusion_active": qub_jin_infusion_active(settings, chain.height() + 1),
         "qub_jin_infusion": qub_jin_state.as_ref().map(|st| serde_json::json!({
             "melted_qub": Amount::from_atoms(st.melted_qub_atoms).map(|a| a.to_string()).unwrap_or_else(|_| st.melted_qub_atoms.to_string()),
@@ -328,7 +331,7 @@ fn cmd_relay_mempool(settings: &Settings) -> Result<()> {
 }
 
 fn hf117_remember_and_relay_cli_tx(settings: &Settings, chain: &ChainState, tx: &Transaction, txid: Hash256, label: &str) -> usize {
-    // HF117/v1.7.6: CLI sends use the same raw-tx outbox and exact bounded
+    // HF117/v1.7.7: CLI sends use the same raw-tx outbox and exact bounded
     // relay as the GUI. If a tx is mined into a stale block and later becomes
     // NotFound, wallet-pending-txs.json still has the raw transaction for
     // deterministic reaccept/rebroadcast once the inputs are valid again.
@@ -1073,6 +1076,7 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
         let seeds = p2p::release_bootnodes(settings);
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_plaintext_wallet_disabled", !settings.wallet.plaintext_keys_allowed, "mainnet local plaintext key creation must be disabled by default".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_coinbase_maturity", settings.consensus.coinbase_maturity >= 100, "mainnet coinbase maturity should be at least 100 blocks".to_string());
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_epoch1_base_block_version_1", settings.consensus.version == PROTOCOL_EPOCH_1_BLOCK_VERSION, "mainnet historical/pre-HF120 block version must remain 1; HF120 upgrades only post-#24000 blocks to version 2".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_dns_seeds_present", seeds.len() >= 2, format!("{} DNS seed domain(s) configured", seeds.len()));
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_seeds_not_placeholders", !seeds.iter().any(|b| looks_placeholder(b)), "seed domains must be final official domains, not placeholders".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_seeds_are_dns_not_raw_ip", !seeds.iter().any(|b| bootnode_host_is_raw_ip(b)), "publish DNS seed names; do not ship personal/server raw IPs in the public mainnet GUI".to_string());
@@ -1101,6 +1105,21 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_library_activation_10550", MAINNET_LIBRARY_ACTIVATION_HEIGHT == 10550 && settings.library.activation_height == 10550, "Library activates at #10550".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_jin_sale_activation_10720", MAINNET_JIN_SWAP_ACTIVATION_HEIGHT == 10720 && settings.jin_swap.activation_height == 10720, "JIN public sale activates at #10720".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_infusion_activation_16777", MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT == 16777 && qub_jin_infusion_activation_height(settings) == 16777, "HF116 JIN Coin infusion into QUB activates at #16777".to_string());
+        let epoch2_activation = protocol_epoch_2_activation_height(settings);
+        let epoch2_notice_blocks = 1_000u32;
+        let epoch2_activation_ok = epoch2_activation == MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT;
+        let epoch2_detail = if current_height < epoch2_activation {
+            format!("HF120 Protocol Epoch 2 activates at #{}; current #{}; {} block(s) notice remaining; post-activation blocks must use version {}", epoch2_activation, current_height, epoch2_activation.saturating_sub(current_height), PROTOCOL_EPOCH_2_BLOCK_VERSION)
+        } else {
+            let last = chain.blocks.last().map(|b| b.header.version).unwrap_or(settings.consensus.version);
+            format!("HF120 Protocol Epoch 2 already active since #{}; current #{}; tip block version {}; expected next version {}", epoch2_activation, current_height, last, expected_block_version(settings, current_height.saturating_add(1)))
+        };
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_protocol_epoch_2_activation_24000", epoch2_activation_ok, epoch2_detail.clone());
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_protocol_epoch_2_notice_or_active", current_height >= epoch2_activation || epoch2_activation >= current_height.saturating_add(epoch2_notice_blocks), epoch2_detail);
+        if current_height >= epoch2_activation {
+            let post_epoch_versions_ok = chain.blocks.iter().enumerate().skip(epoch2_activation as usize).all(|(h, b)| b.header.version == expected_block_version(settings, h as u32));
+            add_preflight_check(&mut checks, &mut ok_all, "mainnet_protocol_epoch_2_blocks_versioned", post_epoch_versions_ok, format!("all blocks from #{} onward must use block version {}", epoch2_activation, PROTOCOL_EPOCH_2_BLOCK_VERSION));
+        }
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_sale_reserve_lock_16666", MAINNET_QUB_JIN_SALE_RESERVE_LOCK_HEIGHT == 16666 && qub_jin_sale_reserve_lock_height(settings) == 16666, "HF116 locks the final 42 JIN sale batches at #16666 so the #16777 bootstrap reserve cannot be drained".to_string());
         add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_bootstrap_exact", qub_jin_bootstrap_units_per_atom(settings).map(|v| v == 20_000_000_000u128).unwrap_or(false), "HF116 bootstrap must be exactly 2 JIN/QUB = 20,000,000,000 JIN units per QUB atom".to_string());
         let hf116_activation = qub_jin_infusion_activation_height(settings);
@@ -1774,4 +1793,4 @@ fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &st
     Ok(())
 }
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> { let pos = args.iter().position(|a| a == flag)?; args.remove(pos); if pos >= args.len() { None } else { Some(args.remove(pos)) } }
-fn help(config: &str) { println!("QUB Core v1.7.6\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }
+fn help(config: &str) { println!("QUB Core v1.7.7\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }

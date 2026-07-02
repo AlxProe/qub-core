@@ -534,3 +534,13 @@ fn hf117_reorg_resurrects_qub_tx_from_stale_block() {
     assert!(stale_local.try_adopt_peer_chain(winning.blocks.clone(), &s, false).unwrap());
     assert!(stale_local.tx_in_mempool(txid), "HF117 should reaccept the QUB tx from the disconnected stale block");
 }
+
+#[test]
+fn hf120_protocol_epoch_2_version_gate_is_forward_only() {
+    let s: Settings = toml::from_str(include_str!("../config/mainnet.toml")).expect("mainnet config parses");
+    assert_eq!(MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT, 24000);
+    assert_eq!(protocol_epoch_2_activation_height(&s), 24000);
+    assert_eq!(expected_block_version(&s, MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT - 1), s.consensus.version);
+    assert_eq!(expected_block_version(&s, MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT), PROTOCOL_EPOCH_2_BLOCK_VERSION);
+    assert_eq!(expected_block_version(&s, MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT + 1), PROTOCOL_EPOCH_2_BLOCK_VERSION);
+}

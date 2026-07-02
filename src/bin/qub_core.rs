@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.6";
+const APP_VERSION: &str = "v1.7.7";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -3504,7 +3504,7 @@ del "%~f0"
         self.gpu_workers = 0;
         self.gpu_device.clear();
         self.gpu_device_rates.clear();
-        // HF117/v1.7.6: target-spacing pacing is policy, not consensus. It reduces
+        // HF117/v1.7.7: target-spacing pacing is policy, not consensus. It reduces
         // last-winner head-start streaks and coinbase-only burst races without any
         // chain upgrade or seed update. Keep the persisted preference defaulted ON.
         if !self.prefs.pace_to_target_spacing {
@@ -3926,7 +3926,7 @@ del "%~f0"
         match mode {
             QubJinMode::Infuse => {
                 if self.qub_jin_dialog.amount.trim().is_empty() || self.qub_jin_dialog.amount.trim() == "0" {
-                    // HF119/v1.7.6: never load/scan the chain on the UI thread just
+                    // HF119/v1.7.7: never load/scan the chain on the UI thread just
                     // because the user pressed the Infuse button. The async preview
                     // worker below computes the exact consensus step. This immediate
                     // default keeps the window responsive even on large mainnet data.
@@ -10537,7 +10537,7 @@ fn hf114_pre_jin_buy_sync(settings: &Settings) {
 
 fn hf119_pre_qub_jin_action_sync(settings: &Settings) {
     if !settings.p2p.enabled { return; }
-    // HF119/v1.7.6: QUB/JIN Infuse/Melt needs a fresh local ledger, but the GUI
+    // HF119/v1.7.7: QUB/JIN Infuse/Melt needs a fresh local ledger, but the GUI
     // action worker must not sit in the long generic pre-send path. Use a shorter
     // bounded catch-up and then recover only exact wallet-outbox transactions.
     let _ = p2p::hf90_auto_catchup(settings, 18_000);
@@ -10546,7 +10546,7 @@ fn hf119_pre_qub_jin_action_sync(settings: &Settings) {
 
 fn hf117_relay_exact_wallet_tx(settings: &Settings, tx: &Transaction, txid: &Hash256) -> usize {
     if !settings.p2p.enabled { return 0; }
-    // HF117/v1.7.6: exact, bounded relay for GUI-created wallet txs. This uses
+    // HF117/v1.7.7: exact, bounded relay for GUI-created wallet txs. This uses
     // the same safe path as JIN buys, but applies it to normal QUB, MultiSend,
     // QNS, Library, Blast and Pool-management txs too.
     let mut relayed = p2p::broadcast_tx_limited(settings, tx, 24, 850).unwrap_or(0);
@@ -11758,7 +11758,7 @@ fn hf119_gui_winner_brake_secs(chain: &ChainState, settings: &Settings) -> Optio
     if settings.mining.miner_address.trim().is_empty() { return None; }
     let streak = hf119_recent_solo_winner_streak(chain, settings);
     if streak == 0 { return None; }
-    // HF119/v1.7.6: public GUI mining fairness brake. This is local policy only,
+    // HF119/v1.7.7: public GUI mining fairness brake. This is local policy only,
     // not consensus. If the same local payout address is already the latest solo
     // winner, wait a wall-clock cooldown before hashing the next height. HF117
     // used block timestamps only; a fast GPU that found a block after a long
@@ -11784,7 +11784,7 @@ fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mps
     let tip_hash = chain.tip_hash();
     let now_at_entry = unix_time_u32();
     let jitter_secs = if settings.p2p.enabled && !settings.mining.miner_address.trim().is_empty() {
-        // HF117/v1.7.6: spread GUI miners across a small deterministic per-height
+        // HF117/v1.7.7: spread GUI miners across a small deterministic per-height
         // window. This is local mining policy only; it does not change block validity
         // or DAA. It removes the last-winner head-start without making seeds a
         // hard dependency.
