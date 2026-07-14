@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.7/"; // HF120
+const USER_AGENT: &str = "/QUB Core:1.7.8/"; // HF121
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;

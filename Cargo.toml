@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.7.7"
+version = "1.7.8"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.7.7 HF120 full-node core with Protocol Epoch 2 activation at mainnet block 24000"
+description = "Qubit Coin v1.7.8 HF121 operational core with HF120 Protocol Epoch 2 activation at mainnet block 24000"
 readme = "README.md"
 
 [features]

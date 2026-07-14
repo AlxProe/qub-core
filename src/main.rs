@@ -3,8 +3,11 @@ use qubd::*;
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 fn main() {
@@ -25,6 +28,7 @@ fn run() -> Result<()> {
     match args[0].as_str() {
         "init" => cmd_init(&settings),
         "info" => cmd_info(&settings),
+        "status-fast" => cmd_status_fast(&settings),
         "validate" => { let chain = load_or_init_chain(&settings)?; chain.validate_all(&settings)?; println!("OK height={} bestblockhash={}", chain.height(), chain.tip_hash()); Ok(()) },
         "node" => p2p::run_node(settings.clone()),
         "sync" => cmd_sync(&settings),
@@ -70,6 +74,7 @@ fn run() -> Result<()> {
         "pool-mine" => cmd_pool_mine(&settings, args.get(1).context("usage: pool-mine <pool-id> [blocks] [miner-address]")?, args.get(2).map(String::as_str).unwrap_or("1").parse()?, args.get(3).map(String::as_str)),
         "mine" => cmd_mine(&settings, args.get(1).map(String::as_str).unwrap_or("1").parse()?, args.get(2).map(String::as_str)),
         "explorer-api" => cmd_explorer_api(&settings, args.get(1).map(String::as_str).unwrap_or("127.0.0.1:18765")),
+        "rpc-api" => cmd_rpc_api(&settings, args.get(1).map(String::as_str).unwrap_or(settings.rpc.bind.as_str())),
         other => bail!("unknown command {other}"),
     }
 }
@@ -84,6 +89,109 @@ fn cmd_init(settings: &Settings) -> Result<()> {
     println!("{}", v1_feature_notice(settings));
     Ok(())
 }
+
+fn cmd_status_fast(settings: &Settings) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status_fast_json(settings, true)?)?
+    );
+    Ok(())
+}
+
+fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<serde_json::Value> {
+    let paths = NodePaths::from_settings(settings);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if !paths.chain_file.exists() {
+        let mut value = serde_json::json!({
+            "ok": false,
+            "mode": "status-fast",
+            "network": settings.network.name,
+            "chain_file_exists": false,
+            "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
+            "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
+            "hf121_status_fast": true,
+            "hf121_r2_bounded_memory": true,
+            "generated_at_unix": now,
+            "note": "chain file not found; node may not be initialized yet"
+        });
+        if include_local_paths {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "data_dir".to_string(),
+                    serde_json::Value::String(paths.data_dir.display().to_string()),
+                );
+                obj.insert(
+                    "chain_file".to_string(),
+                    serde_json::Value::String(paths.chain_file.display().to_string()),
+                );
+                obj.insert(
+                    "chain_status_file".to_string(),
+                    serde_json::Value::String(paths.chain_status_file.display().to_string()),
+                );
+            }
+        }
+        return Ok(value);
+    }
+
+    let (status, source) = load_fast_chain_status(settings)?;
+    let source_name = match source {
+        FastChainStatusSource::Metadata => "chain-status-metadata",
+        FastChainStatusSource::StreamScan => "bounded-memory-stream-scan",
+    };
+    let next_height = status.height.saturating_add(1);
+    let epoch_height = protocol_epoch_2_activation_height(settings);
+    let tip_age_secs = now.saturating_sub(status.tip_block_time as u64);
+
+    let mut value = serde_json::json!({
+        "ok": true,
+        "mode": "status-fast",
+        "status_source": source_name,
+        "network": status.network,
+        "chain_file_exists": true,
+        "chain_file_bytes": status.chain_file_bytes,
+        "height": status.height,
+        "tip_hash": status.tip_hash.to_string(),
+        "tip_block_version": status.tip_block_version,
+        "tip_block_time": status.tip_block_time,
+        "tip_age_secs": tip_age_secs,
+        "tip_tx_count": status.tip_tx_count,
+        "next_height": next_height,
+        "next_block_expected_version": expected_block_version(settings, next_height),
+        "protocol_epoch_2_activation_height": epoch_height,
+        "protocol_epoch_2_active_next_block": protocol_epoch_2_active(settings, next_height),
+        "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
+        "hf120_protocol_epoch_2_unchanged": epoch_height == MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT || settings.network.name != "mainnet",
+        "hf121_status_fast": true,
+        "hf121_r2_bounded_memory": true,
+        "generated_at_unix": now,
+        "status_generated_at_unix": status.generated_at_unix,
+        "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
+    });
+
+    if include_local_paths {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "data_dir".to_string(),
+                serde_json::Value::String(paths.data_dir.display().to_string()),
+            );
+            obj.insert(
+                "chain_file".to_string(),
+                serde_json::Value::String(paths.chain_file.display().to_string()),
+            );
+            obj.insert(
+                "chain_status_file".to_string(),
+                serde_json::Value::String(paths.chain_status_file.display().to_string()),
+            );
+        }
+    }
+
+    Ok(value)
+}
+
 fn cmd_info(settings: &Settings) -> Result<()> {
     let chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
@@ -331,7 +439,7 @@ fn cmd_relay_mempool(settings: &Settings) -> Result<()> {
 }
 
 fn hf117_remember_and_relay_cli_tx(settings: &Settings, chain: &ChainState, tx: &Transaction, txid: Hash256, label: &str) -> usize {
-    // HF117/v1.7.7: CLI sends use the same raw-tx outbox and exact bounded
+    // HF117/v1.7.8: CLI sends use the same raw-tx outbox and exact bounded
     // relay as the GUI. If a tx is mined into a stale block and later becomes
     // NotFound, wallet-pending-txs.json still has the raw transaction for
     // deterministic reaccept/rebroadcast once the inputs are valid again.
@@ -1200,17 +1308,315 @@ fn looks_placeholder(value: &str) -> bool {
 }
 
 
-fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
-    let listener = TcpListener::bind(bind).with_context(|| format!("failed to bind explorer API on {bind}"))?;
-    println!("QUB Explorer API listening on http://{bind}");
-    println!("Network={} data_dir={}", settings.network.name, settings.node.data_dir);
-    println!("Read-only mode: every request reloads chain.json; no explorer database is used.");
+
+const RPC_MAX_HEADER_BYTES: usize = 16 * 1024;
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn cmd_rpc_api(settings: &Settings, bind: &str) -> Result<()> {
+    if !settings.rpc.enabled {
+        bail!("rpc.enabled=false; explicitly enable RPC in the selected config before starting rpc-api");
+    }
+    if !is_loopback_bind(bind) {
+        bail!("HF121 rpc-api is local-only; bind to 127.0.0.1, localhost, or ::1");
+    }
+    if looks_placeholder(&settings.rpc.auth_token) {
+        bail!("rpc.auth_token must be a real secret before starting rpc-api");
+    }
+
+    let listener = TcpListener::bind(bind)
+        .with_context(|| format!("failed to bind QUB RPC API on {bind}"))?;
+    println!("QUB RPC API listening on http://{bind}");
+    println!("Network={}", settings.network.name);
+    println!("HF121-r2 RPC groundwork is loopback-only and token-authenticated; mining template/submit endpoints remain disabled.");
+
+    // Status requests are deliberately handled serially. Combined with short
+    // socket timeouts and O(1) metadata reads, this avoids an unbounded thread
+    // fan-out while the RPC surface is still groundwork-only.
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let s = settings.clone();
+                if let Err(err) = handle_rpc_http(stream, settings) {
+                    eprintln!("rpc api request error: {err:#}");
+                }
+            }
+            Err(err) => eprintln!("rpc api accept error: {err}"),
+        }
+    }
+    Ok(())
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    let Ok(addrs) = bind.to_socket_addrs() else {
+        return false;
+    };
+    let mut saw_address = false;
+    for addr in addrs {
+        saw_address = true;
+        if !addr.ip().is_loopback() {
+            return false;
+        }
+    }
+    saw_address
+}
+
+fn read_http_header(stream: &mut TcpStream, max_bytes: usize) -> Result<String> {
+    let mut data = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if data.len() >= max_bytes {
+            bail!("request headers exceed {max_bytes} bytes");
+        }
+        let remaining = max_bytes - data.len();
+        let take = chunk.len().min(remaining);
+        let n = stream.read(&mut chunk[..take])?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if data.windows(4).any(|w| w == b"\r\n\r\n")
+            || data.windows(2).any(|w| w == b"\n\n")
+        {
+            break;
+        }
+    }
+    if data.is_empty() {
+        bail!("empty HTTP request");
+    }
+    String::from_utf8(data).context("HTTP request headers are not valid UTF-8")
+}
+
+fn parse_http_headers(request: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    for line in request.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    headers
+}
+
+fn constant_time_token_eq(expected: &str, supplied: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = supplied.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+fn handle_rpc_http(mut stream: TcpStream, settings: &Settings) -> Result<()> {
+    stream.set_read_timeout(Some(RPC_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(RPC_WRITE_TIMEOUT))?;
+
+    let request = match read_http_header(&mut stream, RPC_MAX_HEADER_BYTES) {
+        Ok(request) => request,
+        Err(err) => {
+            let status = if err.to_string().contains("exceed") { 413 } else { 400 };
+            return write_json_value_with_cors(
+                &mut stream,
+                status,
+                serde_json::json!({"error":"bad_request"}),
+                false,
+            );
+        }
+    };
+
+    let line = request.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("/");
+    let protocol = parts.next().unwrap_or("");
+    if !protocol.starts_with("HTTP/1.") {
+        return write_json_value_with_cors(
+            &mut stream,
+            400,
+            serde_json::json!({"error":"bad_http_version"}),
+            false,
+        );
+    }
+    if method != "GET" && method != "POST" {
+        return write_json_value_with_cors(
+            &mut stream,
+            405,
+            serde_json::json!({"error":"method_not_allowed"}),
+            false,
+        );
+    }
+
+    let headers = parse_http_headers(&request);
+    let supplied_token = headers
+        .get("x-qub-rpc-token")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !constant_time_token_eq(&settings.rpc.auth_token, supplied_token) {
+        return write_json_value_with_cors(
+            &mut stream,
+            401,
+            serde_json::json!({"error":"unauthorized"}),
+            false,
+        );
+    }
+
+    let (path, query) = split_path_query(target);
+    match rpc_route(settings, method, &path, &query) {
+        Ok((status, value)) => {
+            write_json_value_with_cors(&mut stream, status, value, false)
+        }
+        Err(err) => write_json_value_with_cors(
+            &mut stream,
+            500,
+            serde_json::json!({"error":"internal_error","detail":err.to_string()}),
+            false,
+        ),
+    }
+}
+
+fn rpc_route(
+    settings: &Settings,
+    method: &str,
+    path: &str,
+    _query: &HashMap<String, String>,
+) -> Result<(u16, serde_json::Value)> {
+    let path = path.trim_end_matches('/');
+    if path.is_empty() || path == "/" || path == "/rpc" || path == "/rpc/v1" {
+        if method != "GET" {
+            return Ok((405, serde_json::json!({"error":"method_not_allowed"})));
+        }
+        return Ok((200, serde_json::json!({
+            "service": "QUB RPC API",
+            "version": "1.7.8",
+            "network": settings.network.name,
+            "hf121_groundwork": true,
+            "hf121_r2_hardened": true,
+            "status": "active",
+            "local_only": true,
+            "token_authenticated": true,
+            "mining_template_available": false,
+            "block_submit_available": false,
+            "endpoints": [
+                "/rpc/v1/status",
+                "/rpc/v1/chain/tip",
+                "/rpc/v1/mining/status",
+                "/rpc/v1/mining/template",
+                "/rpc/v1/mining/submit-block"
+            ]
+        })));
+    }
+
+    if path == "/health"
+        || path == "/rpc/v1/health"
+        || path == "/rpc/v1/status"
+        || path == "/rpc/v1/chain/tip"
+    {
+        if method != "GET" {
+            return Ok((405, serde_json::json!({"error":"method_not_allowed"})));
+        }
+        return Ok((200, status_fast_json(settings, false)?));
+    }
+
+    if path == "/rpc/v1/mining/status" {
+        if method != "GET" {
+            return Ok((405, serde_json::json!({"error":"method_not_allowed"})));
+        }
+        let status = status_fast_json(settings, false)
+            .unwrap_or_else(|err| serde_json::json!({"ok": false, "error": err.to_string()}));
+        return Ok((200, serde_json::json!({
+            "ok": true,
+            "network": settings.network.name,
+            "hf121_rpc_groundwork": true,
+            "hf121_r2_hardened": true,
+            "remote_template_available": false,
+            "remote_submit_available": false,
+            "official_pool_recommended": true,
+            "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
+            "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
+            "status_fast": status,
+            "note": "HF121 exposes mining RPC structure only. Work templates and block submission remain disabled until the official QUB pool/mining API release."
+        })));
+    }
+
+    if path == "/rpc/v1/mining/template" {
+        if method != "GET" {
+            return Ok((405, serde_json::json!({"error":"method_not_allowed"})));
+        }
+        return Ok((501, serde_json::json!({
+            "ok": false,
+            "available": false,
+            "endpoint": path,
+            "reason": "remote mining templates are intentionally disabled in HF121",
+            "next_step": "use QUB Core GUI/CLI mining or pool-mine; official RPC mining will ship with the pool/miner infrastructure release",
+            "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
+            "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION
+        })));
+    }
+
+    if path == "/rpc/v1/mining/submit-block" {
+        if method != "POST" {
+            return Ok((405, serde_json::json!({"error":"method_not_allowed"})));
+        }
+        return Ok((501, serde_json::json!({
+            "ok": false,
+            "available": false,
+            "endpoint": path,
+            "reason": "remote block submission is intentionally disabled in HF121",
+            "next_step": "official authenticated submit-block will ship with the pool/miner infrastructure release",
+            "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
+            "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION
+        })));
+    }
+
+    Ok((404, serde_json::json!({"error":"not_found"})))
+}
+
+const EXPLORER_MAX_ACTIVE_CONNECTIONS: usize = 32;
+
+struct ActiveConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
+    let listener = TcpListener::bind(bind)
+        .with_context(|| format!("failed to bind explorer API on {bind}"))?;
+    println!("QUB Explorer API listening on http://{bind}");
+    println!("Network={}", settings.network.name);
+    println!("Read-only mode: chain-backed routes reload chain state; status-fast uses operational metadata.");
+
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let previous = active.fetch_add(1, Ordering::AcqRel);
+                if previous >= EXPLORER_MAX_ACTIVE_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    let _ = stream.set_write_timeout(Some(RPC_WRITE_TIMEOUT));
+                    let _ = write_json_value(
+                        &mut stream,
+                        503,
+                        serde_json::json!({"error":"server_busy"}),
+                    );
+                    continue;
+                }
+
+                let settings = settings.clone();
+                let active = Arc::clone(&active);
                 thread::spawn(move || {
-                    if let Err(err) = handle_explorer_http(stream, &s) {
+                    let _guard = ActiveConnectionGuard { active };
+                    if let Err(err) = handle_explorer_http(stream, &settings) {
                         eprintln!("explorer api request error: {err:#}");
                     }
                 });
@@ -1222,37 +1628,66 @@ fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
 }
 
 fn handle_explorer_http(mut stream: TcpStream, settings: &Settings) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf)?;
-    if n == 0 { return Ok(()); }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let line = req.lines().next().unwrap_or("");
+    stream.set_read_timeout(Some(RPC_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(RPC_WRITE_TIMEOUT))?;
+
+    let request = match read_http_header(&mut stream, RPC_MAX_HEADER_BYTES) {
+        Ok(request) => request,
+        Err(err) => {
+            let status = if err.to_string().contains("exceed") { 413 } else { 400 };
+            return write_json_value(
+                &mut stream,
+                status,
+                serde_json::json!({"error":"bad_request"}),
+            );
+        }
+    };
+    let line = request.lines().next().unwrap_or("");
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
+    let protocol = parts.next().unwrap_or("");
+    if !protocol.starts_with("HTTP/1.") {
+        return write_json_value(
+            &mut stream,
+            400,
+            serde_json::json!({"error":"bad_http_version"}),
+        );
+    }
     if method == "OPTIONS" {
         return write_http(&mut stream, 204, "application/json", "{}", true);
     }
     if method != "GET" {
-        return write_json_value(&mut stream, 405, serde_json::json!({"error":"method_not_allowed"}));
+        return write_json_value(
+            &mut stream,
+            405,
+            serde_json::json!({"error":"method_not_allowed"}),
+        );
     }
     let (path, query) = split_path_query(target);
-    let response = explorer_route(settings, &path, &query);
-    match response {
-        Ok(v) => write_json_value(&mut stream, 200, v),
-        Err(err) => write_json_value(&mut stream, 400, serde_json::json!({"error": err.to_string()})),
+    match explorer_route(settings, &path, &query) {
+        Ok(value) => write_json_value(&mut stream, 200, value),
+        Err(err) => write_json_value(
+            &mut stream,
+            400,
+            serde_json::json!({"error": err.to_string()}),
+        ),
     }
 }
 
 fn explorer_route(settings: &Settings, path: &str, query: &HashMap<String, String>) -> Result<serde_json::Value> {
-    let chain = load_or_init_chain(settings)?;
     let path = path.trim_end_matches('/');
+    if path == "/status-fast" || path == "/api/v1/status-fast" {
+        return status_fast_json(settings, false);
+    }
+    let chain = load_or_init_chain(settings)?;
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.5.1",
+            "version": "1.7.8",
             "network": settings.network.name,
             "endpoints": [
+                "/api/v1/status-fast",
                 "/api/v1/summary",
                 "/api/v1/blocks?limit=25&offset=0",
                 "/api/v1/block/<height-or-hash>",
@@ -1776,21 +2211,86 @@ fn url_decode(input: &str) -> String {
 fn hex_val(b: u8) -> Option<u8> { match b { b'0'..=b'9' => Some(b-b'0'), b'a'..=b'f' => Some(10+b-b'a'), b'A'..=b'F' => Some(10+b-b'A'), _ => None } }
 
 fn write_json_value(stream: &mut TcpStream, status: u16, value: serde_json::Value) -> Result<()> {
-    let body = serde_json::to_string_pretty(&value)?;
-    write_http(stream, status, "application/json; charset=utf-8", &body, true)
+    write_json_value_with_cors(stream, status, value, true)
 }
 
-fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str, cors: bool) -> Result<()> {
-    let reason = match status { 200 => "OK", 204 => "No Content", 400 => "Bad Request", 404 => "Not Found", 405 => "Method Not Allowed", 500 => "Internal Server Error", _ => "OK" };
+fn write_json_value_with_cors(
+    stream: &mut TcpStream,
+    status: u16,
+    value: serde_json::Value,
+    cors: bool,
+) -> Result<()> {
+    let body = serde_json::to_string_pretty(&value)?;
+    write_http(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        &body,
+        cors,
+    )
+}
+
+fn write_http(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+    cors: bool,
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        503 => "Service Unavailable",
+        _ => "OK",
+    };
     let cors_headers = if cors {
         "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
-    } else { "" };
+    } else {
+        ""
+    };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n{cors_headers}Connection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n{cors_headers}Connection: close\r\n\r\n{body}",
+        body.len()
     );
     stream.write_all(response.as_bytes())?;
     Ok(())
 }
 fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> { let pos = args.iter().position(|a| a == flag)?; args.remove(pos); if pos >= args.len() { None } else { Some(args.remove(pos)) } }
-fn help(config: &str) { println!("QUB Core v1.7.7\nUsage: qubd --config {config} <command>\nCommands: init, info, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind]"); }
+fn help(config: &str) { println!("QUB Core v1.7.8\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]"); }
+
+#[cfg(test)]
+mod hf121_r2_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_bind_is_strictly_loopback() {
+        assert!(is_loopback_bind("127.0.0.1:17445"));
+        assert!(is_loopback_bind("[::1]:17445"));
+        assert!(!is_loopback_bind("0.0.0.0:17445"));
+        assert!(!is_loopback_bind("[::]:17445"));
+    }
+
+    #[test]
+    fn rpc_token_comparison_and_header_parsing_are_strict() {
+        assert!(constant_time_token_eq("correct-token", "correct-token"));
+        assert!(!constant_time_token_eq("correct-token", "wrong-token"));
+        assert!(!constant_time_token_eq("short", "shorter"));
+
+        let headers = parse_http_headers(
+            "GET /rpc/v1/status HTTP/1.1\r\nHost: localhost\r\nX-QUB-RPC-Token: correct-token\r\n\r\n",
+        );
+        assert_eq!(
+            headers.get("x-qub-rpc-token").map(String::as_str),
+            Some("correct-token")
+        );
+    }
+}

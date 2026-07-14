@@ -544,3 +544,58 @@ fn hf120_protocol_epoch_2_version_gate_is_forward_only() {
     assert_eq!(expected_block_version(&s, MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT), PROTOCOL_EPOCH_2_BLOCK_VERSION);
     assert_eq!(expected_block_version(&s, MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT + 1), PROTOCOL_EPOCH_2_BLOCK_VERSION);
 }
+
+#[test]
+fn hf121_keeps_hf120_epoch2_anchor_for_pre_and_post_24000() {
+    let s: Settings = toml::from_str(include_str!("../config/mainnet.toml")).expect("mainnet config parses");
+    assert_eq!(MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT, 24000);
+    assert_eq!(protocol_epoch_2_activation_height(&s), 24000);
+    assert_eq!(expected_block_version(&s, 23999), PROTOCOL_EPOCH_1_BLOCK_VERSION);
+    assert_eq!(expected_block_version(&s, 24000), PROTOCOL_EPOCH_2_BLOCK_VERSION);
+    assert_eq!(expected_block_version(&s, 24001), PROTOCOL_EPOCH_2_BLOCK_VERSION);
+    assert!(!protocol_epoch_2_active(&s, 23999));
+    assert!(protocol_epoch_2_active(&s, 24000));
+    assert!(protocol_epoch_2_active(&s, 24001));
+}
+
+#[test]
+fn hf121_r2_status_fast_metadata_and_stream_fallback() {
+    let mut s = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf121-r2-status-{}-{unique}",
+        std::process::id()
+    ));
+    s.node.data_dir = data_dir.display().to_string();
+
+    let chain = ChainState::new_with_genesis(&s).unwrap();
+    save_chain(&s, &chain).unwrap();
+
+    let paths = NodePaths::from_settings(&s);
+    assert!(paths.chain_file.exists());
+    assert!(paths.chain_status_file.exists());
+
+    let (cached, cached_source) = load_fast_chain_status(&s).unwrap();
+    assert_eq!(cached_source, FastChainStatusSource::Metadata);
+    assert_eq!(cached.schema_version, FAST_CHAIN_STATUS_SCHEMA_VERSION);
+    assert_eq!(cached.network, s.network.name);
+    assert_eq!(cached.height, 0);
+    assert_eq!(cached.tip_hash, chain.tip_hash());
+    assert_eq!(cached.tip_block_version, PROTOCOL_EPOCH_1_BLOCK_VERSION);
+
+    std::fs::remove_file(&paths.chain_status_file).unwrap();
+    let (scanned, scanned_source) = load_fast_chain_status(&s).unwrap();
+    assert_eq!(scanned_source, FastChainStatusSource::StreamScan);
+    assert_eq!(scanned.height, cached.height);
+    assert_eq!(scanned.tip_hash, cached.tip_hash);
+    assert!(paths.chain_status_file.exists());
+
+    let (recached, recached_source) = load_fast_chain_status(&s).unwrap();
+    assert_eq!(recached_source, FastChainStatusSource::Metadata);
+    assert_eq!(recached.tip_hash, cached.tip_hash);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}

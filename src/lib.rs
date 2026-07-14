@@ -4,12 +4,13 @@ use num_traits::{One, Zero};
 use rand::rngs::OsRng;
 use ripemd::Ripemd160;
 use secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
-use serde::de::Error as DeError;
+use serde::de::{DeserializeSeed, Error as DeError, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -366,7 +367,7 @@ pub const TESTNET_LIBRARY_ACTIVATION_HEIGHT: u32 = 3440;
 pub const MAINNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 21000;
 pub const TESTNET_VERIFIED_GOVERNANCE_ACTIVATION_HEIGHT: u32 = 5000;
 
-// HF120/v1.7.7: Protocol Epoch 2 is a forward-only mainnet chain upgrade.
+// HF120/v1.7.8: Protocol Epoch 2 is a forward-only mainnet chain upgrade.
 // It does not roll back history, blacklist addresses, change DAA, or change
 // economics. It simply introduces a post-activation block-version gate so all
 // miners must run an updated client to remain on the official QUB mainnet.
@@ -2292,9 +2293,286 @@ impl WalletFile {
 }
 pub fn ensure_plaintext_wallet_allowed(settings: &Settings) -> Result<()> { if settings.wallet.plaintext_keys_allowed || std::env::var("QUB_ALLOW_PLAINTEXT_WALLET").ok().as_deref() == Some("1") { Ok(()) } else { bail!("plaintext local wallet keys disabled; set QUB_ALLOW_PLAINTEXT_WALLET=1 only if you accept the v1 risk") } }
 
-#[derive(Debug, Clone)] pub struct NodePaths { pub data_dir: PathBuf, pub chain_file: PathBuf, pub wallet_file: PathBuf, pub pending_txs_file: PathBuf }
-impl NodePaths { pub fn from_settings(settings: &Settings) -> Self { let data_dir = PathBuf::from(&settings.node.data_dir); Self { chain_file: data_dir.join("chain.json"), wallet_file: data_dir.join("wallet.json"), pending_txs_file: data_dir.join("wallet-pending-txs.json"), data_dir } } pub fn ensure_dirs(&self) -> Result<()> { fs::create_dir_all(&self.data_dir)?; Ok(()) } }
-fn storage_lock() -> &'static StdMutex<()> { static LOCK: OnceLock<StdMutex<()>> = OnceLock::new(); LOCK.get_or_init(|| StdMutex::new(())) }
+pub const FAST_CHAIN_STATUS_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastChainStatus {
+    pub schema_version: u32,
+    pub network: String,
+    pub height: u32,
+    pub tip_hash: Hash256,
+    pub tip_block_version: u32,
+    pub tip_block_time: u32,
+    pub tip_tx_count: usize,
+    pub chain_file_bytes: u64,
+    pub chain_file_modified_unix_secs: u64,
+    pub chain_file_modified_subsec_nanos: u32,
+    pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastChainStatusSource {
+    Metadata,
+    StreamScan,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodePaths {
+    pub data_dir: PathBuf,
+    pub chain_file: PathBuf,
+    pub chain_status_file: PathBuf,
+    pub wallet_file: PathBuf,
+    pub pending_txs_file: PathBuf,
+}
+
+impl NodePaths {
+    pub fn from_settings(settings: &Settings) -> Self {
+        let data_dir = PathBuf::from(&settings.node.data_dir);
+        Self {
+            chain_file: data_dir.join("chain.json"),
+            chain_status_file: data_dir.join("chain-status.json"),
+            wallet_file: data_dir.join("wallet.json"),
+            pending_txs_file: data_dir.join("wallet-pending-txs.json"),
+            data_dir,
+        }
+    }
+
+    pub fn ensure_dirs(&self) -> Result<()> {
+        fs::create_dir_all(&self.data_dir)?;
+        Ok(())
+    }
+}
+
+fn storage_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn unix_time_parts(time: SystemTime) -> (u64, u32) {
+    time.duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0))
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn chain_file_stamp(metadata: &fs::Metadata) -> (u64, u32) {
+    metadata
+        .modified()
+        .map(unix_time_parts)
+        .unwrap_or((0, 0))
+}
+
+fn fast_status_from_chain(chain: &ChainState, metadata: &fs::Metadata) -> Result<FastChainStatus> {
+    let tip = chain.blocks.last().context("chain has no blocks")?;
+    let (modified_secs, modified_nanos) = chain_file_stamp(metadata);
+    Ok(FastChainStatus {
+        schema_version: FAST_CHAIN_STATUS_SCHEMA_VERSION,
+        network: chain.network.clone(),
+        height: chain.height(),
+        tip_hash: tip.block_hash(),
+        tip_block_version: tip.header.version,
+        tip_block_time: tip.header.time,
+        tip_tx_count: tip.transactions.len(),
+        chain_file_bytes: metadata.len(),
+        chain_file_modified_unix_secs: modified_secs,
+        chain_file_modified_subsec_nanos: modified_nanos,
+        generated_at_unix: current_unix_secs(),
+    })
+}
+
+fn fast_status_matches_file(status: &FastChainStatus, settings: &Settings, metadata: &fs::Metadata) -> bool {
+    let (modified_secs, modified_nanos) = chain_file_stamp(metadata);
+    status.schema_version == FAST_CHAIN_STATUS_SCHEMA_VERSION
+        && status.network == settings.network.name
+        && status.chain_file_bytes == metadata.len()
+        && status.chain_file_modified_unix_secs == modified_secs
+        && status.chain_file_modified_subsec_nanos == modified_nanos
+}
+
+fn write_fast_chain_status_file(paths: &NodePaths, status: &FastChainStatus) -> Result<()> {
+    write_text_replace(
+        &paths.chain_status_file,
+        &serde_json::to_string_pretty(status)?,
+    )
+}
+
+fn refresh_fast_chain_status_file(paths: &NodePaths, chain: &ChainState) -> Result<()> {
+    let metadata = fs::metadata(&paths.chain_file)
+        .with_context(|| format!("metadata {}", paths.chain_file.display()))?;
+    let status = fast_status_from_chain(chain, &metadata)?;
+    write_fast_chain_status_file(paths, &status)
+}
+
+#[derive(Default)]
+struct ChainStatusScan {
+    network: Option<String>,
+    block_count: u64,
+    tip_header: Option<BlockHeader>,
+    tip_tx_count: usize,
+}
+
+struct ChainStatusSeed;
+
+impl<'de> DeserializeSeed<'de> for ChainStatusSeed {
+    type Value = ChainStatusScan;
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ChainStatusVisitor)
+    }
+}
+
+struct ChainStatusVisitor;
+
+impl<'de> Visitor<'de> for ChainStatusVisitor {
+    type Value = ChainStatusScan;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a persisted QUB chain object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut scan = ChainStatusScan::default();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "network" => scan.network = Some(map.next_value::<String>()?),
+                "blocks" => map.next_value_seed(BlockSequenceSeed { scan: &mut scan })?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(scan)
+    }
+}
+
+struct BlockSequenceSeed<'a> {
+    scan: &'a mut ChainStatusScan,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for BlockSequenceSeed<'a> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(BlockSequenceVisitor { scan: self.scan })
+    }
+}
+
+struct BlockSequenceVisitor<'a> {
+    scan: &'a mut ChainStatusScan,
+}
+
+impl<'de, 'a> Visitor<'de> for BlockSequenceVisitor<'a> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the persisted blocks array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(block) = seq.next_element::<Block>()? {
+            self.scan.block_count = self
+                .scan
+                .block_count
+                .checked_add(1)
+                .ok_or_else(|| <A::Error as DeError>::custom("block count overflow"))?;
+            self.scan.tip_tx_count = block.transactions.len();
+            self.scan.tip_header = Some(block.header);
+        }
+        Ok(())
+    }
+}
+
+fn stream_scan_fast_chain_status(settings: &Settings, paths: &NodePaths) -> Result<FastChainStatus> {
+    let file = File::open(&paths.chain_file)
+        .with_context(|| format!("open {}", paths.chain_file.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("metadata {}", paths.chain_file.display()))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(file));
+    let scan = ChainStatusSeed
+        .deserialize(&mut deserializer)
+        .with_context(|| format!("stream-scan {}", paths.chain_file.display()))?;
+    deserializer
+        .end()
+        .with_context(|| format!("finish stream-scan {}", paths.chain_file.display()))?;
+
+    let network = scan.network.context("chain.json missing network")?;
+    if network != settings.network.name {
+        bail!("network mismatch: chain={}, config={}", network, settings.network.name);
+    }
+    if scan.block_count == 0 {
+        bail!("chain has no blocks");
+    }
+    let height_u64 = scan.block_count - 1;
+    if height_u64 > u32::MAX as u64 {
+        bail!("chain height exceeds u32");
+    }
+    let tip_header = scan.tip_header.context("chain has no tip header")?;
+    let (modified_secs, modified_nanos) = chain_file_stamp(&metadata);
+    Ok(FastChainStatus {
+        schema_version: FAST_CHAIN_STATUS_SCHEMA_VERSION,
+        network,
+        height: height_u64 as u32,
+        tip_hash: tip_header.hash(),
+        tip_block_version: tip_header.version,
+        tip_block_time: tip_header.time,
+        tip_tx_count: scan.tip_tx_count,
+        chain_file_bytes: metadata.len(),
+        chain_file_modified_unix_secs: modified_secs,
+        chain_file_modified_subsec_nanos: modified_nanos,
+        generated_at_unix: current_unix_secs(),
+    })
+}
+
+pub fn load_fast_chain_status(settings: &Settings) -> Result<(FastChainStatus, FastChainStatusSource)> {
+    let paths = NodePaths::from_settings(settings);
+    if !paths.chain_file.exists() {
+        bail!("chain file not found: {}", paths.chain_file.display());
+    }
+    let metadata = fs::metadata(&paths.chain_file)
+        .with_context(|| format!("metadata {}", paths.chain_file.display()))?;
+
+    if paths.chain_status_file.exists() {
+        if let Ok(raw) = fs::read_to_string(&paths.chain_status_file) {
+            if let Ok(status) = serde_json::from_str::<FastChainStatus>(&raw) {
+                if fast_status_matches_file(&status, settings, &metadata) {
+                    return Ok((status, FastChainStatusSource::Metadata));
+                }
+            }
+        }
+    }
+
+    let status = stream_scan_fast_chain_status(settings, &paths)?;
+
+    // A concurrent node process may replace chain.json while this process is
+    // scanning the old inode. Cache the result only if the path still points to
+    // the exact file stamp we scanned; otherwise the next call will rescan.
+    if let Ok(current_metadata) = fs::metadata(&paths.chain_file) {
+        if fast_status_matches_file(&status, settings, &current_metadata) {
+            let _ = write_fast_chain_status_file(&paths, &status);
+        }
+    }
+
+    Ok((status, FastChainStatusSource::StreamScan))
+}
 
 pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
@@ -2335,7 +2613,21 @@ pub fn save_chain(settings: &Settings, chain: &ChainState) -> Result<()> {
 }
 
 fn write_chain_file(paths: &NodePaths, chain: &ChainState) -> Result<()> {
-    write_text_replace(&paths.chain_file, &serde_json::to_string_pretty(&chain.to_persisted())?)
+    write_text_replace(
+        &paths.chain_file,
+        &serde_json::to_string_pretty(&chain.to_persisted())?,
+    )?;
+
+    // HF121-r2: chain-status.json is an operational cache only. A failure to
+    // refresh it must never turn a successfully persisted consensus state into
+    // a node failure; status-fast will rebuild it with a bounded-memory scan.
+    if let Err(err) = refresh_fast_chain_status_file(paths, chain) {
+        eprintln!(
+            "warning: could not refresh {}: {err:#}",
+            paths.chain_status_file.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn load_or_init_wallet(settings: &Settings) -> Result<WalletFile> {
@@ -2366,20 +2658,87 @@ fn write_wallet_file(paths: &NodePaths, wallet: &WalletFile) -> Result<()> {
 }
 
 fn write_text_replace(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, body)?;
-    if path.exists() { let _ = fs::remove_file(path); }
-
-    // HF117 compile-safe fallback: keep the fast atomic replace path when the
-    // platform allows rename-over-target, but fall back to a direct write on
-    // Windows/AV edge cases without introducing ambiguous Result<T, E> inference.
-    if fs::rename(&tmp, path).is_err() {
-        fs::write(path, body)?;
-        let _ = fs::remove_file(&tmp);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
 
-    Ok(())
+    let file_name = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("qub-state");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("create temporary state file {}", tmp.display()))?;
+        file.write_all(body.as_bytes())?;
+        file.flush()?;
+        // Wallets, pending outboxes, and metadata are small and worth an
+        // explicit durability sync. The canonical chain file can be hundreds
+        // of megabytes and is rewritten frequently; forcing a full fsync on
+        // every block would harm liveness and recreate the observed I/O stalls.
+        if body.len() <= 4 * 1024 * 1024 {
+            file.sync_all()?;
+        }
+        drop(file);
+
+        // Unix rename-over-target is atomic. On platforms where that operation
+        // is rejected, move the old file aside first; if the second rename fails,
+        // restore the old file instead of truncating it in place.
+        match fs::rename(&tmp, path) {
+            Ok(()) => {}
+            Err(first_err) => {
+                if !path.exists() {
+                    return Err(anyhow::Error::new(first_err)).with_context(|| {
+                        format!("replace {} with {}", path.display(), tmp.display())
+                    });
+                }
+
+                let backup = path.with_file_name(format!(
+                    ".{file_name}.{}.{}.bak",
+                    std::process::id(),
+                    nonce
+                ));
+                fs::rename(path, &backup).with_context(|| {
+                    format!(
+                        "move existing state {} aside after rename failure: {first_err}",
+                        path.display()
+                    )
+                })?;
+
+                if let Err(second_err) = fs::rename(&tmp, path) {
+                    let _ = fs::rename(&backup, path);
+                    return Err(anyhow::Error::new(second_err)).with_context(|| {
+                        format!("install replacement state {}", path.display())
+                    });
+                }
+                let _ = fs::remove_file(&backup);
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 

@@ -1,84 +1,345 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN=${BIN:-/opt/qub/bin/qubd}
+# HF121 / v1.7.8: bounded-memory, exact-schema mainnet snapshot publisher.
+#
+# Safety properties:
+# - never runs full `qubd validate` inside the timer path;
+# - takes a coherent copy of the atomically replaced canonical chain file;
+# - scans blocks incrementally and keeps only the latest 4096 in memory;
+# - verifies network, full hash-link continuity, and the HF120 #24000 version gate;
+# - writes every artifact through a staging directory;
+# - publishes tip.json last as the generation commit marker;
+# - preserves the exact JSON schemas consumed by QUB Core and Explorer.
+# - supports an overridable LOCK_FILE so isolated self-tests never touch the live timer lock.
+
 CFG=${CFG:-/opt/qub/mainnet/mainnet-seed.toml}
 OUT_DIR=${OUT_DIR:-/srv/qub-updates/mainnet/snapshots}
 ALT=${ALT:-/srv/qub-updates/mainnet/canonical-chain.json}
+EXPECTED_NETWORK=${EXPECTED_NETWORK:-mainnet}
+EPOCH2_HEIGHT=${EPOCH2_HEIGHT:-24000}
+EPOCH1_VERSION=${EPOCH1_VERSION:-1}
+EPOCH2_VERSION=${EPOCH2_VERSION:-2}
+LOCK_FILE=${LOCK_FILE:-/tmp/qub-mainnet-snapshot-publish.lock}
+
+umask 022
+LOCK_DIR=$(dirname -- "$LOCK_FILE")
+mkdir -p "$LOCK_DIR"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "snapshot publish already running; skipping"
+  exit 0
+fi
 
 DATA_DIR=$(grep -E '^[[:space:]]*data_dir[[:space:]]*=' "$CFG" | head -n1 | cut -d= -f2- | tr -d ' "')
 if [ -z "${DATA_DIR:-}" ]; then
   DATA_DIR=/opt/qub/mainnet/data
 fi
+
 SRC="$DATA_DIR/chain.json"
-test -f "$SRC"
+if [ ! -f "$SRC" ]; then
+  echo "chain source not found: $SRC" >&2
+  exit 1
+fi
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$(dirname "$ALT")"
+STAGE=$(mktemp -d "$OUT_DIR/.publish-hf121-r2.XXXXXX")
+cleanup() {
+  rm -rf "$STAGE"
+}
+trap cleanup EXIT INT TERM
 
-# Validate the source chain before publishing anything.
-"$BIN" --config "$CFG" validate >/dev/null
-
-TMP="$OUT_DIR/chain.json.tmp"
-cp "$SRC" "$TMP"
-chmod 644 "$TMP"
-mv "$TMP" "$OUT_DIR/chain.json"
-cp "$OUT_DIR/chain.json" "$ALT"
-
-python3 - <<'PY'
-import json, hashlib, struct, time
+python3 - "$SRC" "$STAGE" "$OUT_DIR" "$ALT" "$EXPECTED_NETWORK" "$EPOCH2_HEIGHT" "$EPOCH1_VERSION" "$EPOCH2_VERSION" <<'PY'
+import collections
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import sys
+import time
 from pathlib import Path
 
-out_dir = Path('/srv/qub-updates/mainnet/snapshots')
-chain_path = out_dir / 'chain.json'
-alt_path = Path('/srv/qub-updates/mainnet/canonical-chain.json')
-chain = json.load(open(chain_path, encoding='utf-8'))
-blocks = chain.get('blocks', [])
-network = chain.get('network', 'mainnet')
+src = Path(sys.argv[1])
+stage = Path(sys.argv[2])
+out_dir = Path(sys.argv[3])
+alt_path = Path(sys.argv[4])
+expected_network = sys.argv[5]
+epoch2_height = int(sys.argv[6])
+epoch1_version = int(sys.argv[7])
+epoch2_version = int(sys.argv[8])
 
-def u32(x):
-    if isinstance(x, str):
-        x = int(x, 0) if x.startswith('0x') else int(x)
-    return struct.pack('<I', int(x) & 0xffffffff)
+stage.mkdir(parents=True, exist_ok=True)
+out_dir.mkdir(parents=True, exist_ok=True)
+alt_path.parent.mkdir(parents=True, exist_ok=True)
 
-def hb(x):
-    return bytes.fromhex(str(x))
+chain_stage = stage / "chain.json"
+sha256 = hashlib.sha256()
+with src.open("rb") as source, chain_stage.open("wb") as target:
+    while True:
+        chunk = source.read(1024 * 1024)
+        if not chunk:
+            break
+        target.write(chunk)
+        sha256.update(chunk)
+    target.flush()
+    os.fsync(target.fileno())
+chain_sha = sha256.hexdigest()
 
-def bh(block):
-    h = block['header']
-    raw = u32(h['version']) + hb(h['prev_block_hash']) + hb(h['merkle_root']) + u32(h['time']) + u32(h['bits']) + u32(h['nonce'])
+
+def u32(value):
+    if isinstance(value, str):
+        value = int(value, 0) if value.startswith("0x") else int(value)
+    return struct.pack("<I", int(value) & 0xFFFFFFFF)
+
+
+def raw_hash(value):
+    data = bytes.fromhex(str(value))
+    if len(data) != 32:
+        raise ValueError("expected 32-byte hash")
+    return data
+
+
+def block_hash(block):
+    header = block["header"]
+    raw = (
+        u32(header["version"])
+        + raw_hash(header["prev_block_hash"])
+        + raw_hash(header["merkle_root"])
+        + u32(header["time"])
+        + u32(header["bits"])
+        + u32(header["nonce"])
+    )
     return hashlib.sha256(hashlib.sha256(raw).digest()).hexdigest()
 
-height = max(0, len(blocks) - 1)
-tip_hash = bh(blocks[-1]) if blocks else ''
-sha = hashlib.sha256(chain_path.read_bytes()).hexdigest()
-now = int(time.time())
 
-(chain_path.with_suffix(chain_path.suffix + '.sha256')).write_text(f'{sha}  {chain_path.name}\n', encoding='ascii')
-alt_path.with_suffix(alt_path.suffix + '.sha256').write_text(f'{sha}  {alt_path.name}\n', encoding='ascii')
+def find_blocks_array(file_obj):
+    # serde_json pretty output places network and blocks at the beginning. Keep
+    # the search bounded; a missing marker means the source is not the expected
+    # PersistedChainState schema and must never be published.
+    prefix = file_obj.read(1024 * 1024)
+    network_match = re.search(rb'"network"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', prefix)
+    if not network_match:
+        raise ValueError("chain.json missing top-level network")
+    network = json.loads(b'"' + network_match.group(1) + b'"')
+
+    marker = re.search(rb'"blocks"\s*:\s*\[', prefix)
+    if not marker:
+        raise ValueError("chain.json missing top-level blocks array")
+    file_obj.seek(marker.end())
+    return network
+
+
+def iter_block_objects(path):
+    with path.open("rb") as file_obj:
+        network = find_blocks_array(file_obj)
+        yield ("network", network)
+
+        current = None
+        depth = 0
+        in_string = False
+        escaped = False
+        ended = False
+
+        while not ended:
+            chunk = file_obj.read(256 * 1024)
+            if not chunk:
+                break
+            for byte in chunk:
+                if current is None:
+                    if byte in b" \t\r\n,":
+                        continue
+                    if byte == ord("]"):
+                        ended = True
+                        break
+                    if byte != ord("{"):
+                        raise ValueError(f"unexpected byte before block object: {byte}")
+                    current = bytearray([byte])
+                    depth = 1
+                    in_string = False
+                    escaped = False
+                    continue
+
+                current.append(byte)
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                    continue
+
+                if byte == ord('"'):
+                    in_string = True
+                elif byte == ord("{"):
+                    depth += 1
+                elif byte == ord("}"):
+                    depth -= 1
+                    if depth == 0:
+                        block = json.loads(current)
+                        yield ("block", block)
+                        current = None
+
+        if current is not None:
+            raise ValueError("truncated block object in chain.json")
+        if not ended:
+            raise ValueError("unterminated blocks array in chain.json")
+
+
+network = None
+block_count = 0
+previous_hash = None
+latest_blocks = collections.deque(maxlen=4096)
+
+for kind, value in iter_block_objects(chain_stage):
+    if kind == "network":
+        network = value
+        continue
+
+    block = value
+    header = block.get("header")
+    transactions = block.get("transactions")
+    if not isinstance(header, dict) or not isinstance(transactions, list):
+        raise ValueError(f"block #{block_count} has invalid header/transactions schema")
+
+    version = int(header.get("version"))
+    expected_version = epoch2_version if block_count >= epoch2_height else epoch1_version
+    if version != expected_version:
+        raise ValueError(
+            f"block #{block_count} version mismatch: expected {expected_version}, got {version}"
+        )
+
+    current_hash = block_hash(block)
+    if block_count > 0:
+        prev = str(header.get("prev_block_hash", "")).lower()
+        if prev != previous_hash:
+            raise ValueError(
+                f"hash-link mismatch at block #{block_count}: expected prev {previous_hash}, got {prev}"
+            )
+    previous_hash = current_hash
+    latest_blocks.append(block)
+    block_count += 1
+
+if network != expected_network:
+    raise ValueError(f"network mismatch: expected {expected_network}, got {network}")
+if block_count == 0 or previous_hash is None:
+    raise ValueError("snapshot source has no blocks")
+
+height = block_count - 1
+tip_hash = previous_hash
+now = int(time.time())
+latest = list(latest_blocks)
+
+
+def write_text(path, text, encoding="utf-8"):
+    path.write_text(text, encoding=encoding)
+
+
+write_text(stage / "chain.json.sha256", f"{chain_sha}  chain.json\n", "ascii")
 
 tip = {
-    'network': network,
-    'height': height,
-    'tip_hash': tip_hash,
-    'chain_sha256': sha,
-    'published_at_unix': now,
+    "network": network,
+    "height": height,
+    "tip_hash": tip_hash,
+    "chain_sha256": chain_sha,
+    "published_at_unix": now,
 }
-(out_dir / 'tip.json').write_text(json.dumps(tip, separators=(',', ':')) + '\n', encoding='utf-8')
-(out_dir / 'tip.json.sha256').write_text(hashlib.sha256((out_dir / 'tip.json').read_bytes()).hexdigest() + '  tip.json\n', encoding='ascii')
+write_text(stage / "tip.json", json.dumps(tip, separators=(",", ":")) + "\n")
+write_text(
+    stage / "tip.json.sha256",
+    hashlib.sha256((stage / "tip.json").read_bytes()).hexdigest() + "  tip.json\n",
+    "ascii",
+)
 
 for window in (64, 256, 1024, 2048, 4096):
-    start = max(0, height - window + 1)
+    selected = latest[-window:]
+    start_height = height - len(selected) + 1
     tail = {
-        'network': network,
-        'start_height': start,
-        'tip_height': height,
-        'tip_hash': tip_hash,
-        'blocks': blocks[start:],
+        "network": network,
+        "start_height": start_height,
+        "tip_hash": tip_hash,
+        "tip_height": height,
+        "blocks": selected,
     }
-    path = out_dir / f'tail-{window}.json'
-    path.write_text(json.dumps(tail, separators=(',', ':')) + '\n', encoding='utf-8')
-    path.with_suffix(path.suffix + '.sha256').write_text(hashlib.sha256(path.read_bytes()).hexdigest() + f'  tail-{window}.json\n', encoding='ascii')
+    name = f"tail-{window}.json"
+    path = stage / name
+    write_text(path, json.dumps(tail, separators=(",", ":")) + "\n")
+    write_text(
+        stage / f"{name}.sha256",
+        hashlib.sha256(path.read_bytes()).hexdigest() + f"  {name}\n",
+        "ascii",
+    )
+
+# Final staged-schema verification before any public file is replaced.
+for window in (64, 256, 1024, 2048, 4096):
+    obj = json.loads((stage / f"tail-{window}.json").read_text(encoding="utf-8"))
+    expected_keys = {"network", "start_height", "tip_hash", "tip_height", "blocks"}
+    if set(obj) != expected_keys:
+        raise ValueError(f"tail-{window}.json schema mismatch: {sorted(obj)}")
+    if obj["tip_height"] != height or obj["tip_hash"] != tip_hash:
+        raise ValueError(f"tail-{window}.json tip mismatch")
+
+# Publish every generation file atomically. tip.json is the final commit marker.
+non_tip_names = [
+    "chain.json",
+    "chain.json.sha256",
+    "tail-64.json",
+    "tail-64.json.sha256",
+    "tail-256.json",
+    "tail-256.json.sha256",
+    "tail-1024.json",
+    "tail-1024.json.sha256",
+    "tail-2048.json",
+    "tail-2048.json.sha256",
+    "tail-4096.json",
+    "tail-4096.json.sha256",
+]
+for name in non_tip_names:
+    os.replace(stage / name, out_dir / name)
+
+# canonical-chain.json is the same canonical byte stream as snapshots/chain.json.
+alt_tmp = alt_path.with_name(alt_path.name + f".{os.getpid()}.tmp")
+try:
+    if alt_tmp.exists():
+        alt_tmp.unlink()
+    try:
+        os.link(out_dir / "chain.json", alt_tmp)
+    except OSError:
+        shutil.copyfile(out_dir / "chain.json", alt_tmp)
+    os.replace(alt_tmp, alt_path)
+finally:
+    if alt_tmp.exists():
+        alt_tmp.unlink()
+
+alt_sha_path = alt_path.with_suffix(alt_path.suffix + ".sha256")
+alt_sha_tmp = alt_sha_path.with_name(alt_sha_path.name + f".{os.getpid()}.tmp")
+write_text(alt_sha_tmp, f"{chain_sha}  canonical-chain.json\n", "ascii")
+os.replace(alt_sha_tmp, alt_sha_path)
+
+os.replace(stage / "tip.json.sha256", out_dir / "tip.json.sha256")
+os.replace(stage / "tip.json", out_dir / "tip.json")
+
+for path in list(out_dir.glob("*.json")) + list(out_dir.glob("*.sha256")) + [alt_path, alt_sha_path]:
+    try:
+        os.chmod(path, 0o644)
+    except FileNotFoundError:
+        pass
+
+print(
+    f"published snapshot height={height} tip={tip_hash} "
+    f"blocks={block_count} retained={len(latest)} chain_sha256={chain_sha}"
+)
 PY
 
-chmod 644 "$OUT_DIR"/*.json "$OUT_DIR"/*.sha256 "$ALT" "$ALT.sha256" 2>/dev/null || true
-ls -lh "$OUT_DIR"/tip.json "$OUT_DIR"/tail-64.json "$OUT_DIR"/tail-256.json "$OUT_DIR"/tail-1024.json "$OUT_DIR"/tail-2048.json "$OUT_DIR"/tail-4096.json "$OUT_DIR"/chain.json
+cat "$OUT_DIR/tip.json"
+ls -lh \
+  "$OUT_DIR"/tip.json \
+  "$OUT_DIR"/tail-64.json \
+  "$OUT_DIR"/tail-256.json \
+  "$OUT_DIR"/tail-1024.json \
+  "$OUT_DIR"/tail-2048.json \
+  "$OUT_DIR"/tail-4096.json \
+  "$OUT_DIR"/chain.json \
+  "$ALT"
