@@ -1,12 +1,12 @@
 # QUB Core v1.7.8 HF121
 
-HF121 is a mandatory operational reliability update for QUB Core. This archive is reviewed source revision `r3`; the public release identity remains **v1.7.8 / HF121**.
+HF121 is a mandatory operational reliability update for QUB Core. This archive is reviewed source revision `r2`; the public release identity remains **v1.7.8 / HF121**.
 
 HF121 does **not** introduce another chain activation and does **not** move or alter HF120 Protocol Epoch 2.
 
 ## Consensus status
 
-- HF120 Protocol Epoch 2 activated at mainnet block #24000 and is now active on QUB mainnet.
+- HF120 Protocol Epoch 2 remains scheduled at mainnet block #24000.
 - Blocks below #24000 require block version 1.
 - Blocks from #24000 onward require block version 2.
 - No rollback.

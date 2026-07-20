@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.7.8"
+version = "1.7.9"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.7.8 HF121 operational core with HF120 Protocol Epoch 2 activation at mainnet block 24000"
+description = "Qubit Coin v1.7.9 HF122 headless node, authenticated RPC, mining and observability infrastructure"
 readme = "README.md"
 
 [features]
@@ -46,6 +46,10 @@ path = "src/main.rs"
 [[bin]]
 name = "qub-core"
 path = "src/bin/qub_core.rs"
+
+[[bin]]
+name = "qub-rpc-miner"
+path = "src/bin/qub_rpc_miner.rs"
 
 [profile.release]
 lto = true

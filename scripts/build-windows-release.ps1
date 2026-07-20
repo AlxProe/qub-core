@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.7.8'
+$Version = '1.7.9'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
@@ -32,6 +32,7 @@ if (-not $SkipTests) {
 
 cargo build --release --bin qub-core --target x86_64-pc-windows-msvc
 cargo build --release --bin qubd --target x86_64-pc-windows-msvc
+cargo build --release --bin qub-rpc-miner --target x86_64-pc-windows-msvc
 
 function Find-SignTool {
     $candidates = @(
@@ -61,16 +62,20 @@ New-Item -ItemType Directory -Force -Path $ChannelUpdateDir | Out-Null
 $ReleaseDir = Join-Path $Root 'target\x86_64-pc-windows-msvc\release'
 Copy-Item (Join-Path $ReleaseDir 'qub-core.exe') (Join-Path $Dist 'QUB-Core.exe')
 Copy-Item (Join-Path $ReleaseDir 'qubd.exe') (Join-Path $Dist 'tools\qubd.exe')
+Copy-Item (Join-Path $ReleaseDir 'qub-rpc-miner.exe') (Join-Path $Dist 'tools\qub-rpc-miner.exe')
 Copy-Item (Join-Path $Root 'config\*.toml') (Join-Path $Dist 'config')
 if (Test-Path (Join-Path $Root 'README-MINER-WINDOWS.md')) { Copy-Item (Join-Path $Root 'README-MINER-WINDOWS.md') $Dist }
 foreach ($Doc in @(
-    'QUB-Public-Release-Checksums-and-Signing-v1.7.8.md',
+    'README-RPC-MINER.md',
+    'RELEASE_NOTES-v1.7.9-HF122.md',
+    'HF122-v179-SECURITY-REVIEW.md',
+    'QUB-Public-Release-Checksums-and-Signing-v1.7.9.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
-    'QUB-Windows-Code-Signing-v1.7.8.md',
+    'QUB-Windows-Code-Signing-v1.7.9.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
-    'QUB-Mainnet-Release-Readiness-v1.7.8.md',
+    'QUB-Mainnet-Release-Readiness-v1.7.9.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',
-    'QUB-Automatic-Discovery-Production-Runbook-v1.7.8.md',
+    'QUB-Automatic-Discovery-Production-Runbook-v1.7.9.md',
     'QUB-Automatic-Discovery-Production-Runbook-v1.0.0.md'
 )) {
     $DocPath = Join-Path $Root $Doc
@@ -277,7 +282,7 @@ foreach ($Asset in @(
     if (Test-Path $Path) { Copy-Item -Force $Path (Join-Path $Dist 'assets') }
 }
 
-# HF102/v1.7.8: copy every runtime asset that exists, not only the legacy allow-list.
+# HF102/v1.7.9: copy every runtime asset that exists, not only the legacy allow-list.
 # This prevents new bridge/UI icons (eth/usdt/usdc/usdj/enj/subscan/nftio/verified/etc.)
 # from appearing in local smoke but missing from live update bundles.
 $AssetRoot = Join-Path $Root 'assets'

@@ -18,7 +18,12 @@ max_blocks_per_message = 20000
 max_peer_errors = 10
 connect_interval_secs = 3
 peer_file = "peers.json"
-bootnodes = ["seed.qubit-coin.io:17444", "seed-ams3.qubit-coin.io:17444", "seed-nyc3.qubit-coin.io:17444"]
+bootnodes = [
+    "seed.qubit-coin.io:17444",
+    "seed-ams3.qubit-coin.io:17444",
+    "seed-nyc3.qubit-coin.io:17444",
+]
+
 [rpc]
 enabled = false
 bind = "127.0.0.1:17445"
@@ -81,26 +86,6 @@ price_coefficient_atoms = 100000000
 protocol_address = "qub13e088539da373fe809b90ea5c7f6a61e880406d1e459eefe"
 protocol_name = "qns.qub"
 
-[pools]
-enabled = true
-activation_height = 9999
-protocol_name = "pools.qub"
-protocol_address = "qub1b4acf65ce91f786de20baa177cdb643869d1fdd5728eec0e"
-max_name_chars = 32
-max_name_bytes = 128
-marker_output_atoms = 1
-base_create_atoms = 2500000000
-base_capacity_slots = 8
-capacity_step_atoms = 1000000000
-capacity_step_slots = 8
-max_capacity_slots = 128
-max_active_pools = 1024
-max_commission_bps = 2000
-share_window_blocks = 360
-share_target_bits = "0x1e00ffff"
-max_share_txs_per_block = 128
-share_stale_blocks = 6
-
 [jin]
 enabled = true
 activation_height = 5555
@@ -122,6 +107,26 @@ sale_batch_units = "1000000000000000000000000"
 sale_start_price_atoms_per_jin = 1000000
 sale_step_price_atoms_per_jin = 100000
 protocol_fee_bps = 10
+
+[pools]
+enabled = true
+activation_height = 9999
+protocol_name = "pools.qub"
+protocol_address = "qub1b4acf65ce91f786de20baa177cdb643869d1fdd5728eec0e"
+max_name_chars = 32
+max_name_bytes = 128
+marker_output_atoms = 1
+base_create_atoms = 2500000000
+base_capacity_slots = 8
+capacity_step_atoms = 1000000000
+capacity_step_slots = 8
+max_capacity_slots = 128
+max_active_pools = 1024
+max_commission_bps = 2000
+share_window_blocks = 360
+share_target_bits = "0x1e00ffff"
+max_share_txs_per_block = 128
+share_stale_blocks = 6
 
 [library]
 enabled = true

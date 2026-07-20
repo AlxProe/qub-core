@@ -1,0 +1,32 @@
+[Unit]
+Description=QUB reference RPC CPU miner (solo payout)
+After=qub-headless-mainnet.service
+Requires=qub-headless-mainnet.service
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/qub/headless
+EnvironmentFile=/opt/qub/headless/config/miner.env
+ExecStart=/opt/qub/bin/qub-rpc-miner --rpc http://127.0.0.1:17445 --token-file /opt/qub/headless/config/rpc.token --address ${QUB_MINER_ADDRESS} --workers ${QUB_MINER_WORKERS} --batch ${QUB_MINER_BATCH} --refresh-secs ${QUB_MINER_REFRESH_SECS}
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/qub/headless/config
+
+[Install]
+WantedBy=multi-user.target

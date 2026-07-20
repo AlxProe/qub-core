@@ -1,0 +1,39 @@
+[Unit]
+Description=QUB mainnet headless node with authenticated loopback RPC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/opt/qub/headless
+ExecStart=/opt/qub/bin/qubd --config /opt/qub/headless/config/mainnet.toml node
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=65536
+
+# The RPC listener is loopback-only in the supplied mainnet template. Do not
+# expose it directly to the public Internet; use SSH/WireGuard/Tailscale or a
+# separately reviewed TLS gateway if remote access is required later.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/qub/headless
+
+[Install]
+WantedBy=multi-user.target

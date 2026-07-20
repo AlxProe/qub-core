@@ -1,48 +1,84 @@
-# QUB Core v1.7.8 HF121 — reviewed source revision r3
+# QUB Core v1.7.9 HF122 — Headless Node, Authenticated RPC and Mining Infrastructure
 
-HF121 / v1.7.8 is a mandatory operational reliability package on top of HF120. It **does not add a new consensus activation**. HF120 Protocol Epoch 2 activated at mainnet block **#24000** and remains fixed there.
+HF122 / v1.7.9 completes the first production release of QUB-native headless node and mining infrastructure started in HF121. It adds **no new consensus activation**.
 
-This `r3` label identifies the reviewed source archive only. The public application identity remains **QUB Core v1.7.8 / HF121 / v178**.
+Protocol Epoch 2 remains active exactly as deployed:
 
-## HF120 Protocol Epoch 2 remains unchanged
+- blocks below mainnet height **#24000** use block version **1**;
+- blocks at and above **#24000** require block version **2**;
+- no rollback, address-specific rule, DAA change, checkpoint change, genesis change, economics change, or QUB/JIN rule change is introduced by HF122.
 
-- Protocol Epoch 2 activation height: **#24000**
-- Blocks below #24000: **version 1**
-- Blocks at and above #24000: **version 2**
-- No rollback
-- No address blacklist
-- No reward confiscation
-- No DAA change
-- No checkpoint, genesis, or economics change
+## HF122 infrastructure
 
-## HF121 operational work
+- Embedded authenticated RPC in `qubd node`, sharing the same canonical in-memory chain state as P2P.
+- Read-only standalone RPC mode for diagnostics.
+- Canonical chain, block, transaction and mempool read endpoints.
+- Tracked solo and existing on-chain pool mining templates.
+- Compact independent template batches for parallel workers.
+- Canonical-parent, expiry, version and proof-of-work guards on block submission.
+- Authenticated raw transaction submission through the normal mempool validation and relay path.
+- Long-poll tip events.
+- `qub-rpc-miner`, a QUB-native reference CPU worker.
+- Mining-distribution observability: payout/pool labels, HHI, effective label count, same-label streaks, exact two-label alternation, coinbase-only rate, timing percentiles and block-version distribution.
+- QUB Explorer v0.7 mining analytics support.
+- A separate headless-mainnet configuration and hardened systemd service examples.
 
-- Adds `chain-status.json`, a tiny operational metadata cache refreshed after successful chain persistence.
-- Adds `status-fast`, which reads the metadata cache in normal operation and uses a bounded-memory streaming scan only as a recovery fallback. It does not replay consensus or load wallet state.
-- Adds a bounded-memory, exact-schema snapshot publisher that verifies the full block hash-link chain and the HF120 #24000 block-version boundary before publishing.
-- Builds every snapshot generation in staging and publishes `tip.json` last as the commit marker.
-- Adds `/api/v1/status-fast` to the explorer API without exposing local filesystem paths.
-- Adds local-only, token-authenticated `rpc-api` groundwork for future headless node, pool, and miner infrastructure.
-- Keeps remote mining templates and block submission disabled in HF121.
-- Hardens state-file replacement so Linux uses atomic rename-over-target and Windows preserves/restores the previous file if replacement fails.
-- Keeps HF117 stale/reorg transaction recovery, HF118 QUB/JIN Melt/Infuse GUI support, HF119 non-blocking QUB/JIN flow, and the complete HF120 epoch gate.
+## Security defaults
 
-## Security posture of the HF121 RPC groundwork
+- RPC is disabled by default in normal mainnet and testnet configs.
+- The supplied headless config binds RPC to `127.0.0.1:17445`.
+- Every RPC request requires a non-placeholder token.
+- Token files must be owner-only on Unix (`chmod 600`).
+- Remote binding requires both `allow_remote=true` and an explicit CIDR allowlist.
+- RPC has no built-in TLS and must not be exposed directly to the public Internet.
+- Request headers, bodies, connections, timeouts, request rates, cached jobs and batch sizes are bounded.
+- Duplicate sensitive headers, folded headers and chunked request bodies are rejected.
+- Mining jobs are tracked, expire, and are invalidated after a parent-tip change.
+- Arbitrary untracked block submission is not supported.
+- State-changing RPC requires embedded `qubd node` mode.
 
-- `rpc.enabled=true` is required.
-- A non-placeholder `rpc.auth_token` is required.
-- HF121 permits loopback binds only (`127.0.0.1`, `localhost`, or `::1`).
-- Every request requires `X-QUB-RPC-Token`.
-- Browser CORS is not enabled for RPC.
-- Request headers and socket wait times are bounded.
-- Mining template and submit-block endpoints return HTTP 501 and cannot alter chain state.
+## Important hardware note
 
-## Source/package notes
+`qub-rpc-miner` is the QUB-native reference CPU worker and protocol reference. Stock Bitcoin Stratum/AxeOS devices, including Bitaxe Gamma, are **not directly compatible** with HF122 RPC. A reviewed QUB Stratum/worker adapter will be built and hardware-tested separately.
 
-This is a no-assets source package. Runtime UI/media assets are intentionally not included. Copy the known-good `assets` directory from the currently deployed QUB Core source tree before building the Windows release.
-
-Run the local and seed build/test gates before public deployment. The snapshot publisher also includes a standalone self-test:
+## Build
 
 ```bash
-bash deploy/digitalocean/test-publish-mainnet-snapshot.sh
+cargo test
+cargo build --release --bin qubd
+cargo build --release --bin qub-core
+cargo build --release --bin qub-rpc-miner
 ```
+
+## Regtest RPC end-to-end test
+
+```bash
+python3 scripts/test-hf122-rpc-regtest.py \
+  --qubd target/release/qubd \
+  --miner target/release/qub-rpc-miner
+```
+
+On Windows PowerShell:
+
+```powershell
+py .\scripts\test-hf122-rpc-regtest.py `
+  --qubd .\target\release\qubd.exe `
+  --miner .\target\release\qub-rpc-miner.exe
+```
+
+Expected ending:
+
+```text
+HF122 RPC REGTEST E2E: PASS
+```
+
+## Documentation
+
+- `README-RPC-MINER.md` — RPC and reference-miner usage.
+- `HF122-v179-SECURITY-REVIEW.md` — security model, findings and remaining boundaries.
+- `HF122-v179-DEPLOY-RUNBOOK.md` — end-to-end local, seed, headless-node, Explorer, distribution, GitHub and announcement workflow.
+- `RELEASE_NOTES-v1.7.9-HF122.md` — release notes.
+
+## No-assets package
+
+Runtime image, audio and font assets are intentionally excluded. Copy the known-good `assets` directory from the currently deployed QUB Core source tree before producing the Windows distribution.

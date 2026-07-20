@@ -5,11 +5,11 @@ default_port = 17444
 address_prefix = "qub"
 
 [node]
-data_dir = "./data/mainnet"
+data_dir = "/opt/qub/headless/data/mainnet"
 
 [p2p]
 enabled = true
-bind = "0.0.0.0:17444"
+bind = "0.0.0.0:17446"
 advertise_addr = ""
 max_inbound_peers = 128
 max_outbound_peers = 24
@@ -20,10 +20,10 @@ connect_interval_secs = 3
 peer_file = "peers.json"
 bootnodes = ["seed.qubit-coin.io:17444", "seed-ams3.qubit-coin.io:17444", "seed-nyc3.qubit-coin.io:17444"]
 [rpc]
-enabled = false
+enabled = true
 bind = "127.0.0.1:17445"
 auth_token = ""
-auth_token_file = ""
+auth_token_file = "/opt/qub/headless/config/rpc.token"
 allow_remote = false
 allowed_cidrs = []
 max_connections = 64

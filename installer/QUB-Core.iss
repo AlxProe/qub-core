@@ -16,10 +16,10 @@
 #define MyAppId "{{8E24D6B6-51BE-4C5C-9C01-0B3F3A000100}"
 #endif
 
-#define MyAppVersion "1.7.8"
+#define MyAppVersion "1.7.9"
 #define MyAppPublisher "Alexander Proestakis"
 #ifndef MyAppSource
-#define MyAppSource "..\dist\QUB-Core-v1.7.8-windows-x64-regtest-lan"
+#define MyAppSource "..\dist\QUB-Core-v1.7.9-windows-x64-regtest-lan"
 #endif
 
 [Setup]
@@ -51,6 +51,7 @@ UninstallDisplayIcon={app}\QUB-Core.exe
 [Files]
 Source: "{#MyAppSource}\QUB-Core.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\README-MINER-WINDOWS.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSource}\README-RPC-MINER.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#MyAppSource}\SHA256SUMS.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\config\*"; DestDir: "{app}\config"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#MyAppSource}\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs

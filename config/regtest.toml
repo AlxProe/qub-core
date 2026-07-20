@@ -24,6 +24,18 @@ bootnodes = []
 enabled = true
 bind = "127.0.0.1:19445"
 auth_token = "regtest-local-only-change-me"
+auth_token_file = ""
+allow_remote = false
+allowed_cidrs = []
+max_connections = 64
+max_requests_per_minute = 600
+max_header_bytes = 16384
+max_body_bytes = 2097152
+read_timeout_secs = 5
+write_timeout_secs = 15
+job_ttl_secs = 90
+max_cached_jobs = 256
+max_template_batch = 32
 
 [mempool]
 max_transactions = 50000
