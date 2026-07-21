@@ -36,8 +36,8 @@ fn main() {
         res.set_icon(ico_path.to_str().expect("ico path str"));
         res.set("ProductName", product_name);
         res.set("FileDescription", file_description);
-        res.set("ProductVersion", "1.7.9");
-        res.set("FileVersion", "1.7.9.0");
+        res.set("ProductVersion", "1.8.0");
+        res.set("FileVersion", "1.8.0.0");
         res.compile().expect("compile windows resources");
     }
 }

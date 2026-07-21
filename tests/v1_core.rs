@@ -159,9 +159,9 @@ fn equal_work_forks_do_not_flip_without_explicit_preference() {
         c2.clone()
     };
     let lower_tip_blocks = if c1_tip < c2_tip {
-        c1.blocks.clone()
+        c1.blocks.as_ref().clone()
     } else {
-        c2.blocks.clone()
+        c2.blocks.as_ref().clone()
     };
 
     let original_tip = higher_tip_chain.tip_hash().to_string();
@@ -228,7 +228,7 @@ fn reorg_resurrects_tx_from_abandoned_suffix_into_mempool() {
     }
 
     assert!(stale
-        .try_adopt_peer_chain(winning.blocks.clone(), &s, false)
+        .try_adopt_peer_chain(winning.blocks.as_ref().clone(), &s, false)
         .unwrap());
     assert!(stale.tx_in_mempool(txid));
 }
@@ -823,7 +823,7 @@ fn hf117_reorg_resurrects_qub_tx_from_stale_block() {
     }
     assert!(winning.height() > stale_local.height());
     assert!(stale_local
-        .try_adopt_peer_chain(winning.blocks.clone(), &s, false)
+        .try_adopt_peer_chain(winning.blocks.as_ref().clone(), &s, false)
         .unwrap());
     assert!(
         stale_local.tx_in_mempool(txid),
@@ -875,14 +875,14 @@ fn hf121_keeps_hf120_epoch2_anchor_for_pre_and_post_24000() {
 }
 
 #[test]
-fn hf121_r2_status_fast_metadata_and_stream_fallback() {
+fn hf123_fast_storage_status_metadata_and_export() {
     let mut s = regtest();
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let data_dir = std::env::temp_dir().join(format!(
-        "qub-hf121-r2-status-{}-{unique}",
+        "qub-hf123-fast-status-{}-{unique}",
         std::process::id()
     ));
     s.node.data_dir = data_dir.display().to_string();
@@ -891,33 +891,47 @@ fn hf121_r2_status_fast_metadata_and_stream_fallback() {
     save_chain(&s, &chain).unwrap();
 
     let paths = NodePaths::from_settings(&s);
+    assert!(paths.fast_storage_exists());
+    assert!(paths.fast_pointer_file.exists());
     assert!(paths.chain_file.exists());
     assert!(paths.chain_status_file.exists());
 
     let (cached, cached_source) = load_fast_chain_status(&s).unwrap();
-    assert_eq!(cached_source, FastChainStatusSource::Metadata);
+    assert_eq!(cached_source, FastChainStatusSource::FastStorageMetadata);
     assert_eq!(cached.schema_version, FAST_CHAIN_STATUS_SCHEMA_VERSION);
     assert_eq!(cached.network, s.network.name);
     assert_eq!(cached.height, 0);
     assert_eq!(cached.tip_hash, chain.tip_hash());
     assert_eq!(cached.tip_block_version, PROTOCOL_EPOCH_1_BLOCK_VERSION);
+    assert_eq!(cached.storage_engine, HF123_FAST_STORAGE_MAGIC);
 
     std::fs::remove_file(&paths.chain_status_file).unwrap();
-    let (scanned, scanned_source) = load_fast_chain_status(&s).unwrap();
-    assert_eq!(scanned_source, FastChainStatusSource::StreamScan);
-    assert_eq!(scanned.height, cached.height);
-    assert_eq!(scanned.tip_hash, cached.tip_hash);
+    let (recovered, recovered_source) = load_fast_chain_status(&s).unwrap();
+    assert_eq!(recovered_source, FastChainStatusSource::FastStorageMetadata);
+    assert_eq!(recovered.height, cached.height);
+    assert_eq!(recovered.tip_hash, cached.tip_hash);
     assert!(paths.chain_status_file.exists());
 
-    let (recached, recached_source) = load_fast_chain_status(&s).unwrap();
-    assert_eq!(recached_source, FastChainStatusSource::Metadata);
-    assert_eq!(recached.tip_hash, cached.tip_hash);
+    let export = data_dir.join("explicit-export.json");
+    let (height, tip, bytes) = export_chain_json(&s, &export).unwrap();
+    assert_eq!(height, 0);
+    assert_eq!(tip, chain.tip_hash());
+    assert!(bytes > 0);
+    let persisted: PersistedChainState =
+        serde_json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+    assert_eq!(persisted.network, s.network.name);
+    assert_eq!(&persisted.blocks, chain.blocks.as_ref());
+
+    let stats = fast_storage_stats(&s).unwrap();
+    assert!(stats.ok);
+    assert_eq!(stats.storage_engine, HF123_FAST_STORAGE_MAGIC);
+    assert_eq!(stats.height, 0);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[test]
-fn hf122_mining_observability_detects_exact_two_label_alternation() {
+fn hf123_mining_observability_is_neutral_aggregation_only() {
     let s = regtest();
     let mut chain = ChainState::new_with_genesis(&s).unwrap();
     let mut wallet_a = WalletFile::new(&s.network.name);
@@ -946,18 +960,32 @@ fn hf122_mining_observability_detects_exact_two_label_alternation() {
     let stats = mining_stats_json(&s, &chain.blocks, 8);
     assert_eq!(stats["window_blocks"].as_u64(), Some(8));
     assert_eq!(stats["unique_payout_labels"].as_u64(), Some(2));
-    assert_eq!(
-        stats["longest_exact_two_label_alternation"]["blocks"].as_u64(),
-        Some(8)
-    );
-    assert_eq!(
-        stats["current_exact_two_label_alternation"]["blocks"].as_u64(),
-        Some(8)
-    );
-    assert_eq!(
-        stats["longest_same_label_streak"]["blocks"].as_u64(),
-        Some(1)
-    );
+    assert_eq!(stats["distribution"].as_array().map(Vec::len), Some(2));
+    let keys = stats.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let expected = [
+        "block_versions",
+        "coinbase_only_blocks",
+        "coinbase_only_percent",
+        "distribution",
+        "effective_label_count",
+        "from_height",
+        "hhi",
+        "hhi_10000",
+        "interpretation_note",
+        "interval_seconds",
+        "network",
+        "ok",
+        "requested_window",
+        "tip_hash",
+        "to_height",
+        "top_label_share_percent",
+        "unique_payout_labels",
+        "window_blocks",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys, expected);
 }
 
 #[test]
@@ -979,4 +1007,159 @@ fn hf122_rpc_config_is_bounded_and_protocol_epoch_2_is_unchanged() {
     assert!(headless.rpc.enabled);
     assert_eq!(headless.rpc.bind, "127.0.0.1:17445");
     assert_eq!(headless.node.data_dir, "/opt/qub/headless/data/mainnet");
+}
+
+#[test]
+fn hf123_chainstate_snapshots_share_immutable_state() {
+    let s = regtest();
+    let original = ChainState::new_with_genesis(&s).unwrap();
+    let snapshot = original.clone();
+
+    assert!(std::sync::Arc::ptr_eq(&original.blocks, &snapshot.blocks));
+    assert!(std::sync::Arc::ptr_eq(&original.utxos, &snapshot.utxos));
+    assert!(std::sync::Arc::ptr_eq(&original.mempool, &snapshot.mempool));
+
+    let mut advanced = snapshot;
+    let mut wallet = WalletFile::new(&s.network.name);
+    let miner = Address::parse_with_prefix(
+        &wallet.create_key(&s, "hf123-cow-miner", 0).unwrap().address,
+        &s.network.address_prefix,
+    )
+    .unwrap();
+    let block = mine_next_block(
+        &advanced,
+        &s,
+        &miner,
+        MiningOptions {
+            duty_cycle_percent: 100,
+            max_hashes: Some(5_000_000),
+        },
+    )
+    .unwrap();
+    advanced.connect_block(block, &s).unwrap();
+
+    assert_eq!(original.height(), 0);
+    assert_eq!(advanced.height(), 1);
+    assert!(!std::sync::Arc::ptr_eq(&original.blocks, &advanced.blocks));
+    assert!(!std::sync::Arc::ptr_eq(&original.utxos, &advanced.utxos));
+}
+
+#[test]
+fn hf123_fast_storage_truncates_uncommitted_suffix_and_recovers_previous_pointer() {
+    use std::io::Write;
+
+    let mut s = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf123-recovery-{}-{unique}",
+        std::process::id()
+    ));
+    s.node.data_dir = data_dir.display().to_string();
+
+    let mut wallet = WalletFile::new(&s.network.name);
+    let miner = Address::parse_with_prefix(
+        &wallet.create_key(&s, "hf123-recovery-miner", 0).unwrap().address,
+        &s.network.address_prefix,
+    )
+    .unwrap();
+    let options = MiningOptions {
+        duty_cycle_percent: 100,
+        max_hashes: Some(5_000_000),
+    };
+
+    let mut chain = ChainState::new_with_genesis(&s).unwrap();
+    save_chain(&s, &chain).unwrap();
+    let block1 = mine_next_block(&chain, &s, &miner, options).unwrap();
+    chain.connect_block(block1, &s).unwrap();
+    save_chain(&s, &chain).unwrap();
+
+    let paths = NodePaths::from_settings(&s);
+    let current: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&paths.fast_pointer_file).unwrap(),
+    )
+    .unwrap();
+    let journal_name = current["blocks_file"].as_str().unwrap();
+    let committed_bytes = current["journal_bytes"].as_u64().unwrap();
+    let journal_path = paths.fast_storage_dir.join(journal_name);
+
+    {
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(b"{uncommitted-crash-suffix}\n").unwrap();
+        journal.flush().unwrap();
+    }
+    assert!(std::fs::metadata(&journal_path).unwrap().len() > committed_bytes);
+
+    let block2 = mine_next_block(&chain, &s, &miner, options).unwrap();
+    chain.connect_block(block2, &s).unwrap();
+    save_chain(&s, &chain).unwrap();
+    let loaded = load_committed_chain(&s, true).unwrap();
+    assert_eq!(loaded.height(), 2);
+    assert_eq!(loaded.tip_hash(), chain.tip_hash());
+
+    // A syntactically valid CURRENT pointer with a corrupt/missing state must
+    // also recover through PREVIOUS, not only a malformed CURRENT.json file.
+    let current_pointer: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&paths.fast_pointer_file).unwrap(),
+    )
+    .unwrap();
+    let current_state_name = current_pointer["state_file"].as_str().unwrap();
+    let current_state_path = paths.fast_storage_dir.join(current_state_name);
+    let current_state_backup = std::fs::read(&current_state_path).unwrap();
+    std::fs::write(&current_state_path, b"{corrupt-current-state").unwrap();
+    let state_recovered = load_committed_chain(&s, true).unwrap();
+    assert_eq!(state_recovered.height(), 1);
+    assert_eq!(state_recovered.tip_hash(), chain.blocks[1].block_hash());
+    std::fs::write(&current_state_path, current_state_backup).unwrap();
+
+    std::fs::write(&paths.fast_pointer_file, b"{broken-current").unwrap();
+    let recovered = load_committed_chain(&s, true).unwrap();
+    assert_eq!(recovered.height(), 1);
+    assert_eq!(recovered.tip_hash(), chain.blocks[1].block_hash());
+
+    save_chain(&s, &chain).unwrap();
+    let restored = load_committed_chain(&s, true).unwrap();
+    assert_eq!(restored.height(), 2);
+    assert_eq!(restored.tip_hash(), chain.tip_hash());
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf123_migrates_valid_legacy_chain_once() {
+    let mut s = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf123-migration-{}-{unique}",
+        std::process::id()
+    ));
+    s.node.data_dir = data_dir.display().to_string();
+
+    let paths = NodePaths::from_settings(&s);
+    paths.ensure_dirs().unwrap();
+    let chain = ChainState::new_with_genesis(&s).unwrap();
+    std::fs::write(
+        &paths.chain_file,
+        serde_json::to_vec_pretty(&chain.to_persisted()).unwrap(),
+    )
+    .unwrap();
+
+    assert!(!paths.fast_storage_exists());
+    let migrated = load_or_init_chain(&s).unwrap();
+    assert_eq!(migrated.tip_hash(), chain.tip_hash());
+    assert!(paths.fast_storage_exists());
+
+    let second = load_or_init_chain(&s).unwrap();
+    assert_eq!(second.tip_hash(), chain.tip_hash());
+    assert_eq!(fast_storage_stats(&s).unwrap().height, 0);
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# HF121 / v1.7.8: bounded-memory, exact-schema mainnet snapshot publisher.
+# HF123 / v1.8.0: Fast Chain Engine aware, bounded-memory exact-schema publisher.
 #
 # Safety properties:
 # - never runs full `qubd validate` inside the timer path;
-# - takes a coherent copy of the atomically replaced canonical chain file;
+# - exports one committed QUB-FCE-1 generation through qubd when available;
+# - retains the legacy chain.json fallback for isolated tests and pre-migration recovery;
 # - scans blocks incrementally and keeps only the latest 4096 in memory;
 # - verifies network, full hash-link continuity, and the HF120 #24000 version gate;
 # - writes every artifact through a staging directory;
@@ -14,6 +15,8 @@ set -euo pipefail
 # - supports an overridable LOCK_FILE so isolated self-tests never touch the live timer lock.
 
 CFG=${CFG:-/opt/qub/mainnet/mainnet-seed.toml}
+BIN=${BIN:-/opt/qub/bin/qubd}
+EXPORT_TIMEOUT_SECS=${EXPORT_TIMEOUT_SECS:-900}
 OUT_DIR=${OUT_DIR:-/srv/qub-updates/mainnet/snapshots}
 ALT=${ALT:-/srv/qub-updates/mainnet/canonical-chain.json}
 EXPECTED_NETWORK=${EXPECTED_NETWORK:-mainnet}
@@ -36,18 +39,36 @@ if [ -z "${DATA_DIR:-}" ]; then
   DATA_DIR=/opt/qub/mainnet/data
 fi
 
-SRC="$DATA_DIR/chain.json"
-if [ ! -f "$SRC" ]; then
-  echo "chain source not found: $SRC" >&2
-  exit 1
-fi
-
 mkdir -p "$OUT_DIR" "$(dirname "$ALT")"
-STAGE=$(mktemp -d "$OUT_DIR/.publish-hf121-r2.XXXXXX")
+STAGE=$(mktemp -d "$OUT_DIR/.publish-hf123.XXXXXX")
 cleanup() {
   rm -rf "$STAGE"
 }
 trap cleanup EXIT INT TERM
+
+LEGACY_SRC="$DATA_DIR/chain.json"
+FAST_POINTER="$DATA_DIR/chain-v2/CURRENT.json"
+EXPORT_SRC="$STAGE/export-source.json"
+
+if [ -f "$FAST_POINTER" ]; then
+  if [ ! -x "$BIN" ]; then
+    echo "Fast Chain Engine exists but qubd exporter is unavailable: $BIN" >&2
+    exit 1
+  fi
+  echo "exporting committed Fast Chain Engine generation via qubd"
+  timeout \
+    --signal=TERM \
+    --kill-after=30s \
+    "${EXPORT_TIMEOUT_SECS}s" \
+    "$BIN" --config "$CFG" export-chain-json "$EXPORT_SRC"
+  SRC="$EXPORT_SRC"
+elif [ -f "$LEGACY_SRC" ]; then
+  echo "using pre-migration legacy chain source: $LEGACY_SRC"
+  SRC="$LEGACY_SRC"
+else
+  echo "canonical chain source not found under $DATA_DIR" >&2
+  exit 1
+fi
 
 python3 - "$SRC" "$STAGE" "$OUT_DIR" "$ALT" "$EXPECTED_NETWORK" "$EPOCH2_HEIGHT" "$EPOCH1_VERSION" "$EPOCH2_VERSION" <<'PY'
 import collections

@@ -1,28 +1,27 @@
-# QUB HF122 RPC and Reference Miner
+# QUB HF123 RPC and Reference Miner
 
 ## Production model
 
-The recommended HF122 layout is:
-
 ```text
 qubd node
-  ├─ public/private QUB P2P
+  ├─ QUB P2P
+  ├─ Fast Chain Engine canonical state owner
   └─ authenticated loopback RPC
-       ├─ qub-rpc-miner (reference CPU worker)
+       ├─ qub-rpc-miner
        ├─ future official QUB pool service
        └─ future hardware/Stratum adapter
 ```
 
-Do not expose raw HF122 RPC directly to the public Internet. It has token authentication but no built-in TLS. Keep it on loopback, an authenticated private network, or behind a separately reviewed TLS gateway.
+Do not expose raw QUB RPC directly to the public Internet. It has token authentication and strict limits but no built-in TLS. Keep it on loopback, an authenticated private network, or behind a separately reviewed TLS gateway.
 
 ## Headless config
 
-Use `config/headless-mainnet.toml` as the starting template. It deliberately uses a data directory and P2P port separate from the public seeds:
+`config/headless-mainnet.toml` deliberately uses a data directory and P2P port separate from the public seeds:
 
 ```text
-P2P: 0.0.0.0:17446
-RPC: 127.0.0.1:17445
-Data: /opt/qub/headless/data/mainnet
+P2P:   0.0.0.0:17446
+RPC:   127.0.0.1:17445
+Data:  /opt/qub/headless/data/mainnet
 Token: /opt/qub/headless/config/rpc.token
 ```
 
@@ -49,9 +48,7 @@ or:
 Authorization: Bearer <token>
 ```
 
-Duplicate sensitive authentication headers are rejected.
-
-Example:
+Duplicate sensitive headers are rejected.
 
 ```bash
 TOKEN="$(tr -d '\r\n' < /opt/qub/headless/config/rpc.token)"
@@ -74,7 +71,9 @@ GET /rpc/v1/mining/stats?window=256
 GET /rpc/v1/events/tip?after=<tip-hash>&wait_ms=30000
 ```
 
-## Mining template endpoints
+Mining statistics are aggregate-only. They do not infer address ownership, operator identity or coordination.
+
+## Mining templates
 
 Solo:
 
@@ -100,20 +99,7 @@ curl -sS \
   "http://127.0.0.1:17445/rpc/v1/mining/template?pool_id=<64-hex-pool-id>" | jq
 ```
 
-A template includes:
-
-```text
-job_id
-height / parent_hash / version / time / bits
-target_hex
-80-byte header and 76-byte nonce prefix
-nonce_offset = 76
-coinbase bytes and txid
-extra_nonce
-expiry
-```
-
-HF122 proof-of-work is double SHA-256. The response explicitly documents the internal-byte-order comparison required by the QUB implementation.
+A template includes the tracked job ID, height, parent hash, block version, timestamp, compact target, QUB header bytes, nonce offset, coinbase bytes, extra nonce and expiry.
 
 ## Submit a tracked candidate
 
@@ -125,7 +111,7 @@ curl -sS \
   http://127.0.0.1:17445/rpc/v1/mining/submit-block | jq
 ```
 
-A submit can be rejected because the job is unknown/expired, proof of work is insufficient, the canonical parent moved, the job is stale, or the expected block version changed. Arbitrary full-block submission without a tracked job is intentionally unavailable.
+Submission requires a known, unexpired job tied to the current canonical parent and expected block version. Arbitrary untracked block submission is unavailable.
 
 ## Reference miner
 
@@ -152,8 +138,8 @@ Existing on-chain pool:
   --batch 4
 ```
 
-The worker is a protocol reference and CPU smoke tool. It is not intended to compete with ASIC/GPU infrastructure.
+The worker is a CPU protocol reference and smoke tool. It is not intended to compete with ASIC/GPU infrastructure.
 
 ## Bitaxe/AxeOS boundary
 
-Bitaxe Gamma performs SHA-256 ASIC work, but stock AxeOS speaks Bitcoin-oriented Stratum and Bitcoin job semantics. HF122 RPC is QUB-native and tracked-job based. A separate adapter must translate QUB templates and submits, preserve QUB header/version/coinbase semantics, and be hardware-tested before any Dedicated QUB Miner claim.
+Bitaxe Gamma performs SHA-256 ASIC work, but stock AxeOS speaks Bitcoin-oriented Stratum and Bitcoin job semantics. HF123 RPC is QUB-native and tracked-job based. A separately reviewed adapter must translate QUB templates and submissions while preserving QUB header, version and coinbase semantics. Hardware compatibility must be verified on the actual device before release.

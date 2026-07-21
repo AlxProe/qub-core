@@ -1133,7 +1133,7 @@ pub fn validate_pools_transaction_against_chain(
     }
     let mut registry = pools_registry_from_blocks(settings, &chain.blocks)?;
     let mut state = PoolWindowState::from_blocks(settings, &chain.blocks, spend_height);
-    for mem in &chain.mempool {
+    for mem in chain.mempool.iter() {
         if mem.txid() == tx.txid() {
             continue;
         }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PUBLISHER="$SCRIPT_DIR/publish-mainnet-snapshot.sh"
-TMP=$(mktemp -d /tmp/qub-hf121-snapshot-test.XXXXXX)
+TMP=$(mktemp -d /tmp/qub-hf123-snapshot-test.XXXXXX)
 VALID_LOG="$TMP/valid.log"
 INVALID_LOG="$TMP/invalid.log"
 VALID_LOCK="$TMP/publisher-valid.lock"
@@ -64,6 +64,7 @@ path.write_text(
 )
 PY
 
+BIN="$TMP/no-qubd" \
 CFG="$TMP/config.toml" \
 OUT_DIR="$TMP/out" \
 ALT="$TMP/canonical-chain.json" \
@@ -102,7 +103,7 @@ o["blocks"][50]["header"]["version"] = 1
 p.write_text(json.dumps(o, indent=2) + "\n", encoding="utf-8")
 PY
 
-if CFG="$TMP/config.toml" OUT_DIR="$TMP/bad-out" ALT="$TMP/bad-canonical.json" LOCK_FILE="$INVALID_LOCK" EPOCH2_HEIGHT=50 bash "$PUBLISHER" >"$INVALID_LOG" 2>&1; then
+if BIN="$TMP/no-qubd" CFG="$TMP/config.toml" OUT_DIR="$TMP/bad-out" ALT="$TMP/bad-canonical.json" LOCK_FILE="$INVALID_LOCK" EPOCH2_HEIGHT=50 bash "$PUBLISHER" >"$INVALID_LOG" 2>&1; then
     echo "ERROR: publisher accepted an invalid post-activation block version" >&2
     exit 1
 fi
@@ -110,4 +111,4 @@ fi
 grep -q 'version mismatch' "$INVALID_LOG"
 
 echo "invalid epoch-version rejection: OK"
-echo "HF121 snapshot publisher self-test: PASS"
+echo "HF123 snapshot publisher self-test: PASS"

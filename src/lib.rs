@@ -13,12 +13,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod fast_storage;
 pub mod p2p;
 pub mod pools;
 pub mod rpc;
+pub use fast_storage::*;
 pub use pools::*;
 
 pub const ATOMS_PER_QUB: u64 = 100_000_000;
@@ -1189,17 +1191,21 @@ pub struct PersistedChainState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainState {
     pub network: String,
-    pub blocks: Vec<Block>,
-    pub utxos: HashMap<OutPoint, CoinRecord>,
-    pub mempool: Vec<Transaction>,
+    /// HF123 Fast Chain Engine: immutable canonical block history is shared
+    /// across snapshots. Cloning a ChainState no longer duplicates every block.
+    pub blocks: Arc<Vec<Block>>,
+    /// UTXO and mempool snapshots use copy-on-write so read-side snapshots are
+    /// O(1) while consensus mutations remain explicit through Arc::make_mut.
+    pub utxos: Arc<HashMap<OutPoint, CoinRecord>>,
+    pub mempool: Arc<Vec<Transaction>>,
 }
 impl ChainState {
     pub fn new_with_genesis(settings: &Settings) -> Result<Self> {
         Ok(Self {
             network: settings.network.name.clone(),
-            blocks: vec![genesis_block(settings)?],
-            utxos: HashMap::new(),
-            mempool: Vec::new(),
+            blocks: Arc::new(vec![genesis_block(settings)?]),
+            utxos: Arc::new(HashMap::new()),
+            mempool: Arc::new(Vec::new()),
         })
     }
 
@@ -1242,9 +1248,9 @@ impl ChainState {
         utxos.sort_by(|a, b| a.outpoint.key().cmp(&b.outpoint.key()));
         PersistedChainState {
             network: self.network.clone(),
-            blocks: self.blocks.clone(),
+            blocks: self.blocks.as_ref().clone(),
             utxos,
-            mempool: self.mempool.clone(),
+            mempool: self.mempool.as_ref().clone(),
         }
     }
 
@@ -1260,9 +1266,9 @@ impl ChainState {
         }
         let s = Self {
             network: p.network,
-            blocks: p.blocks,
-            utxos,
-            mempool: p.mempool,
+            blocks: Arc::new(p.blocks),
+            utxos: Arc::new(utxos),
+            mempool: Arc::new(p.mempool),
         };
         s.validate_all(settings)?;
         Ok(s)
@@ -1315,9 +1321,9 @@ impl ChainState {
         }
         Ok(Self {
             network: p.network,
-            blocks: p.blocks,
-            utxos,
-            mempool: p.mempool,
+            blocks: Arc::new(p.blocks),
+            utxos: Arc::new(utxos),
+            mempool: Arc::new(p.mempool),
         })
     }
 
@@ -1346,7 +1352,7 @@ impl ChainState {
             connect_block_utxos(block, &mut utxos, i as u32)?;
             prev = block.block_hash();
         }
-        if utxos != self.utxos {
+        if &utxos != self.utxos.as_ref() {
             bail!("UTXO mismatch after replay");
         }
         Ok(())
@@ -1568,7 +1574,7 @@ impl ChainState {
             self.height() + 1,
             settings,
         )?;
-        self.mempool.push(tx);
+        Arc::make_mut(&mut self.mempool).push(tx);
         Ok(txid)
     }
 
@@ -1590,7 +1596,7 @@ impl ChainState {
                 tx.txid().to_string(),
             )
         });
-        self.mempool.clear();
+        Arc::make_mut(&mut self.mempool).clear();
         let mut seen = HashSet::<Hash256>::new();
         let mut pending = Vec::<Transaction>::new();
         for tx in candidates.into_iter().take(mempool_cap) {
@@ -1631,7 +1637,7 @@ impl ChainState {
     }
 
     pub fn revalidate_mempool(&mut self, settings: &Settings) -> usize {
-        let pending = self.mempool.clone();
+        let pending = self.mempool.as_ref().clone();
         self.rebuild_mempool_from(pending, settings)
     }
 
@@ -1657,12 +1663,12 @@ impl ChainState {
         validate_library_block(&block, &self.blocks, &self.utxos, height, settings)?;
         validate_verified_governance_block(&block, &self.blocks, &self.utxos, height, settings)?;
         validate_consensus_checkpoint(settings, height, block.block_hash())?;
-        let mut new_utxos = self.utxos.clone();
+        let mut new_utxos = self.utxos.as_ref().clone();
         connect_block_utxos(&block, &mut new_utxos, height)?;
         let hash = block.block_hash();
-        self.blocks.push(block);
-        self.utxos = new_utxos;
-        self.mempool.retain(|tx| !txids.contains(&tx.txid()));
+        Arc::make_mut(&mut self.blocks).push(block);
+        self.utxos = Arc::new(new_utxos);
+        Arc::make_mut(&mut self.mempool).retain(|tx| !txids.contains(&tx.txid()));
         // HF76/v1.5.8: a newly-confirmed block can spend inputs or change feature
         // state used by still-pending transactions. Revalidate survivors now so
         // stale local mempool entries do not linger for many blocks and then appear
@@ -3264,7 +3270,7 @@ fn candidate_mempool_transactions(
     height: u32,
     solo_miner_for_legacy_jin: Option<&str>,
 ) -> Result<(Vec<Transaction>, u64)> {
-    let mut scratch = chain.utxos.clone();
+    let mut scratch = chain.utxos.as_ref().clone();
     let mut jin_ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
     let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
     qub_jin_apply_bootstrap_for_context(
@@ -3654,7 +3660,6 @@ pub fn mining_stats_json(
         &blocks[0..0]
     };
 
-    let mut labels = Vec::<String>::with_capacity(selected.len());
     let mut label_types = HashMap::<String, String>::new();
     let mut counts = HashMap::<String, u64>::new();
     let mut coinbase_only = HashMap::<String, u64>::new();
@@ -3664,7 +3669,6 @@ pub fn mining_stats_json(
 
     for (offset, block) in selected.iter().enumerate() {
         let (label, kind) = mining_payout_label(settings, block);
-        labels.push(label.clone());
         label_types.entry(label.clone()).or_insert(kind);
         *counts.entry(label.clone()).or_insert(0) += 1;
         if block.transactions.len() == 1 {
@@ -3723,61 +3727,6 @@ pub fn mining_stats_json(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0);
 
-    let mut longest_streak = 0usize;
-    let mut longest_streak_label = String::new();
-    let mut current_streak = 0usize;
-    let mut current_streak_label = String::new();
-    for label in &labels {
-        if current_streak_label == *label {
-            current_streak += 1;
-        } else {
-            current_streak_label = label.clone();
-            current_streak = 1;
-        }
-        if current_streak > longest_streak {
-            longest_streak = current_streak;
-            longest_streak_label = label.clone();
-        }
-    }
-
-    let mut alt_len = 0usize;
-    let mut alt_a = String::new();
-    let mut alt_b = String::new();
-    let mut longest_alt = usize::from(!labels.is_empty());
-    let mut longest_alt_a = labels.first().cloned().unwrap_or_default();
-    let mut longest_alt_b = String::new();
-    for i in 0..labels.len() {
-        if i == 0 {
-            alt_len = 1;
-            alt_a = labels[i].clone();
-            alt_b.clear();
-            continue;
-        }
-        if labels[i] == labels[i - 1] {
-            alt_len = 1;
-            alt_a = labels[i].clone();
-            alt_b.clear();
-        } else if alt_len == 1 {
-            alt_len = 2;
-            alt_a = labels[i - 1].clone();
-            alt_b = labels[i].clone();
-        } else {
-            let expected = if alt_len % 2 == 0 { &alt_a } else { &alt_b };
-            if labels[i] == *expected {
-                alt_len += 1;
-            } else {
-                alt_len = 2;
-                alt_a = labels[i - 1].clone();
-                alt_b = labels[i].clone();
-            }
-        }
-        if alt_len > longest_alt {
-            longest_alt = alt_len;
-            longest_alt_a = alt_a.clone();
-            longest_alt_b = alt_b.clone();
-        }
-    }
-
     intervals.sort_unstable();
     let average_interval = if intervals.is_empty() {
         0.0
@@ -3830,24 +3779,6 @@ pub fn mining_stats_json(
         "effective_label_count": effective_labels,
         "coinbase_only_blocks": total_coinbase_only,
         "coinbase_only_percent": if block_count == 0 { 0.0 } else { total_coinbase_only as f64 * 100.0 / block_count as f64 },
-        "longest_same_label_streak": {
-            "blocks": longest_streak,
-            "label": longest_streak_label,
-        },
-        "current_same_label_streak": {
-            "blocks": current_streak,
-            "label": current_streak_label,
-        },
-        "longest_exact_two_label_alternation": {
-            "blocks": longest_alt,
-            "label_a": longest_alt_a,
-            "label_b": longest_alt_b,
-        },
-        "current_exact_two_label_alternation": {
-            "blocks": alt_len,
-            "label_a": alt_a,
-            "label_b": alt_b,
-        },
         "interval_seconds": {
             "average": average_interval,
             "median": median_interval,
@@ -4149,7 +4080,7 @@ impl WalletFile {
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
         let pending_spent = Self::pending_spent_outpoints(chain);
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if pending_spent.contains(outpoint) {
                 continue;
             }
@@ -4591,7 +4522,7 @@ impl WalletFile {
             }
         }
         if selected.is_none() {
-            for (outpoint, coin) in &chain.utxos {
+            for (outpoint, coin) in chain.utxos.iter() {
                 if pending_spent.contains(outpoint) {
                     continue;
                 }
@@ -5045,7 +4976,7 @@ impl WalletFile {
             .context("QNS payment overflow")?;
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if is_immature_coinbase(coin, chain.height(), settings) {
                 continue;
             }
@@ -5160,7 +5091,7 @@ impl WalletFile {
             .context("pool create payment overflow")?;
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if is_immature_coinbase(coin, chain.height(), settings) {
                 continue;
             }
@@ -5271,7 +5202,7 @@ impl WalletFile {
         let manager_script = manager.script_pubkey().0;
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if is_immature_coinbase(coin, chain.height(), settings) {
                 continue;
             }
@@ -5369,7 +5300,7 @@ impl WalletFile {
         let manager_script = manager.script_pubkey().0;
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if is_immature_coinbase(coin, chain.height(), settings) {
                 continue;
             }
@@ -5463,7 +5394,7 @@ impl WalletFile {
         let manager_script = manager.script_pubkey().0;
         let mut selected: Vec<(OutPoint, CoinRecord, WalletKey)> = Vec::new();
         let mut total = 0u64;
-        for (outpoint, coin) in &chain.utxos {
+        for (outpoint, coin) in chain.utxos.iter() {
             if is_immature_coinbase(coin, chain.height(), settings) {
                 continue;
             }
@@ -5887,10 +5818,27 @@ pub struct FastChainStatus {
     pub chain_file_modified_unix_secs: u64,
     pub chain_file_modified_subsec_nanos: u32,
     pub generated_at_unix: u64,
+    #[serde(default)]
+    pub storage_engine: String,
+    #[serde(default)]
+    pub storage_generation: u64,
+    #[serde(default)]
+    pub state_revision: u64,
+    #[serde(default)]
+    pub primary_state_bytes: u64,
+    #[serde(default)]
+    pub journal_bytes: u64,
+    #[serde(default)]
+    pub mempool_tx_count: usize,
+    #[serde(default = "Hash256::zero")]
+    pub mempool_digest: Hash256,
+    #[serde(default)]
+    pub recent_blocks: Vec<FastRecentBlock>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastChainStatusSource {
+    FastStorageMetadata,
     Metadata,
     StreamScan,
 }
@@ -5902,16 +5850,27 @@ pub struct NodePaths {
     pub chain_status_file: PathBuf,
     pub wallet_file: PathBuf,
     pub pending_txs_file: PathBuf,
+    pub fast_storage_dir: PathBuf,
+    pub fast_pointer_file: PathBuf,
+    pub fast_previous_pointer_file: PathBuf,
+    pub fast_storage_lock_file: PathBuf,
+    pub fast_legacy_export_status_file: PathBuf,
 }
 
 impl NodePaths {
     pub fn from_settings(settings: &Settings) -> Self {
         let data_dir = PathBuf::from(&settings.node.data_dir);
+        let fast_storage_dir = data_dir.join("chain-v2");
         Self {
             chain_file: data_dir.join("chain.json"),
             chain_status_file: data_dir.join("chain-status.json"),
             wallet_file: data_dir.join("wallet.json"),
             pending_txs_file: data_dir.join("wallet-pending-txs.json"),
+            fast_pointer_file: fast_storage_dir.join("CURRENT.json"),
+            fast_previous_pointer_file: fast_storage_dir.join("PREVIOUS.json"),
+            fast_storage_lock_file: fast_storage_dir.join("WRITE.lock"),
+            fast_legacy_export_status_file: fast_storage_dir.join("legacy-export-status.json"),
+            fast_storage_dir,
             data_dir,
         }
     }
@@ -5919,6 +5878,10 @@ impl NodePaths {
     pub fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(&self.data_dir)?;
         Ok(())
+    }
+
+    pub fn fast_storage_exists(&self) -> bool {
+        self.fast_pointer_file.is_file() || self.fast_previous_pointer_file.is_file()
     }
 }
 
@@ -5959,6 +5922,14 @@ fn fast_status_from_chain(chain: &ChainState, metadata: &fs::Metadata) -> Result
         chain_file_modified_unix_secs: modified_secs,
         chain_file_modified_subsec_nanos: modified_nanos,
         generated_at_unix: current_unix_secs(),
+        storage_engine: "legacy-chain-json".to_string(),
+        storage_generation: 0,
+        state_revision: 0,
+        primary_state_bytes: metadata.len(),
+        journal_bytes: metadata.len(),
+        mempool_tx_count: chain.mempool.len(),
+        mempool_digest: Hash256::zero(),
+        recent_blocks: Vec::new(),
     })
 }
 
@@ -6126,6 +6097,14 @@ fn stream_scan_fast_chain_status(
         chain_file_modified_unix_secs: modified_secs,
         chain_file_modified_subsec_nanos: modified_nanos,
         generated_at_unix: current_unix_secs(),
+        storage_engine: "legacy-chain-json".to_string(),
+        storage_generation: 0,
+        state_revision: 0,
+        primary_state_bytes: metadata.len(),
+        journal_bytes: metadata.len(),
+        mempool_tx_count: 0,
+        mempool_digest: Hash256::zero(),
+        recent_blocks: Vec::new(),
     })
 }
 
@@ -6133,8 +6112,19 @@ pub fn load_fast_chain_status(
     settings: &Settings,
 ) -> Result<(FastChainStatus, FastChainStatusSource)> {
     let paths = NodePaths::from_settings(settings);
+    if paths.fast_storage_exists() {
+        match fast_storage::load_fast_status(settings, &paths) {
+            Ok(status) => return Ok(status),
+            Err(err) if paths.chain_file.exists() => {
+                eprintln!(
+                    "warning: Fast Chain Engine status unavailable; falling back to legacy bounded scan: {err:#}"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
     if !paths.chain_file.exists() {
-        bail!("chain file not found: {}", paths.chain_file.display());
+        bail!("chain state not found under {}", paths.data_dir.display());
     }
     let metadata = fs::metadata(&paths.chain_file)
         .with_context(|| format!("metadata {}", paths.chain_file.display()))?;
@@ -6164,32 +6154,55 @@ pub fn load_fast_chain_status(
 }
 
 pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
+    if let Some(chain) = live_chain_snapshot(settings) {
+        return Ok(chain);
+    }
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
+    if paths.fast_storage_exists() {
+        // QUB-FCE-1 is authoritative once present. CURRENT/PREVIOUS recovery is
+        // internal to the engine; never silently replace it from a potentially
+        // stale compatibility chain.json export.
+        return fast_storage::load_fast_chain(settings, &paths, true)
+            .map(|(chain, _)| chain)
+            .context("Fast Chain Engine load failed; explicit operator recovery is required");
+    }
     if paths.chain_file.exists() {
         let raw = fs::read_to_string(&paths.chain_file)?;
-        ChainState::from_persisted(serde_json::from_str(&raw)?, settings)
+        let chain = ChainState::from_persisted(serde_json::from_str(&raw)?, settings)?;
+        fast_storage::migrate_legacy_chain(settings, &paths, &chain)?;
+        Ok(chain)
     } else {
         let chain = ChainState::new_with_genesis(settings)?;
-        write_chain_file(&paths, &chain)?;
+        fast_storage::initialize_new_chain(settings, &paths, &chain)?;
         Ok(chain)
     }
 }
 
-/// HF88/v1.6.2: UI-only fast chain loader. It reads persisted chain/UTXO data
-/// with cheap structural checks instead of a full replay. Do not use this for
-/// mining, sync, tx creation, or consensus decisions.
+/// HF123/v1.8.0 UI loader. Once the embedded node is running this reads its
+/// canonical in-memory owner. Before that, it reads QUB-FCE-1 with structural
+/// verification and avoids full consensus replay. A pre-migration legacy file is
+/// still supported for the first paint; the validated node startup performs the
+/// one-time migration afterward.
 pub fn load_or_init_chain_for_ui_fast(settings: &Settings) -> Result<ChainState> {
+    if let Some(chain) = live_chain_snapshot(settings) {
+        return Ok(chain);
+    }
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
+    if paths.fast_storage_exists() {
+        return fast_storage::load_fast_chain(settings, &paths, false)
+            .map(|(chain, _)| chain)
+            .context("Fast Chain Engine UI load failed; refusing stale legacy fallback");
+    }
     if paths.chain_file.exists() {
         let raw = fs::read_to_string(&paths.chain_file)?;
         ChainState::from_persisted_unchecked_for_ui(serde_json::from_str(&raw)?, settings)
     } else {
         let chain = ChainState::new_with_genesis(settings)?;
-        write_chain_file(&paths, &chain)?;
+        fast_storage::initialize_new_chain(settings, &paths, &chain)?;
         Ok(chain)
     }
 }
@@ -6198,26 +6211,26 @@ pub fn save_chain(settings: &Settings, chain: &ChainState) -> Result<()> {
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
-    write_chain_file(&paths, chain)
-}
-
-fn write_chain_file(paths: &NodePaths, chain: &ChainState) -> Result<()> {
-    write_text_replace(
-        &paths.chain_file,
-        &serde_json::to_string_pretty(&chain.to_persisted())?,
-    )?;
-
-    // HF121-r2: chain-status.json is an operational cache only. A failure to
-    // refresh it must never turn a successfully persisted consensus state into
-    // a node failure; status-fast will rebuild it with a bounded-memory scan.
-    if let Err(err) = refresh_fast_chain_status_file(paths, chain) {
-        eprintln!(
-            "warning: could not refresh {}: {err:#}",
-            paths.chain_status_file.display()
-        );
+    if !paths.fast_storage_exists() {
+        chain.validate_all(settings)?;
+        if paths.chain_file.exists() {
+            fast_storage::migrate_legacy_chain(settings, &paths, chain)?;
+        } else {
+            fast_storage::initialize_new_chain(settings, &paths, chain)?;
+        }
+    } else {
+        fast_storage::commit_chain(settings, &paths, chain)?;
     }
+    fast_storage::publish_live_chain(settings, chain);
     Ok(())
 }
+
+/// Explicit compatibility export for snapshots and external tools. Normal
+/// block persistence uses QUB-FCE-1 and does not rewrite the monolithic file.
+pub fn export_chain_json(settings: &Settings, output_path: &Path) -> Result<(u32, Hash256, u64)> {
+    fast_storage::export_chain_json(settings, output_path)
+}
+
 
 pub fn load_or_init_wallet(settings: &Settings) -> Result<WalletFile> {
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
@@ -7310,7 +7323,7 @@ fn validate_qub_jin_infusion_transaction_against_chain(
         chain.height(),
         spend_height,
     )?;
-    let mut scratch = chain.utxos.clone();
+    let mut scratch = chain.utxos.as_ref().clone();
     let mut pending = chain.mempool.iter().collect::<Vec<_>>();
     pending.sort_by_cached_key(|tx| {
         (
@@ -8118,7 +8131,7 @@ pub fn jin_balance_units_for_address(
         spend_height,
     );
     // Show local mempool effects optimistically for the selected address.
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         for (_, purchase, _) in jin_sale_purchases_in_tx(tx, settings) {
             let _ = apply_jin_sale_purchase(&mut ledger, &purchase, settings);
         }
@@ -8252,7 +8265,7 @@ fn validate_jin_transaction_against_chain(
         chain.height(),
         spend_height,
     )?;
-    for mem in &chain.mempool {
+    for mem in chain.mempool.iter() {
         if mem.txid() == tx.txid() {
             continue;
         }

@@ -1,47 +1,67 @@
-# QUB Core v1.7.9 HF122 — Headless Node, Authenticated RPC and Mining Infrastructure
+# QUB Core v1.8.0 HF123 — Fast Chain Engine
 
-HF122 / v1.7.9 completes the first production release of QUB-native headless node and mining infrastructure started in HF121. It adds **no new consensus activation**.
+HF123 / v1.8.0 is the QUB Core storage, synchronization and GUI-performance release. It introduces **no new consensus activation**.
 
 Protocol Epoch 2 remains active exactly as deployed:
 
 - blocks below mainnet height **#24000** use block version **1**;
 - blocks at and above **#24000** require block version **2**;
-- no rollback, address-specific rule, DAA change, checkpoint change, genesis change, economics change, or QUB/JIN rule change is introduced by HF122.
+- DAA, checkpoints, genesis, economics and QUB/JIN consensus rules are unchanged.
 
-## HF122 infrastructure
+## Fast Chain Engine
 
-- Embedded authenticated RPC in `qubd node`, sharing the same canonical in-memory chain state as P2P.
-- Read-only standalone RPC mode for diagnostics.
-- Canonical chain, block, transaction and mempool read endpoints.
-- Tracked solo and existing on-chain pool mining templates.
-- Compact independent template batches for parallel workers.
-- Canonical-parent, expiry, version and proof-of-work guards on block submission.
-- Authenticated raw transaction submission through the normal mempool validation and relay path.
-- Long-poll tip events.
-- `qub-rpc-miner`, a QUB-native reference CPU worker.
-- Mining-distribution observability: payout/pool labels, HHI, effective label count, same-label streaks, exact two-label alternation, coinbase-only rate, timing percentiles and block-version distribution.
-- QUB Explorer v0.7 mining analytics support.
-- A separate headless-mainnet configuration and hardened systemd service examples.
+HF123 replaces the monolithic `chain.json` hot path with `QUB-FCE-1`:
 
-## Security defaults
+```text
+chain-v2/
+├── CURRENT.json
+├── PREVIOUS.json
+├── WRITE.lock
+├── blocks-<generation>.jsonl
+├── state-<generation>-<revision>.json
+└── legacy-export-status.json
+```
 
-- RPC is disabled by default in normal mainnet and testnet configs.
-- The supplied headless config binds RPC to `127.0.0.1:17445`.
-- Every RPC request requires a non-placeholder token.
-- Token files must be owner-only on Unix (`chmod 600`).
-- Remote binding requires both `allow_remote=true` and an explicit CIDR allowlist.
-- RPC has no built-in TLS and must not be exposed directly to the public Internet.
-- Request headers, bodies, connections, timeouts, request rates, cached jobs and batch sizes are bounded.
-- Duplicate sensitive headers, folded headers and chunked request bodies are rejected.
-- Mining jobs are tracked, expire, and are invalidated after a parent-tip change.
-- Arbitrary untracked block submission is not supported.
-- State-changing RPC requires embedded `qubd node` mode.
+Key properties:
 
-## Important hardware note
+- append-only committed block journal;
+- immutable state snapshots and atomic current/previous pointers;
+- one-time validated migration from the existing `chain.json`;
+- recovery from the previous fully validated committed generation;
+- fail-closed behavior if both committed generations are unusable;
+- truncation of uncommitted journal suffixes after interrupted writes;
+- one canonical in-memory `ChainState` shared by P2P, embedded RPC and GUI snapshots;
+- copy-on-write block, UTXO and mempool snapshots;
+- batched catch-up persistence instead of repeated full-chain rewrites;
+- infrequent compatibility `chain.json` export for external tools;
+- `status-fast`, `storage-stats` and `export-chain-json` operator commands.
 
-`qub-rpc-miner` is the QUB-native reference CPU worker and protocol reference. Stock Bitcoin Stratum/AxeOS devices, including Bitaxe Gamma, are **not directly compatible** with HF122 RPC. A reviewed QUB Stratum/worker adapter will be built and hardware-tested separately.
+## GUI and synchronization
 
-## Build
+HF123 removes repeated full-chain JSON loading from hot P2P and GUI paths. It adds:
+
+- true single-flight chain catch-up and snapshot workers;
+- cached derived QNS, pool, JIN, governance and QUB/JIN views per canonical tip;
+- stable timestamped status history;
+- lightweight local height detection through Fast Chain Engine metadata;
+- immutable Explorer API cache keyed by the committed storage identity.
+
+## Headless RPC and reference miner
+
+HF122 authenticated infrastructure remains included:
+
+- embedded, token-authenticated RPC in `qubd node`;
+- canonical chain, block, transaction and mempool endpoints;
+- tracked solo and existing on-chain pool templates;
+- compact parallel template batches;
+- guarded tracked block submission;
+- `qub-rpc-miner` reference CPU worker.
+
+Standard mainnet/testnet RPC remains disabled by default. The supplied headless configuration is loopback-only. Raw RPC has no built-in TLS and must not be exposed directly to the public Internet.
+
+Mining observability is intentionally neutral and aggregate-only: payout/pool label distribution, top-label share, HHI, effective label count, coinbase-only rate, block intervals and block-version distribution. A payout label is not proof of a unique operator or exact hashrate share.
+
+## Build and mandatory release gates
 
 ```bash
 cargo test
@@ -50,34 +70,46 @@ cargo build --release --bin qub-core
 cargo build --release --bin qub-rpc-miner
 ```
 
-## Regtest RPC end-to-end test
+Fast Chain Engine E2E:
 
 ```bash
-python3 scripts/test-hf122-rpc-regtest.py \
+python3 scripts/test-hf123-fast-chain-regtest.py \
+  --qubd target/release/qubd
+```
+
+RPC/miner E2E:
+
+```bash
+python3 scripts/test-hf123-rpc-regtest.py \
   --qubd target/release/qubd \
   --miner target/release/qub-rpc-miner
 ```
 
-On Windows PowerShell:
+Windows PowerShell:
 
 ```powershell
-py .\scripts\test-hf122-rpc-regtest.py `
+py .\scripts\test-hf123-fast-chain-regtest.py `
+  --qubd .\target\release\qubd.exe
+
+py .\scripts\test-hf123-rpc-regtest.py `
   --qubd .\target\release\qubd.exe `
   --miner .\target\release\qub-rpc-miner.exe
 ```
 
-Expected ending:
+Expected endings:
 
 ```text
-HF122 RPC REGTEST E2E: PASS
+HF123 FAST CHAIN ENGINE REGTEST E2E: PASS
+HF123 RPC REGTEST E2E: PASS
 ```
 
 ## Documentation
 
-- `README-RPC-MINER.md` — RPC and reference-miner usage.
-- `HF122-v179-SECURITY-REVIEW.md` — security model, findings and remaining boundaries.
-- `HF122-v179-DEPLOY-RUNBOOK.md` — end-to-end local, seed, headless-node, Explorer, distribution, GitHub and announcement workflow.
-- `RELEASE_NOTES-v1.7.9-HF122.md` — release notes.
+- `README-FAST-CHAIN-ENGINE.md` — storage format, migration and recovery model.
+- `README-RPC-MINER.md` — headless RPC and reference-miner usage.
+- `HF123-v180-ENTERPRISE-REVIEW.md` — safety and architecture review.
+- `HF123-v180-DEPLOY-RUNBOOK.md` — end-to-end deployment procedure.
+- `RELEASE_NOTES-v1.8.0-HF123.md` — release notes.
 
 ## No-assets package
 

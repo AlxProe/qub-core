@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.7.9";
+const RPC_VERSION: &str = "1.8.0";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;
@@ -279,7 +279,7 @@ pub fn start_embedded(settings: Settings, chain: Arc<Mutex<ChainState>>) -> Resu
     let bind = settings.rpc.bind.clone();
     let listener = prepare_listener(&settings, &bind)?;
     let state = Arc::new(build_server_state(settings, RpcBackend::Embedded(chain))?);
-    println!("QUB HF122 embedded RPC listening on http://{bind}");
+    println!("QUB HF123 embedded RPC listening on http://{bind}");
     println!(
         "RPC mode={} remote={} state_changes=true mining_templates=true",
         state.backend.mode_name(),
@@ -301,7 +301,7 @@ pub fn run_standalone(settings: Settings, bind_override: Option<&str>) -> Result
         settings,
         RpcBackend::StandaloneReadOnly,
     )?);
-    println!("QUB HF122 standalone read-only RPC listening on http://{bind}");
+    println!("QUB HF123 standalone read-only RPC listening on http://{bind}");
     println!("State-changing endpoints require embedded `qubd node` mode.");
     serve(listener, state);
     Ok(())
@@ -960,7 +960,7 @@ fn mining_status_value(state: &Arc<RpcServerState>) -> Result<Value> {
         "cached_jobs":cached_jobs,
         "tracked_jobs_required":true,
         "status":status,
-        "note":"HF122 jobs are exact canonical-parent jobs. Stock Bitcoin Stratum/AxeOS compatibility requires a separate QUB adapter."
+        "note":"HF123 jobs are exact canonical-parent jobs. Stock Bitcoin Stratum/AxeOS compatibility requires a separate QUB adapter."
     }))
 }
 
@@ -1086,7 +1086,7 @@ fn create_templates(
             };
             let counter = state.extra_nonce.load(Ordering::Acquire);
             let id_material = format!(
-                "QUB-HF122-JOB|{}|{}|{}|{}|{}|{}",
+                "QUB-HF123-JOB|{}|{}|{}|{}|{}|{}",
                 state.settings.network.name,
                 parts.height,
                 parts.prev_block_hash,

@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.7.9";
+const APP_VERSION: &str = "v1.8.0";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -154,24 +154,15 @@ fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
     // It is allowed to run longer than a UI snapshot, but the wallet/blocks view
     // must remain visible and refresh through quick local snapshots.
     let now_ms = hf85_now_ms();
+    // HF123/v1.8.0: a catch-up worker is true single-flight. Never release the
+    // gate merely because a slow worker crossed an elapsed-time threshold; that
+    // created phantom completion pulses and status churn while the original
+    // consensus writer was still alive.
     if HF105_CATCHUP_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        let started = HF105_CATCHUP_STARTED_MS.load(Ordering::SeqCst);
-        if now_ms.saturating_sub(started) < 260_000 {
-            return;
-        }
-        // HF106: release a stale detached pulse gate. Any old worker that later
-        // finishes still writes only consensus-validated chain state; fresh pulses
-        // must not be suppressed forever.
-        HF105_CATCHUP_IN_FLIGHT.store(false, Ordering::SeqCst);
-        if HF105_CATCHUP_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
+        return;
     }
     HF105_CATCHUP_STARTED_MS.store(now_ms, Ordering::SeqCst);
     thread::spawn(move || {
@@ -200,30 +191,19 @@ fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
 
 fn hf88_try_begin_snapshot_worker() -> bool {
     let now_ms = hf85_now_ms();
+    // HF123/v1.8.0: snapshot readers are also true single-flight. The Fast
+    // Chain Engine/live canonical owner removes the old JSON-reader deadlock;
+    // starting a replacement reader while the first one is alive only produces
+    // duplicate scans and misleading UI completion events.
     if HF105_SNAPSHOT_WORKER_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
         HF105_SNAPSHOT_WORKER_STARTED_MS.store(now_ms, Ordering::SeqCst);
-        return true;
+        true
+    } else {
+        false
     }
-
-    // HF106: an abandoned UI snapshot worker may still be waiting on disk/JSON.
-    // Do not queue another reader behind it; that was the HF84-HF87 loop. Only
-    // allow a replacement after a hard timeout so the UI can recover from a
-    // genuinely wedged worker while still avoiding reader stampedes.
-    let started = HF105_SNAPSHOT_WORKER_STARTED_MS.load(Ordering::SeqCst);
-    if now_ms.saturating_sub(started) >= 180_000 {
-        HF105_SNAPSHOT_WORKER_IN_FLIGHT.store(false, Ordering::SeqCst);
-        if HF105_SNAPSHOT_WORKER_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            HF105_SNAPSHOT_WORKER_STARTED_MS.store(now_ms, Ordering::SeqCst);
-            return true;
-        }
-    }
-    false
 }
 
 fn hf88_finish_snapshot_worker() {
@@ -1407,6 +1387,8 @@ struct QubCoreApp {
     prefs: GuiPrefs,
     snapshot: ChainSnapshot,
     status_line: String,
+    status_history: VecDeque<String>,
+    last_recorded_status: String,
     last_error: Option<String>,
     last_success: Option<String>,
     last_block_card: Option<BlockCard>,
@@ -1813,6 +1795,8 @@ impl QubCoreApp {
             prefs,
             snapshot: ChainSnapshot::default(),
             status_line: "Ready.".to_string(),
+            status_history: VecDeque::from(["[+0s] Ready.".to_string()]),
+            last_recorded_status: "Ready.".to_string(),
             last_error: None,
             last_success: None,
             last_block_card: None,
@@ -2612,18 +2596,12 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 if self.snapshot_in_flight {
                     let elapsed = self.last_refresh.elapsed().as_secs();
                     if !self.initial_loading && elapsed > 90 {
-                        self.snapshot_in_flight = false;
-                        self.snapshot_rx = None;
-                        self.hf88_snapshot_timeout_count = self.hf88_snapshot_timeout_count.saturating_add(1);
-                        let backoff_secs = match self.hf88_snapshot_timeout_count {
-                            0 | 1 => 20,
-                            2 => 45,
-                            _ => 90,
-                        };
-                        self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(backoff_secs));
-                        self.last_error = Some(format!("QUB Core snapshot worker exceeded 90s and was released. Local UI stays live; next quick local refresh is backed off for {backoff_secs}s while detached catch-up continues."));
-                        self.hf86_force_quick_snapshot = true;
-                        self.last_refresh = Instant::now();
+                        // HF123: keep the one real worker attached. Releasing the
+                        // receiver/gate while the worker was still alive produced
+                        // repeated readers and rapidly alternating status lines.
+                        self.status_line = format!(
+                            "Fast Chain Engine snapshot is still completing; no duplicate reader was started. {elapsed}s elapsed"
+                        );
                     } else if self.initial_loading && elapsed > 20 {
                         // HF72/v1.5.8: do not keep non-mining users trapped on the
                         // splash screen. The verified startup worker continues in the
@@ -6819,6 +6797,7 @@ impl eframe::App for QubCoreApp {
             apply_visual_tuning(ctx);
             self.last_theme_applied = self.prefs.theme.clone();
         }
+        self.record_status_history();
         self.save_prefs_if_needed();
 
         let active_ui = self.initial_loading
@@ -9312,6 +9291,20 @@ impl QubCoreApp {
         }
     }
 
+    fn record_status_history(&mut self) {
+        let current = self.status_line.trim();
+        if current.is_empty() || current == self.last_recorded_status {
+            return;
+        }
+        let elapsed = self.app_started.elapsed().as_secs();
+        self.status_history
+            .push_back(format!("[+{elapsed}s] {current}"));
+        while self.status_history.len() > 12 {
+            self.status_history.pop_front();
+        }
+        self.last_recorded_status = current.to_string();
+    }
+
     fn local_mined_active(&self) -> bool {
         self.last_local_mined_at
             .map(|at| at.elapsed() <= Duration::from_secs(LOCAL_ACTIVE_DOT_SECS))
@@ -9378,6 +9371,12 @@ impl QubCoreApp {
                     ui.colored_label(color, err);
                 }
             });
+            if self.status_history.len() > 1 {
+                ui.separator();
+                for line in self.status_history.iter().rev().take(4).rev() {
+                    ui.small(egui::RichText::new(line).monospace().weak());
+                }
+            }
         });
     }
 }
@@ -9470,10 +9469,27 @@ fn resolve_app_read_path(path: &str) -> PathBuf {
 }
 
 fn chain_file_height(data_dir: &Path) -> Option<u32> {
-    let raw = std::fs::read_to_string(data_dir.join("chain.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let blocks = json.get("blocks")?.as_array()?;
-    Some(blocks.len().saturating_sub(1) as u32)
+    // HF123/v1.8.0: never parse a 100+ MiB chain.json merely to discover a
+    // sibling data directory height. Prefer the tiny operational metadata and
+    // Fast Chain Engine pointer; legacy JSON is used only as a last-resort
+    // bounded stream scan through the library loader later.
+    for path in [
+        data_dir.join("chain-status.json"),
+        data_dir.join("chain-v2").join("CURRENT.json"),
+    ] {
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue; };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue; };
+        if let Some(height) = value
+            .get("height")
+            .or_else(|| value.get("committed_height"))
+            .and_then(|v| v.as_u64())
+        {
+            if height <= u32::MAX as u64 {
+                return Some(height as u32);
+            }
+        }
+    }
+    None
 }
 
 fn best_sibling_data_dir_for_network(network: &str) -> Option<PathBuf> {
@@ -9712,7 +9728,7 @@ fn build_address_activity_window(settings: &Settings, chain: &ChainState, wallet
     }
 
     let now = unix_time_u32();
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         handle_tx(tx, None, now, Some("Mempool"), 0, &mut known_outputs, &mut rows);
     }
 
@@ -9769,16 +9785,10 @@ fn hf88_read_text_atomicish(path: &Path, label: &str) -> Result<String> {
 }
 
 fn hf88_load_chain_for_gui_snapshot(settings: &Settings) -> Result<ChainState> {
-    let paths = NodePaths::from_settings(settings);
-    paths.ensure_dirs()?;
-    if !paths.chain_file.exists() {
-        // First run / empty data dir: normal initializer is fine because no
-        // detached writer has had a chance to start yet.
-        return load_or_init_chain(settings);
-    }
-    let raw = hf88_read_text_atomicish(&paths.chain_file, "chain.json")?;
-    let persisted: PersistedChainState = serde_json::from_str(&raw)?;
-    ChainState::from_persisted_unchecked_for_ui(persisted, settings)
+    // HF123/v1.8.0: use the embedded canonical owner when available, otherwise
+    // one structurally verified Fast Chain Engine generation. Do not read and
+    // parse the monolithic compatibility export on each UI refresh.
+    load_or_init_chain_for_ui_fast(settings)
 }
 
 fn hf88_load_wallet_for_gui_snapshot(settings: &Settings) -> Result<WalletFile> {
@@ -9814,6 +9824,90 @@ fn read_snapshot_for_payout_startup(config_path: &str, payout_address: &str) -> 
     read_snapshot_for_payout_inner(config_path, payout_address, false, true, false)
 }
 
+#[derive(Clone)]
+struct Hf123GuiDerivedCache {
+    network: String,
+    data_dir: String,
+    height: u32,
+    tip_hash: Hash256,
+    qns_count: usize,
+    qns_by_address: HashMap<String, Vec<String>>,
+    pools_registry: HashMap<Hash256, PoolRecord>,
+    confirmed_jin_ledger: HashMap<String, u128>,
+    qub_jin_state: QubJinInfusionState,
+    verified_governance_state: VerifiedGovernanceState,
+}
+
+fn hf123_gui_derived_cache(
+    settings: &Settings,
+    chain: &ChainState,
+) -> Arc<Hf123GuiDerivedCache> {
+    static CACHE: OnceLock<std::sync::Mutex<Option<Arc<Hf123GuiDerivedCache>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let height = chain.height();
+    let tip_hash = chain.tip_hash();
+    if let Ok(guard) = cache.lock() {
+        if let Some(existing) = guard.as_ref() {
+            if existing.network == settings.network.name
+                && existing.data_dir == settings.node.data_dir
+                && existing.height == height
+                && existing.tip_hash == tip_hash
+            {
+                return Arc::clone(existing);
+            }
+        }
+    }
+
+    let qns_registry = qns_registry_from_blocks(settings, &chain.blocks).unwrap_or_default();
+    let mut qns_by_address: HashMap<String, Vec<String>> = HashMap::new();
+    for record in qns_registry.values() {
+        qns_by_address
+            .entry(record.address.clone())
+            .or_default()
+            .push(record.name.clone());
+    }
+    for names in qns_by_address.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+
+    let pools_registry = pools_registry_from_blocks(settings, &chain.blocks).unwrap_or_default();
+    let confirmed_len = chain.blocks.len().saturating_sub(1);
+    let confirmed_jin_ledger = jin_ledger_from_blocks(settings, &chain.blocks[..confirmed_len])
+        .unwrap_or_default();
+    let qub_jin_state = qub_jin_infusion_state(settings, chain).unwrap_or_else(|_| {
+        QubJinInfusionState {
+            active: false,
+            activation_height: qub_jin_infusion_activation_height(settings),
+            melted_qub_atoms: 0,
+            true_max_qub_atoms: MAX_MONEY_ATOMS,
+            lifetime_infused_jin_units: 0,
+            active_infused_jin_units: 0,
+            units_per_qub_atom: 0,
+            bootstrap_units: qub_jin_bootstrap_units(settings),
+        }
+    });
+    let verified_governance_state =
+        verified_governance_state_from_blocks(settings, &chain.blocks).unwrap_or_default();
+
+    let built = Arc::new(Hf123GuiDerivedCache {
+        network: settings.network.name.clone(),
+        data_dir: settings.node.data_dir.clone(),
+        height,
+        tip_hash,
+        qns_count: qns_registry.len(),
+        qns_by_address,
+        pools_registry,
+        confirmed_jin_ledger,
+        qub_jin_state,
+        verified_governance_state,
+    });
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(Arc::clone(&built));
+    }
+    built
+}
+
 fn jin_balance_units_for_address_confirmed(settings: &Settings, chain: &ChainState, address: &str, min_confirmations: u32) -> Result<u128> {
     Address::parse_with_prefix(address, &settings.network.address_prefix)?;
     let keep = min_confirmations.saturating_sub(1) as usize;
@@ -9841,13 +9935,11 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     if let Ok(payout) = Address::parse_with_prefix(payout_address.trim(), &settings.network.address_prefix) {
         wallet_scripts.insert(payout.script_pubkey().0);
     }
-    let qns_registry = qns_registry_from_blocks(&settings, &chain.blocks).unwrap_or_default();
-    let mut qns_by_address: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for rec in qns_registry.values() { qns_by_address.entry(rec.address.clone()).or_default().push(rec.name.clone()); }
-    for names in qns_by_address.values_mut() { names.sort(); }
+    let derived = hf123_gui_derived_cache(&settings, &chain);
+    let qns_by_address = &derived.qns_by_address;
     let spendable = chain.balance_for_scripts(&wallet_scripts, &settings, false);
     let total = chain.balance_for_scripts(&wallet_scripts, &settings, true);
-    let pools_registry = pools_registry_from_blocks(&settings, &chain.blocks).unwrap_or_default();
+    let pools_registry = &derived.pools_registry;
 
     let recent_blocks = chain.blocks
         .iter()
@@ -9907,17 +9999,16 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     // HF106/v1.6.9: GUI balances show JIN only after 2+ confirmations.
     // Pending mempool JIN purchases/transfers still appear in Address Activity,
     // but the spendable JIN balance no longer jumps optimistically on buy.
-    let jin_total = if display_address_for_jin.is_empty() { 0 } else { jin_balance_units_for_address_confirmed(&settings, &chain, &display_address_for_jin, 2).unwrap_or(0) };
-    let qub_jin_state = qub_jin_infusion_state(&settings, &chain).unwrap_or_else(|_| QubJinInfusionState {
-        active: false,
-        activation_height: qub_jin_infusion_activation_height(&settings),
-        melted_qub_atoms: 0,
-        true_max_qub_atoms: MAX_MONEY_ATOMS,
-        lifetime_infused_jin_units: 0,
-        active_infused_jin_units: 0,
-        units_per_qub_atom: 0,
-        bootstrap_units: qub_jin_bootstrap_units(&settings),
-    });
+    let jin_total = if display_address_for_jin.is_empty() {
+        0
+    } else {
+        derived
+            .confirmed_jin_ledger
+            .get(&display_address_for_jin)
+            .copied()
+            .unwrap_or(0)
+    };
+    let qub_jin_state = derived.qub_jin_state.clone();
 
     let wallet_addresses = wallet.keys.iter().map(|k| k.address.clone()).collect::<std::collections::HashSet<_>>();
     let mut pools = pools_registry.values().map(|pool| {
@@ -9947,7 +10038,7 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     }).collect::<Vec<_>>();
     pools.sort_by(|a, b| a.created_height.cmp(&b.created_height).then(a.pool_id.cmp(&b.pool_id)));
     let pools_count = pools_registry.len().max(pools.len());
-    let verified_governance_state = verified_governance_state_from_blocks(&settings, &chain.blocks).unwrap_or_default();
+    let verified_governance_state = derived.verified_governance_state.clone();
     let verified_wallets_count = verified_governance_state.wallets.len();
     let verified_pools_count = verified_governance_state.pools.len();
     let report_cases_count = verified_governance_state.reports.len();
@@ -10086,7 +10177,7 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
         halving_interval: settings.consensus.subsidy_halving_interval,
         pow_bits: settings.consensus.pow_bits.clone(),
         data_dir: settings.node.data_dir.clone(),
-        qns_count: qns_registry.len(),
+        qns_count: derived.qns_count,
         pools_count,
         verified_wallets_count,
         verified_pools_count,

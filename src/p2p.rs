@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.7.9/"; // HF122
+const USER_AGENT: &str = "/QUB Core:1.8.0/"; // HF123 Fast Chain Engine
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -473,6 +473,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
     }
 
     let chain = Arc::new(Mutex::new(load_or_init_chain(&settings)?));
+    register_live_chain(&settings, &chain);
     if settings.rpc.enabled {
         crate::rpc::start_embedded(settings.clone(), chain.clone())?;
     }
@@ -613,102 +614,81 @@ pub fn run_node(settings: Settings) -> Result<()> {
             }
         }
 
-        if let Ok(disk_chain) = load_or_init_chain(&settings) {
-            let mut relay_after_merge = Vec::<Transaction>::new();
+        // HF123/v1.8.0 Fast Chain Engine: chain.json is no longer a thread
+        // communication bus. The canonical Arc is authoritative. A lightweight
+        // pointer comparison detects state committed by another process and only
+        // then loads one immutable Fast Chain Engine generation.
+        let committed_identity = fast_storage_identity(&settings).ok().flatten();
+        let memory_identity = live_chain_identity(&settings);
+        let committed_changed = match (committed_identity.as_ref(), memory_identity.as_ref()) {
+            (Some(committed), Some(memory)) => {
+                committed.committed_height != memory.committed_height
+                    || committed.tip_hash != memory.tip_hash
+                    || committed.mempool_digest != memory.mempool_digest
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        let mut relay_after_merge = Vec::<Transaction>::new();
+        if committed_changed {
+            match load_committed_chain(&settings, false) {
+                Ok(disk_chain) => {
+                    let mut local = chain.lock().expect("chain mutex poisoned");
+                    relay_after_merge.extend(merge_mempool_from_chain(
+                        &mut local,
+                        &disk_chain,
+                        &settings,
+                    ));
+                    if disk_chain.height() > local.height()
+                        || (disk_chain.height() == local.height()
+                            && disk_chain.tip_hash() != local.tip_hash())
+                    {
+                        let mut adopted = disk_chain;
+                        let keep_mempool = local.reorg_mempool_candidates_for(&adopted);
+                        adopted.rebuild_mempool_from(keep_mempool, &settings);
+                        relay_after_merge.extend(adopted.mempool.iter().take(64).cloned());
+                        *local = adopted;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("HF123 committed-state reconcile skipped: {err:#}");
+                }
+            }
+        }
+
+        let mempool_for_periodic = if last_mempool_relay.elapsed() >= Duration::from_secs(6) {
+            last_mempool_relay = Instant::now();
             let mut local = chain.lock().expect("chain mutex poisoned");
-
-            // HF75/v1.5.8: mempool preservation has priority over disk/memory
-            // chain-tip reconciliation. GUI/CLI actions update chain.json first;
-            // the embedded node must merge those txs before it ever writes its
-            // in-memory chain back to disk, otherwise pending JIN/Library/Blast/
-            // MultiSend txs can appear for hours and then vanish during a later
-            // sync/adoption cycle.
-            relay_after_merge.extend(merge_mempool_from_chain(&mut local, &disk_chain, &settings));
-
-            if disk_chain.height() > local.height() || disk_chain.tip_hash() != local.tip_hash() {
-                // HF107/v1.6.9: if a detached catch-up/repair worker wrote a taller
-                // validated chain to disk, the embedded P2P node must adopt it into
-                // memory, not overwrite it with an older in-memory tip on the next
-                // heartbeat. This was a likely cause of nodes visibly knowing
-                // network #N but staying frozen at local #(N-k).
-                if disk_chain.height() > local.height() {
-                    let mut adopted = disk_chain.clone();
-                    // HF117: if disk was advanced by a catch-up worker while the
-                    // embedded node still held a stale in-memory suffix, resurrect
-                    // txs from that replaced suffix before overwriting memory.
-                    let keep_mempool = local.reorg_mempool_candidates_for(&adopted);
-                    adopted.rebuild_mempool_from(keep_mempool, &settings);
-                    relay_after_merge.extend(adopted.mempool.iter().take(64).cloned());
-                    *local = adopted;
-                    let _ = save_chain(&settings, &local);
-                } else {
-                    let disk_blocks = disk_chain.blocks.clone();
-                    match local.try_adopt_peer_chain(disk_blocks, &settings, false) {
-                        Ok(true) => {
-                            relay_after_merge.extend(merge_mempool_from_chain(
-                                &mut local,
-                                &disk_chain,
-                                &settings,
-                            ));
-                            let _ = save_chain(&settings, &local);
-                        }
-                        Ok(false) => {
-                            if local.tip_hash() != disk_chain.tip_hash()
-                                || !relay_after_merge.is_empty()
-                            {
-                                let _ = save_chain(&settings, &local);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = save_chain(&settings, &local);
-                        }
+            if let Ok(report) = reconcile_pending_txs(&settings, &mut local) {
+                if report.reaccepted > 0 {
+                    if let Err(err) = save_chain(&settings, &local) {
+                        eprintln!("HF123 pending-outbox persistence failed: {err:#}");
                     }
                 }
-            } else if disk_chain.tip_hash() == local.tip_hash()
-                && disk_chain.mempool_txids() != local.mempool_txids()
-            {
-                // HF76/v1.5.8: persist either direction of mempool merge. HF75 saved only
-                // when disk contributed new txs; if the embedded node had accepted peer txs
-                // while disk had fewer, the next GUI/status read could see them as vanished.
-                let _ = save_chain(&settings, &local);
             }
-            let mempool_for_periodic = if last_mempool_relay.elapsed() >= Duration::from_secs(6) {
-                last_mempool_relay = Instant::now();
-                // HF117: recover exact wallet-created txs from the persistent
-                // outbox before the periodic relay snapshot. This covers the case
-                // where a tx left mempool in a stale block and the GUI is idle.
-                if let Ok(report) = reconcile_pending_txs(&settings, &mut local) {
-                    if report.reaccepted > 0 {
-                        let _ = save_chain(&settings, &local);
-                    }
-                }
-                let mut txs = local
-                    .mempool
-                    .iter()
-                    .filter(|tx| hf106_jin_sale_standardness_policy(tx, &settings).is_ok())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                // HF107/v1.6.9: pool shares and zero-fee protocol markers need
-                // fast relay or pool membership appears to vanish before a block
-                // sees it. Do not rebroadcast non-standard huge JIN sale buys;
-                // otherwise the hot-potato tx re-enters every miner's mempool.
-                txs.sort_by_key(|tx| {
-                    (
-                        mempool_template_priority(&settings, tx),
-                        tx.txid().to_string(),
-                    )
-                });
-                txs.into_iter().take(96).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            drop(local);
-            for tx in relay_after_merge
-                .into_iter()
-                .chain(mempool_for_periodic.into_iter())
-            {
-                let _ = relay_tx_to_known_peers(&settings, &tx, None);
-            }
+            let mut txs = local
+                .mempool
+                .iter()
+                .filter(|tx| hf106_jin_sale_standardness_policy(tx, &settings).is_ok())
+                .cloned()
+                .collect::<Vec<_>>();
+            txs.sort_by_key(|tx| {
+                (
+                    mempool_template_priority(&settings, tx),
+                    tx.txid().to_string(),
+                )
+            });
+            txs.into_iter().take(96).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        for tx in relay_after_merge
+            .into_iter()
+            .chain(mempool_for_periodic.into_iter())
+        {
+            let _ = relay_tx_to_known_peers(&settings, &tx, None);
         }
         // HF88/v1.6.2: outbound loop is the always-on lifeline. Keep a bounded
         // catch-up heartbeat running even if the GUI is idle or inbound bind is
@@ -3172,7 +3152,7 @@ fn apply_official_snapshot_fast_path(
         == Some(local_before.tip_hash())
     {
         let mut repaired = local_before.clone();
-        repaired.mempool.clear();
+        Arc::make_mut(&mut repaired.mempool).clear();
         let mut connected = 0usize;
         for block in persisted.blocks.into_iter().skip(local_height as usize + 1) {
             repaired.connect_block(block, settings)?;
@@ -3256,7 +3236,7 @@ fn apply_official_tail_snapshot(
     // tip. Fork repairs still use the full prefix+suffix rebuild path below.
     if anchor == local_height {
         let mut repaired = local_before.clone();
-        repaired.mempool.clear();
+        Arc::make_mut(&mut repaired.mempool).clear();
         let mut appended_from_tail = 0usize;
         for (idx, block) in tail.blocks.into_iter().enumerate() {
             let height = tail.start_height.saturating_add(idx as u32);

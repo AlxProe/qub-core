@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,8 @@ fn run() -> Result<()> {
         "init" => cmd_init(&settings),
         "info" => cmd_info(&settings),
         "status-fast" => cmd_status_fast(&settings),
+        "storage-stats" => cmd_storage_stats(&settings),
+        "export-chain-json" => cmd_export_chain_json(&settings, args.get(1).map(String::as_str)),
         "validate" => { let chain = load_or_init_chain(&settings)?; chain.validate_all(&settings)?; println!("OK height={} bestblockhash={}", chain.height(), chain.tip_hash()); Ok(()) },
         "node" => p2p::run_node(settings.clone()),
         "sync" => cmd_sync(&settings),
@@ -106,16 +108,21 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if !paths.chain_file.exists() {
+    let chain_state_exists = paths.fast_storage_exists() || paths.chain_file.exists();
+    if !chain_state_exists {
         let mut value = serde_json::json!({
             "ok": false,
             "mode": "status-fast",
             "network": settings.network.name,
             "chain_file_exists": false,
+            "fast_storage_exists": false,
+            "storage_engine": "uninitialized",
+            "hf123_fast_chain_engine": true,
             "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
             "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
             "hf121_status_fast": true,
             "hf121_r2_bounded_memory": true,
+            "hf123_single_canonical_owner": live_chain_arc(settings).is_some(),
             "generated_at_unix": now,
             "note": "chain file not found; node may not be initialized yet"
         });
@@ -133,6 +140,14 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
                     "chain_status_file".to_string(),
                     serde_json::Value::String(paths.chain_status_file.display().to_string()),
                 );
+                obj.insert(
+                    "fast_storage_dir".to_string(),
+                    serde_json::Value::String(paths.fast_storage_dir.display().to_string()),
+                );
+                obj.insert(
+                    "fast_pointer_file".to_string(),
+                    serde_json::Value::String(paths.fast_pointer_file.display().to_string()),
+                );
             }
         }
         return Ok(value);
@@ -140,6 +155,7 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
 
     let (status, source) = load_fast_chain_status(settings)?;
     let source_name = match source {
+        FastChainStatusSource::FastStorageMetadata => "fast-chain-engine-metadata",
         FastChainStatusSource::Metadata => "chain-status-metadata",
         FastChainStatusSource::StreamScan => "bounded-memory-stream-scan",
     };
@@ -152,7 +168,16 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "mode": "status-fast",
         "status_source": source_name,
         "network": status.network,
-        "chain_file_exists": true,
+        "storage_engine": status.storage_engine,
+        "storage_generation": status.storage_generation,
+        "state_revision": status.state_revision,
+        "primary_state_bytes": status.primary_state_bytes,
+        "journal_bytes": status.journal_bytes,
+        "mempool_tx_count": status.mempool_tx_count,
+        "mempool_digest": status.mempool_digest.to_string(),
+        "recent_blocks": status.recent_blocks,
+        "chain_file_exists": paths.chain_file.exists(),
+        "fast_storage_exists": paths.fast_storage_exists(),
         "chain_file_bytes": status.chain_file_bytes,
         "height": status.height,
         "tip_hash": status.tip_hash.to_string(),
@@ -168,6 +193,8 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "hf120_protocol_epoch_2_unchanged": epoch_height == MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT || settings.network.name != "mainnet",
         "hf121_status_fast": true,
         "hf121_r2_bounded_memory": true,
+        "hf123_fast_chain_engine": true,
+        "hf123_single_canonical_owner": live_chain_arc(settings).is_some(),
         "generated_at_unix": now,
         "status_generated_at_unix": status.generated_at_unix,
         "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
@@ -187,10 +214,45 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
                 "chain_status_file".to_string(),
                 serde_json::Value::String(paths.chain_status_file.display().to_string()),
             );
+            obj.insert(
+                "fast_storage_dir".to_string(),
+                serde_json::Value::String(paths.fast_storage_dir.display().to_string()),
+            );
+            obj.insert(
+                "fast_pointer_file".to_string(),
+                serde_json::Value::String(paths.fast_pointer_file.display().to_string()),
+            );
         }
     }
 
     Ok(value)
+}
+
+fn cmd_storage_stats(settings: &Settings) -> Result<()> {
+    let stats = fast_storage_stats(settings)?;
+    println!("{}", serde_json::to_string_pretty(&stats)?);
+    Ok(())
+}
+
+fn cmd_export_chain_json(settings: &Settings, output: Option<&str>) -> Result<()> {
+    let paths = NodePaths::from_settings(settings);
+    let target = output
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths.data_dir.join("chain-export.json"));
+    let (height, tip_hash, bytes) = export_chain_json(settings, &target)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "network": settings.network.name,
+            "height": height,
+            "tip_hash": tip_hash.to_string(),
+            "bytes": bytes,
+            "output": target.display().to_string(),
+            "storage_engine": HF123_FAST_STORAGE_MAGIC,
+        }))?
+    );
+    Ok(())
 }
 
 fn cmd_info(settings: &Settings) -> Result<()> {
@@ -473,7 +535,7 @@ fn cmd_jin_balance(settings: &Settings, address: Option<&str>) -> Result<()> {
 fn cmd_mempool(settings: &Settings) -> Result<()> {
     let chain = load_or_init_chain(settings)?;
     println!("mempooltx: {}", chain.mempool.len());
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         println!("{}", tx.txid());
     }
     Ok(())
@@ -487,7 +549,7 @@ fn cmd_relay_mempool(settings: &Settings) -> Result<()> {
     }
     let mut txs = 0usize;
     let mut peers_total = 0usize;
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         txs += 1;
         match p2p::broadcast_tx(settings, tx) {
             Ok(sent) => peers_total = peers_total.saturating_add(sent),
@@ -2338,6 +2400,52 @@ fn read_http_header(stream: &mut TcpStream, max_bytes: usize) -> Result<String> 
 
 const EXPLORER_MAX_ACTIVE_CONNECTIONS: usize = 32;
 
+#[derive(Clone)]
+struct ExplorerChainCacheEntry {
+    identity: FastStorageIdentity,
+    chain: Arc<ChainState>,
+}
+
+fn explorer_chain_cache() -> &'static StdMutex<HashMap<String, ExplorerChainCacheEntry>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, ExplorerChainCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
+    // Embedded mode can clone the canonical view in O(1): HF123 ChainState
+    // snapshots share immutable blocks/UTXOs/mempool through copy-on-write Arcs.
+    if let Some(chain) = live_chain_snapshot(settings) {
+        return Ok(Arc::new(chain));
+    }
+
+    if let Some(identity) = fast_storage_identity(settings)? {
+        let key = settings.node.data_dir.clone();
+        if let Ok(cache) = explorer_chain_cache().lock() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.identity == identity {
+                    return Ok(Arc::clone(&entry.chain));
+                }
+            }
+        }
+
+        let chain = Arc::new(load_committed_chain(settings, false)?);
+        if let Ok(mut cache) = explorer_chain_cache().lock() {
+            cache.insert(
+                key,
+                ExplorerChainCacheEntry {
+                    identity,
+                    chain: Arc::clone(&chain),
+                },
+            );
+        }
+        return Ok(chain);
+    }
+
+    // Pre-migration compatibility path. Normal HF123 operation reaches this at
+    // most during first-run migration.
+    Ok(Arc::new(load_or_init_chain_for_ui_fast(settings)?))
+}
+
 struct ActiveConnectionGuard {
     active: Arc<AtomicUsize>,
 }
@@ -2353,7 +2461,7 @@ fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
         .with_context(|| format!("failed to bind explorer API on {bind}"))?;
     println!("QUB Explorer API listening on http://{bind}");
     println!("Network={}", settings.network.name);
-    println!("Read-only mode: chain-backed routes reload chain state; status-fast uses operational metadata.");
+    println!("Read-only mode: chain-backed routes use the live canonical owner when embedded, otherwise the Fast Chain Engine snapshot.");
 
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -2447,11 +2555,11 @@ fn explorer_route(
     if path == "/status-fast" || path == "/api/v1/status-fast" {
         return status_fast_json(settings, false);
     }
-    let chain = load_or_init_chain(settings)?;
+    let chain = explorer_chain_snapshot(settings)?;
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.7.9",
+            "version": "1.8.0",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -2665,7 +2773,7 @@ fn explorer_tx(settings: &Settings, chain: &ChainState, txid: &str) -> Result<se
             }
         }
     }
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         if tx.txid().to_string() == txid {
             return Ok(
                 serde_json::json!({"network": settings.network.name, "status": "mempool", "confirmations": 0, "tx": tx_json(settings, chain, tx, None)}),
@@ -2740,7 +2848,7 @@ fn explorer_address(
         }));
     }
 
-    for tx in &chain.mempool {
+    for tx in chain.mempool.iter() {
         for (vout, out) in tx.outputs.iter().enumerate() {
             if out.script_pubkey.0 == script {
                 history.push(serde_json::json!({"kind":"mempool_received", "height": null, "txid": tx.txid().to_string(), "vout": vout, "value_atoms": out.value.atoms(), "value_qub": amount_string(out.value.atoms())}));
@@ -2816,7 +2924,7 @@ fn explorer_search(settings: &Settings, chain: &ChainState, q: &str) -> Result<s
                 }
             }
         }
-        for tx in &chain.mempool {
+        for tx in chain.mempool.iter() {
             if tx.txid().to_string() == q {
                 return Ok(serde_json::json!({"type":"tx", "txid": q, "status":"mempool"}));
             }
@@ -3261,5 +3369,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.7.9\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.0\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.7.9'
+$Version = '1.8.0'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
@@ -66,16 +66,14 @@ Copy-Item (Join-Path $ReleaseDir 'qub-rpc-miner.exe') (Join-Path $Dist 'tools\qu
 Copy-Item (Join-Path $Root 'config\*.toml') (Join-Path $Dist 'config')
 if (Test-Path (Join-Path $Root 'README-MINER-WINDOWS.md')) { Copy-Item (Join-Path $Root 'README-MINER-WINDOWS.md') $Dist }
 foreach ($Doc in @(
+    'README-FAST-CHAIN-ENGINE.md',
     'README-RPC-MINER.md',
-    'RELEASE_NOTES-v1.7.9-HF122.md',
-    'HF122-v179-SECURITY-REVIEW.md',
-    'QUB-Public-Release-Checksums-and-Signing-v1.7.9.md',
+    'RELEASE_NOTES-v1.8.0-HF123.md',
+    'HF123-v180-ENTERPRISE-REVIEW.md',
+    'HF123-v180-DEPLOY-RUNBOOK.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
-    'QUB-Windows-Code-Signing-v1.7.9.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
-    'QUB-Mainnet-Release-Readiness-v1.7.9.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',
-    'QUB-Automatic-Discovery-Production-Runbook-v1.7.9.md',
     'QUB-Automatic-Discovery-Production-Runbook-v1.0.0.md'
 )) {
     $DocPath = Join-Path $Root $Doc
@@ -282,7 +280,7 @@ foreach ($Asset in @(
     if (Test-Path $Path) { Copy-Item -Force $Path (Join-Path $Dist 'assets') }
 }
 
-# HF102/v1.7.9: copy every runtime asset that exists, not only the legacy allow-list.
+# HF123/v1.8.0: copy every runtime asset that exists, not only the legacy allow-list.
 # This prevents new bridge/UI icons (eth/usdt/usdc/usdj/enj/subscan/nftio/verified/etc.)
 # from appearing in local smoke but missing from live update bundles.
 $AssetRoot = Join-Path $Root 'assets'
@@ -339,7 +337,7 @@ if (-not $SkipPreflight) {
 if ($Sign) {
     $SignTool = Find-SignTool
     $Description = "Qubit Coin Core v$Version"
-    $ExeFiles = @((Join-Path $Dist 'QUB-Core.exe'), (Join-Path $Dist 'tools\qubd.exe'))
+    $ExeFiles = @((Join-Path $Dist 'QUB-Core.exe'), (Join-Path $Dist 'tools\qubd.exe'), (Join-Path $Dist 'tools\qub-rpc-miner.exe'))
     foreach ($Exe in $ExeFiles) {
         if (-not (Test-Path $Exe)) { throw "Missing executable to sign: $Exe" }
         $SignArgs = @('sign', '/fd', 'SHA256', '/td', 'SHA256', '/tr', $TimestampUrl, '/d', $Description)
