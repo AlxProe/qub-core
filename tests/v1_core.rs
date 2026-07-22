@@ -1163,3 +1163,753 @@ fn hf123_migrates_valid_legacy_chain_once() {
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
+
+fn hf124_pool_fixture(
+) -> (
+    Settings,
+    ChainState,
+    WalletFile,
+    Address,
+    Hash256,
+    WalletKey,
+    MiningOptions,
+) {
+    let mut settings = regtest();
+    // Keep the template scan budget small enough to prove that a backlog of
+    // priority-0 pool shares cannot hide an ordinary transaction beyond it.
+    settings.consensus.max_block_transactions = 160;
+    let mut chain = ChainState::new_with_genesis(&settings).unwrap();
+    let mut manager_wallet = WalletFile::new(&settings.network.name);
+    let manager_key = manager_wallet.create_key(&settings, "manager", 0).unwrap();
+    let manager = Address::parse_with_prefix(
+        &manager_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let mut share_wallet = WalletFile::new(&settings.network.name);
+    let share_key = share_wallet
+        .create_key(&settings, "share-miner", 0)
+        .unwrap();
+    let options = MiningOptions {
+        duty_cycle_percent: 100,
+        max_hashes: Some(5_000_000),
+    };
+
+    for _ in 0..8 {
+        let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+        chain.connect_block(block, &settings).unwrap();
+    }
+
+    let create = manager_wallet
+        .create_pool_create_transaction(
+            &chain,
+            &settings,
+            "HF124 Liveness Pool",
+            &manager,
+            500,
+            settings.pools.base_capacity_slots,
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let pool_id = create.txid();
+    chain
+        .accept_transaction_to_mempool(create, &settings)
+        .unwrap();
+    let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+    chain.connect_block(block, &settings).unwrap();
+
+    (
+        settings,
+        chain,
+        manager_wallet,
+        manager,
+        pool_id,
+        share_key,
+        options,
+    )
+}
+
+fn hf124_make_pool_shares(
+    settings: &Settings,
+    chain: &ChainState,
+    pool_id: Hash256,
+    share_key: &WalletKey,
+    count: usize,
+    nonce_cursor: &mut u64,
+) -> Vec<Transaction> {
+    let parent_height = chain.height();
+    let parent_hash = chain.tip_hash();
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        let nonce = *nonce_cursor;
+        *nonce_cursor = nonce.wrapping_add(1);
+        if pool_share_meets_target(
+            settings,
+            pool_id,
+            &share_key.address,
+            parent_height,
+            parent_hash,
+            nonce,
+        )
+        .unwrap()
+        {
+            out.push(
+                create_pool_share_transaction(
+                    settings,
+                    pool_id,
+                    share_key,
+                    parent_height,
+                    parent_hash,
+                    nonce,
+                )
+                .unwrap(),
+            );
+        }
+    }
+    out
+}
+
+#[test]
+fn hf124_candidate_parts_are_reused_without_rebuilding_transaction_selection() {
+    let (settings, mut chain, manager_wallet, manager, _pool_id, _share_key, _options) =
+        hf124_pool_fixture();
+
+    let mut recipient_wallet = WalletFile::new(&settings.network.name);
+    let recipient_key = recipient_wallet
+        .create_key(&settings, "candidate-parts-recipient", 0)
+        .unwrap();
+    let recipient = Address::parse_with_prefix(
+        &recipient_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let ordinary = manager_wallet
+        .create_signed_transaction(
+            &chain,
+            &settings,
+            &recipient,
+            Amount::from_str("1").unwrap(),
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let ordinary_txid = ordinary.txid();
+    chain
+        .accept_transaction_to_mempool(ordinary, &settings)
+        .unwrap();
+
+    let parts = build_candidate_block_parts(
+        &chain,
+        &settings,
+        Some(&manager.to_string()),
+    )
+    .unwrap();
+    assert!(parts
+        .non_coinbase_transactions
+        .iter()
+        .any(|tx| tx.txid() == ordinary_txid));
+
+    let coinbase_a = create_coinbase(parts.height, parts.reward_atoms, &manager, 11).unwrap();
+    let coinbase_b = create_coinbase(parts.height, parts.reward_atoms, &manager, 12).unwrap();
+    let block_a = block_from_candidate_parts(&parts, coinbase_a);
+    let block_b = block_from_candidate_parts(&parts, coinbase_b);
+
+    let expected_tail = parts
+        .non_coinbase_transactions
+        .iter()
+        .map(Transaction::txid)
+        .collect::<Vec<_>>();
+    let tail_a = block_a
+        .transactions
+        .iter()
+        .skip(1)
+        .map(Transaction::txid)
+        .collect::<Vec<_>>();
+    let tail_b = block_b
+        .transactions
+        .iter()
+        .skip(1)
+        .map(Transaction::txid)
+        .collect::<Vec<_>>();
+
+    assert_eq!(tail_a, expected_tail);
+    assert_eq!(tail_b, expected_tail);
+    assert_ne!(block_a.transactions[0].txid(), block_b.transactions[0].txid());
+    assert_ne!(block_a.header.merkle_root, block_b.header.merkle_root);
+    assert_eq!(block_a.header.prev_block_hash, parts.prev_block_hash);
+    assert_eq!(block_b.header.prev_block_hash, parts.prev_block_hash);
+    assert_eq!(block_a.header.version, parts.version);
+    assert_eq!(block_b.header.version, parts.version);
+    assert_eq!(block_a.header.bits, parts.bits);
+    assert_eq!(block_b.header.bits, parts.bits);
+}
+
+#[test]
+fn hf124_candidate_caps_pool_shares_and_keeps_ordinary_transactions() {
+    let (
+        settings,
+        mut chain,
+        manager_wallet,
+        manager,
+        pool_id,
+        share_key,
+        options,
+    ) = hf124_pool_fixture();
+    let mut nonce = 0u64;
+    let shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        400,
+        &mut nonce,
+    );
+    let accepted = chain
+        .accept_transactions_to_mempool_batch(shares, &settings)
+        .unwrap();
+    assert_eq!(accepted.len(), 400);
+    assert!(400 > hf115_template_scan_limit(&settings));
+
+    let mut recipient_wallet = WalletFile::new(&settings.network.name);
+    let recipient_key = recipient_wallet
+        .create_key(&settings, "recipient", 0)
+        .unwrap();
+    let recipient = Address::parse_with_prefix(
+        &recipient_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let ordinary = manager_wallet
+        .create_signed_transaction(
+            &chain,
+            &settings,
+            &recipient,
+            Amount::from_str("1").unwrap(),
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let ordinary_txid = ordinary.txid();
+    chain
+        .accept_transaction_to_mempool(ordinary, &settings)
+        .unwrap();
+
+    let parts = build_candidate_block_parts(
+        &chain,
+        &settings,
+        Some(&manager.to_string()),
+    )
+    .unwrap();
+    let selected_shares = parts
+        .non_coinbase_transactions
+        .iter()
+        .filter(|tx| is_pool_share_transaction(tx))
+        .count();
+    assert_eq!(selected_shares, settings.pools.max_share_txs_per_block);
+    assert!(parts
+        .non_coinbase_transactions
+        .iter()
+        .any(|tx| tx.txid() == ordinary_txid));
+
+    let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+    assert_eq!(
+        block
+            .transactions
+            .iter()
+            .skip(1)
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count(),
+        settings.pools.max_share_txs_per_block
+    );
+    assert!(block
+        .transactions
+        .iter()
+        .any(|tx| tx.txid() == ordinary_txid));
+    chain.connect_block(block, &settings).unwrap();
+}
+
+#[test]
+fn hf124_pool_share_mempool_policy_is_bounded_to_confirmable_horizon() {
+    let (settings, mut chain, _wallet, _manager, pool_id, share_key, _options) =
+        hf124_pool_fixture();
+    let limit = hf124_pool_share_mempool_limit(&settings);
+    assert_eq!(
+        limit,
+        settings.pools.max_share_txs_per_block * settings.pools.share_stale_blocks as usize
+    );
+
+    let mut nonce = 0u64;
+    let shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        limit + 1,
+        &mut nonce,
+    );
+    let accepted = chain
+        .accept_transactions_to_mempool_batch(shares, &settings)
+        .unwrap();
+    assert_eq!(accepted.len(), limit);
+    assert_eq!(
+        chain
+            .mempool
+            .iter()
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count(),
+        limit
+    );
+}
+
+#[test]
+fn hf124_consensus_still_rejects_more_than_128_pool_shares() {
+    let (settings, mut chain, _wallet, manager, pool_id, share_key, options) =
+        hf124_pool_fixture();
+    let mut nonce = 0u64;
+    let shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        settings.pools.max_share_txs_per_block + 1,
+        &mut nonce,
+    );
+    chain
+        .accept_transactions_to_mempool_batch(shares, &settings)
+        .unwrap();
+
+    let mut block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+    let selected = block
+        .transactions
+        .iter()
+        .map(Transaction::txid)
+        .collect::<std::collections::HashSet<_>>();
+    let extra = chain
+        .mempool
+        .iter()
+        .find(|tx| is_pool_share_transaction(tx) && !selected.contains(&tx.txid()))
+        .cloned()
+        .expect("one capped share remains outside the candidate");
+    block.transactions.push(extra);
+    block.header.merkle_root = merkle_root(
+        &block
+            .transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>(),
+    );
+    block.header.nonce = 0;
+    while !verify_header_pow(&block.header).unwrap() {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+
+    let err = chain.connect_block(block, &settings).unwrap_err();
+    assert!(err.to_string().contains("too many pool share txs in block"));
+}
+
+#[test]
+fn hf124_candidate_drains_oldest_confirmable_shares_first() {
+    let (settings, mut chain, _wallet, manager, pool_id, share_key, options) =
+        hf124_pool_fixture();
+    let first_parent = chain.height();
+    let mut nonce = 0u64;
+    let old_shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        200,
+        &mut nonce,
+    );
+    assert_eq!(
+        chain
+            .accept_transactions_to_mempool_batch(old_shares, &settings)
+            .unwrap()
+            .len(),
+        200
+    );
+
+    let first_block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+    assert_eq!(
+        first_block
+            .transactions
+            .iter()
+            .skip(1)
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count(),
+        settings.pools.max_share_txs_per_block
+    );
+    chain.connect_block(first_block, &settings).unwrap();
+
+    let old_remaining = chain
+        .mempool
+        .iter()
+        .filter_map(parse_pool_share_tx)
+        .filter(|share| share.parent_height == first_parent)
+        .count();
+    assert_eq!(old_remaining, 72);
+
+    let second_parent = chain.height();
+    let new_shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        100,
+        &mut nonce,
+    );
+    assert_eq!(
+        chain
+            .accept_transactions_to_mempool_batch(new_shares, &settings)
+            .unwrap()
+            .len(),
+        100
+    );
+
+    let parts = build_candidate_block_parts(
+        &chain,
+        &settings,
+        Some(&manager.to_string()),
+    )
+    .unwrap();
+    let selected = parts
+        .non_coinbase_transactions
+        .iter()
+        .filter_map(parse_pool_share_tx)
+        .collect::<Vec<_>>();
+
+    assert_eq!(selected.len(), settings.pools.max_share_txs_per_block);
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|share| share.parent_height == first_parent)
+            .count(),
+        72
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|share| share.parent_height == second_parent)
+            .count(),
+        settings.pools.max_share_txs_per_block - 72
+    );
+    assert!(selected
+        .windows(2)
+        .all(|pair| pair[0].parent_height <= pair[1].parent_height));
+}
+
+#[test]
+fn hf124_same_tip_persistence_merges_concurrent_mempool_entries() {
+    let (
+        mut settings,
+        chain,
+        _wallet,
+        _manager,
+        pool_id,
+        share_key,
+        _options,
+    ) = hf124_pool_fixture();
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf124-live-merge-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+
+    save_chain(&settings, &chain).unwrap();
+
+    let mut nonce = 0u64;
+    let shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        2,
+        &mut nonce,
+    );
+    let first_txid = shares[0].txid();
+    let second_txid = shares[1].txid();
+
+    let mut live_state = chain.clone();
+    live_state
+        .accept_transaction_to_mempool(shares[0].clone(), &settings)
+        .unwrap();
+    let live = std::sync::Arc::new(std::sync::Mutex::new(live_state));
+    register_live_chain(&settings, &live);
+
+    let mut candidate = chain.clone();
+    candidate
+        .accept_transaction_to_mempool(shares[1].clone(), &settings)
+        .unwrap();
+    save_chain(&settings, &candidate).unwrap();
+
+    let snapshot = live.lock().unwrap().clone();
+    assert!(snapshot.tx_in_mempool(first_txid));
+    assert!(snapshot.tx_in_mempool(second_txid));
+    assert_eq!(snapshot.mempool.len(), 2);
+
+    // Persist the merged owner once and prove both sides survive a fresh load.
+    save_chain(&settings, &snapshot).unwrap();
+    unregister_live_chain(&settings);
+    let reloaded = load_or_init_chain(&settings).unwrap();
+    assert!(reloaded.tx_in_mempool(first_txid));
+    assert!(reloaded.tx_in_mempool(second_txid));
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf124_stale_pool_share_does_not_block_ordinary_mempool_admission() {
+    let (
+        mut settings,
+        mut chain,
+        manager_wallet,
+        manager,
+        pool_id,
+        share_key,
+        options,
+    ) = hf124_pool_fixture();
+
+    let stale_parent = chain.height();
+    let mut nonce = 0u64;
+    let stale_share = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        1,
+        &mut nonce,
+    )
+    .pop()
+    .expect("share generated");
+
+    // Advance beyond the confirmable share horizon without ever admitting the
+    // share. Then emulate an older persisted mempool containing that stale item.
+    for _ in 0..=settings.pools.share_stale_blocks {
+        let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+        chain.connect_block(block, &settings).unwrap();
+    }
+    assert!(chain.height().saturating_sub(stale_parent) > settings.pools.share_stale_blocks);
+    std::sync::Arc::make_mut(&mut chain.mempool).push(stale_share);
+
+    // Force the general mempool-full path. HF124 must prune the unconfirmable
+    // share before applying the ordinary-transaction capacity check.
+    settings.mempool.max_transactions = 1;
+    let mut recipient_wallet = WalletFile::new(&settings.network.name);
+    let recipient_key = recipient_wallet
+        .create_key(&settings, "stale-share-recipient", 0)
+        .unwrap();
+    let recipient = Address::parse_with_prefix(
+        &recipient_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let ordinary = manager_wallet
+        .create_signed_transaction(
+            &chain,
+            &settings,
+            &recipient,
+            Amount::from_str("1").unwrap(),
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let ordinary_txid = ordinary.txid();
+
+    chain
+        .accept_transaction_to_mempool(ordinary, &settings)
+        .unwrap();
+
+    assert_eq!(chain.mempool.len(), 1);
+    assert!(chain.tx_in_mempool(ordinary_txid));
+    assert!(!chain.mempool.iter().any(is_pool_share_transaction));
+}
+
+#[test]
+fn hf124_rebuild_skips_stale_legacy_prefix_and_retains_newer_valid_shares() {
+    let (
+        mut settings,
+        mut chain,
+        _manager_wallet,
+        manager,
+        pool_id,
+        share_key,
+        options,
+    ) = hf124_pool_fixture();
+
+    settings.pools.max_share_txs_per_block = 4;
+    settings.pools.share_stale_blocks = 2;
+    settings.mempool.max_transactions = 8;
+    let share_limit = hf124_pool_share_mempool_limit(&settings);
+    assert_eq!(share_limit, 8);
+
+    let stale_parent_height = chain.height();
+    let mut nonce = 0u64;
+    let stale_shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        share_limit,
+        &mut nonce,
+    );
+
+    for _ in 0..=settings.pools.share_stale_blocks {
+        let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+        chain.connect_block(block, &settings).unwrap();
+    }
+    assert!(
+        chain.height().saturating_sub(stale_parent_height)
+            > settings.pools.share_stale_blocks
+    );
+
+    let valid_parent_height = chain.height();
+    let valid_parent_hash = chain.tip_hash();
+    let valid_shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        share_limit,
+        &mut nonce,
+    );
+
+    // Emulate a pre-HF124 persisted queue sorted with a full stale prefix.
+    // Rebuild must continue scanning past rejected stale entries until the
+    // dedicated share queue is filled by valid newer entries.
+    let mut legacy = stale_shares;
+    legacy.extend(valid_shares);
+    std::sync::Arc::make_mut(&mut chain.mempool).extend(legacy.clone());
+
+    let retained = chain.rebuild_mempool_from(legacy, &settings);
+    assert_eq!(retained, share_limit);
+    assert_eq!(chain.mempool.len(), share_limit);
+    assert!(chain.mempool.iter().all(|tx| {
+        parse_pool_share_tx(tx)
+            .map(|share| {
+                share.parent_height == valid_parent_height
+                    && share.parent_hash == valid_parent_hash
+            })
+            .unwrap_or(false)
+    }));
+}
+
+#[test]
+fn hf124_rebuild_caps_legacy_share_queue_before_general_mempool_limit() {
+    let (
+        mut settings,
+        mut chain,
+        manager_wallet,
+        _manager,
+        pool_id,
+        share_key,
+        _options,
+    ) = hf124_pool_fixture();
+
+    settings.pools.max_share_txs_per_block = 4;
+    settings.pools.share_stale_blocks = 2;
+    settings.mempool.max_transactions = 9;
+    let share_limit = hf124_pool_share_mempool_limit(&settings);
+    assert_eq!(share_limit, 8);
+
+    let mut nonce = 0u64;
+    let shares = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        pool_id,
+        &share_key,
+        share_limit + 4,
+        &mut nonce,
+    );
+
+    let mut recipient_wallet = WalletFile::new(&settings.network.name);
+    let recipient_key = recipient_wallet
+        .create_key(&settings, "rebuild-recipient", 0)
+        .unwrap();
+    let recipient = Address::parse_with_prefix(
+        &recipient_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let ordinary = manager_wallet
+        .create_signed_transaction(
+            &chain,
+            &settings,
+            &recipient,
+            Amount::from_str("1").unwrap(),
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let ordinary_txid = ordinary.txid();
+
+    // Emulate a pre-HF124 persisted queue that exceeded the dedicated share
+    // policy before startup/block-connect revalidation was available.
+    let mut legacy = shares;
+    legacy.push(ordinary);
+    std::sync::Arc::make_mut(&mut chain.mempool).extend(legacy.clone());
+
+    let retained = chain.rebuild_mempool_from(legacy, &settings);
+    assert_eq!(retained, 9);
+    assert_eq!(chain.mempool.len(), 9);
+    assert_eq!(
+        chain
+            .mempool
+            .iter()
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count(),
+        share_limit
+    );
+    assert!(chain.tx_in_mempool(ordinary_txid));
+}
+
+#[test]
+fn hf124_pool_shares_are_not_persisted_or_resurrected_by_wallet_outbox() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf124-share-outbox-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+    let mut chain = ChainState::new_with_genesis(&settings).unwrap();
+
+    let share = Transaction {
+        version: TX_VERSION_POOL_SHARE,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(b"POOLSHARE1|legacy".to_vec()),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 0,
+    };
+
+    remember_pending_tx(&settings, &chain, &share, "legacy-gui-pool-share").unwrap();
+    assert!(load_pending_txs(&settings).unwrap().txs.is_empty());
+
+    // Emulate an old HF117 outbox created before HF124 and prove startup/
+    // heartbeat reconciliation removes the ephemeral share deterministically.
+    let legacy = PendingTxFile {
+        version: 1,
+        network: settings.network.name.clone(),
+        txs: vec![PendingTxRecord {
+            txid: share.txid(),
+            tx: share,
+            label: "legacy-gui-pool-share".to_string(),
+            created_height: chain.height(),
+            created_unix: unix_time_u32() as u64,
+            last_rebroadcast_unix: 0,
+            confirmations_required: HF117_PENDING_TX_CONFIRMATIONS,
+        }],
+    };
+    save_pending_txs(&settings, &legacy).unwrap();
+    let report = reconcile_pending_txs(&settings, &mut chain).unwrap();
+    assert_eq!(report.dropped, 1);
+    assert!(load_pending_txs(&settings).unwrap().txs.is_empty());
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}

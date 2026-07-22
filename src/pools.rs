@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use secp256k1::PublicKey;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
     address_from_script_pubkey, public_key_hash, sign_hash, target_from_compact, verify_hash,
@@ -140,19 +141,39 @@ struct PoolWindowState {
 }
 
 impl PoolWindowState {
-    fn from_blocks(settings: &Settings, blocks: &[Block], spend_height: u32) -> Self {
-        let mut state = Self {
+    fn empty() -> Self {
+        Self {
             active_pool_by_miner: HashMap::new(),
             active_miners_by_pool: HashMap::new(),
             seen_share_keys: HashSet::new(),
-        };
-        let window_start = spend_height.saturating_sub(settings.pools.share_window_blocks);
-        for (height, block) in blocks.iter().enumerate().skip(1) {
+        }
+    }
+
+    fn from_blocks(settings: &Settings, blocks: &[Block], spend_height: u32) -> Self {
+        let mut state = Self::empty();
+
+        // HF124/v1.8.1: a candidate share can only reference one of the
+        // share_stale_blocks immediately preceding the spend height. Active
+        // membership only depends on share_window_blocks. Scanning genesis for
+        // every share admission/template was therefore pure hot-path overhead.
+        let active_start = spend_height.saturating_sub(settings.pools.share_window_blocks);
+        let duplicate_start = spend_height.saturating_sub(settings.pools.share_stale_blocks);
+        let scan_start = active_start.min(duplicate_start).max(1) as usize;
+        let scan_end = (spend_height as usize).min(blocks.len());
+
+        for (height, block) in blocks
+            .iter()
+            .enumerate()
+            .take(scan_end)
+            .skip(scan_start)
+        {
             let height = height as u32;
             for tx in block.transactions.iter().skip(1) {
                 if let Some(share) = parse_pool_share_tx(tx) {
-                    state.seen_share_keys.insert(pool_share_key(&share));
-                    if height >= window_start && height < spend_height {
+                    if height >= duplicate_start {
+                        state.seen_share_keys.insert(pool_share_key(&share));
+                    }
+                    if height >= active_start {
                         state.add_active_unchecked(&share);
                     }
                 }
@@ -173,7 +194,7 @@ impl PoolWindowState {
 
     fn validate_and_add_share(&mut self, share: &PoolShare, pool: &PoolRecord) -> Result<()> {
         let key = pool_share_key(share);
-        if !self.seen_share_keys.insert(key) {
+        if self.seen_share_keys.contains(&key) {
             bail!("duplicate pool share");
         }
         if let Some(existing) = self.active_pool_by_miner.get(&share.miner_address) {
@@ -181,18 +202,281 @@ impl PoolWindowState {
                 bail!("miner address is already active in another pool during the share window");
             }
         }
-        let miners = self.active_miners_by_pool.entry(share.pool_id).or_default();
-        if !miners.contains(&share.miner_address) && miners.len() >= pool.capacity_slots as usize {
+        let (miner_already_active, active_miner_count) = self
+            .active_miners_by_pool
+            .get(&share.pool_id)
+            .map(|miners| {
+                (
+                    miners.contains(&share.miner_address),
+                    miners.len(),
+                )
+            })
+            .unwrap_or((false, 0));
+        if !miner_already_active && active_miner_count >= pool.capacity_slots as usize {
             bail!(
                 "pool is full: active miners {}/{}",
-                miners.len(),
+                active_miner_count,
                 pool.capacity_slots
             );
         }
-        miners.insert(share.miner_address.clone());
+
+        // Mutate the reusable validation context only after every check passes.
+        // A rejected share must not poison a subsequent batch/template attempt.
+        self.seen_share_keys.insert(key);
+        self.active_miners_by_pool
+            .entry(share.pool_id)
+            .or_default()
+            .insert(share.miner_address.clone());
         self.active_pool_by_miner
             .insert(share.miner_address.clone(), share.pool_id);
         Ok(())
+    }
+}
+
+const HF124_POOL_REGISTRY_CACHE_ENTRIES: usize = 8;
+const HF124_POOL_WINDOW_CACHE_ENTRIES: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolRegistryCacheKey {
+    network: String,
+    settings_digest: Hash256,
+    tip_height: u32,
+    tip_hash: Hash256,
+}
+
+#[derive(Debug, Clone)]
+struct PoolRegistryCacheEntry {
+    key: PoolRegistryCacheKey,
+    registry: Arc<HashMap<Hash256, PoolRecord>>,
+}
+
+fn pool_registry_cache() -> &'static Mutex<VecDeque<PoolRegistryCacheEntry>> {
+    static CACHE: OnceLock<Mutex<VecDeque<PoolRegistryCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+#[derive(Debug, Clone)]
+struct PoolWindowCacheEntry {
+    key: PoolRegistryCacheKey,
+    spend_height: u32,
+    window: PoolWindowState,
+}
+
+fn pool_window_cache() -> &'static Mutex<VecDeque<PoolWindowCacheEntry>> {
+    static CACHE: OnceLock<Mutex<VecDeque<PoolWindowCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn pool_registry_settings_digest(settings: &Settings) -> Result<Hash256> {
+    let mut bytes = serde_json::to_vec(&settings.pools)?;
+    bytes.extend_from_slice(settings.network.name.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(settings.network.address_prefix.as_bytes());
+    bytes.push(settings.features.pooled_mining_enabled as u8);
+    Ok(Hash256::double_sha256(&bytes))
+}
+
+fn pool_cache_key(settings: &Settings, blocks: &[Block]) -> Result<PoolRegistryCacheKey> {
+    Ok(PoolRegistryCacheKey {
+        network: settings.network.name.clone(),
+        settings_digest: pool_registry_settings_digest(settings)?,
+        tip_height: blocks.len().saturating_sub(1) as u32,
+        tip_hash: blocks
+            .last()
+            .map(Block::block_hash)
+            .unwrap_or_else(Hash256::zero),
+    })
+}
+
+/// HF124/v1.8.1 local hot-path cache. The key binds the registry to an exact
+/// canonical tip plus every pool/network setting that affects marker parsing.
+/// A direct extension replays only the newly connected block(s); a reorg or
+/// unknown ancestor falls back to the deterministic full reconstruction.
+pub fn cached_pools_registry_from_blocks(
+    settings: &Settings,
+    blocks: &[Block],
+) -> Result<Arc<HashMap<Hash256, PoolRecord>>> {
+    if !settings.pools.enabled || !settings.features.pooled_mining_enabled {
+        return Ok(Arc::new(HashMap::new()));
+    }
+
+    let key = pool_cache_key(settings, blocks)?;
+    let tip_height = key.tip_height;
+
+    let mut cache = pool_registry_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = cache.iter().find(|entry| entry.key == key) {
+        return Ok(entry.registry.clone());
+    }
+
+    // Reuse the newest cached ancestor that is still on this exact branch.
+    // Keeping the lock during replay makes cache refill single-flight under a
+    // pool-share burst; only the first inbound share after a new tip pays it.
+    let ancestor = cache
+        .iter()
+        .filter(|entry| {
+            entry.key.network == key.network
+                && entry.key.settings_digest == key.settings_digest
+                && entry.key.tip_height < tip_height
+                && blocks
+                    .get(entry.key.tip_height as usize)
+                    .map(Block::block_hash)
+                    == Some(entry.key.tip_hash)
+        })
+        .max_by_key(|entry| entry.key.tip_height)
+        .cloned();
+
+    let registry = if let Some(entry) = ancestor {
+        let mut registry = entry.registry.as_ref().clone();
+        for (height, block) in blocks
+            .iter()
+            .enumerate()
+            .skip(entry.key.tip_height.saturating_add(1) as usize)
+        {
+            apply_pool_registry_block(settings, &mut registry, block, height as u32)?;
+        }
+        registry
+    } else {
+        pools_registry_from_blocks(settings, blocks)?
+    };
+    let registry = Arc::new(registry);
+
+    cache.retain(|entry| entry.key != key);
+    cache.push_front(PoolRegistryCacheEntry {
+        key,
+        registry: registry.clone(),
+    });
+    cache.truncate(HF124_POOL_REGISTRY_CACHE_ENTRIES);
+
+    Ok(registry)
+}
+
+fn cached_pool_window_from_blocks(
+    settings: &Settings,
+    blocks: &[Block],
+    spend_height: u32,
+) -> Result<PoolWindowState> {
+    if !settings.pools.enabled || !settings.features.pooled_mining_enabled {
+        return Ok(PoolWindowState::empty());
+    }
+
+    let key = pool_cache_key(settings, blocks)?;
+    let mut cache = pool_window_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(entry) = cache
+        .iter()
+        .find(|entry| entry.key == key && entry.spend_height == spend_height)
+    {
+        return Ok(entry.window.clone());
+    }
+
+    // PoolWindowState scans only the bounded consensus-relevant suffix, but an
+    // inbound share burst can still call admission once per wire message. Cache
+    // that confirmed suffix per exact tip so only the first share after a new
+    // block performs the scan; each admission mutates its own cheap clone.
+    let window = PoolWindowState::from_blocks(settings, blocks, spend_height);
+    cache.retain(|entry| !(entry.key == key && entry.spend_height == spend_height));
+    cache.push_front(PoolWindowCacheEntry {
+        key,
+        spend_height,
+        window: window.clone(),
+    });
+    cache.truncate(HF124_POOL_WINDOW_CACHE_ENTRIES);
+    Ok(window)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PoolValidationContext {
+    registry: Arc<HashMap<Hash256, PoolRecord>>,
+    window: PoolWindowState,
+}
+
+impl PoolValidationContext {
+    pub(crate) fn from_confirmed(
+        settings: &Settings,
+        blocks: &[Block],
+        spend_height: u32,
+    ) -> Result<Self> {
+        Ok(Self {
+            registry: cached_pools_registry_from_blocks(settings, blocks)?,
+            window: cached_pool_window_from_blocks(settings, blocks, spend_height)?,
+        })
+    }
+
+    pub(crate) fn absorb_mempool_shares(
+        &mut self,
+        settings: &Settings,
+        blocks: &[Block],
+        mempool: &[Transaction],
+        spend_height: u32,
+        exclude_txid: Option<Hash256>,
+    ) {
+        for tx in mempool {
+            if exclude_txid == Some(tx.txid()) {
+                continue;
+            }
+            let Some(share) = parse_pool_share_tx(tx) else {
+                continue;
+            };
+            let Some(pool) = self.registry.get(&share.pool_id) else {
+                continue;
+            };
+            if share.parent_height < pool.created_height {
+                continue;
+            }
+            let Some(parent) = blocks.get(share.parent_height as usize) else {
+                continue;
+            };
+            if share.parent_hash != parent.block_hash() {
+                continue;
+            }
+            let age = spend_height.saturating_sub(share.parent_height);
+            if age > 0 && age <= settings.pools.share_stale_blocks {
+                self.window.seen_share_keys.insert(pool_share_key(&share));
+                self.window.add_active_unchecked(&share);
+            }
+        }
+    }
+
+    pub(crate) fn validate_and_apply(
+        &mut self,
+        tx: &Transaction,
+        blocks: &[Block],
+        utxos: &HashMap<OutPoint, CoinRecord>,
+        spend_height: u32,
+        fee_atoms: u64,
+        settings: &Settings,
+    ) -> Result<()> {
+        let has_pool_action = pool_action_count(tx, settings) > 0;
+        let is_share = is_pool_share_transaction(tx);
+        if !has_pool_action && !is_share {
+            return Ok(());
+        }
+        if !settings.features.pooled_mining_enabled || !settings.pools.enabled {
+            bail!("pooled mining is disabled on this network");
+        }
+        if is_share {
+            return validate_share_tx_against_context(
+                tx,
+                settings,
+                blocks,
+                spend_height,
+                self.registry.as_ref(),
+                &mut self.window,
+            );
+        }
+        validate_pool_action_tx(
+            tx,
+            fee_atoms,
+            spend_height,
+            settings,
+            Arc::make_mut(&mut self.registry),
+            utxos,
+        )
     }
 }
 
@@ -254,6 +538,11 @@ pub fn validate_pools_settings(settings: &Settings) -> Result<()> {
     }
     if settings.pools.max_share_txs_per_block == 0 {
         bail!("pools max_share_txs_per_block must be non-zero");
+    }
+    if settings.pools.max_share_txs_per_block.saturating_add(1)
+        > settings.consensus.max_block_transactions
+    {
+        bail!("pools max_share_txs_per_block must leave room for coinbase");
     }
     parse_share_bits(settings)?;
     Ok(())
@@ -602,6 +891,62 @@ pub fn pool_renames_in_tx(tx: &Transaction, settings: &Settings) -> Vec<(usize, 
         .collect()
 }
 
+fn apply_pool_registry_block(
+    settings: &Settings,
+    registry: &mut HashMap<Hash256, PoolRecord>,
+    block: &Block,
+    height: u32,
+) -> Result<()> {
+    if !pools_active(settings, height) {
+        return Ok(());
+    }
+
+    for tx in block.transactions.iter().skip(1) {
+        for (_, create, _) in pool_creates_in_tx(tx, settings) {
+            let pool_id = tx.txid();
+            let price = pool_create_price_atoms(settings, create.capacity_slots)?;
+            registry.insert(
+                pool_id,
+                PoolRecord {
+                    pool_id,
+                    name: create.name,
+                    manager_address: create.manager_address,
+                    commission_bps: create.commission_bps,
+                    capacity_slots: create.capacity_slots,
+                    created_height: height,
+                    create_txid: pool_id,
+                    total_paid_atoms: price,
+                },
+            );
+        }
+        for (_, topup, _) in pool_topups_in_tx(tx, settings) {
+            if let Some(pool) = registry.get_mut(&topup.pool_id) {
+                let price = pool_topup_price_atoms(settings, topup.extra_capacity_slots)?;
+                pool.capacity_slots = pool
+                    .capacity_slots
+                    .saturating_add(topup.extra_capacity_slots)
+                    .min(settings.pools.max_capacity_slots);
+                pool.total_paid_atoms = pool.total_paid_atoms.saturating_add(price);
+            }
+        }
+        for (_, commission, _) in pool_commissions_in_tx(tx, settings) {
+            if let Some(pool) = registry.get_mut(&commission.pool_id) {
+                if commission.new_commission_bps <= pool.commission_bps {
+                    pool.commission_bps = commission.new_commission_bps;
+                }
+            }
+        }
+        for (_, rename, _) in pool_renames_in_tx(tx, settings) {
+            if let Some(pool) = registry.get_mut(&rename.pool_id) {
+                if rename.manager_address == pool.manager_address {
+                    pool.name = rename.new_name;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn pools_registry_from_blocks(
     settings: &Settings,
     blocks: &[Block],
@@ -611,53 +956,7 @@ pub fn pools_registry_from_blocks(
         return Ok(registry);
     }
     for (height, block) in blocks.iter().enumerate().skip(1) {
-        let height = height as u32;
-        if !pools_active(settings, height) {
-            continue;
-        }
-        for tx in block.transactions.iter().skip(1) {
-            for (_, create, _) in pool_creates_in_tx(tx, settings) {
-                let pool_id = tx.txid();
-                let price = pool_create_price_atoms(settings, create.capacity_slots)?;
-                registry.insert(
-                    pool_id,
-                    PoolRecord {
-                        pool_id,
-                        name: create.name,
-                        manager_address: create.manager_address,
-                        commission_bps: create.commission_bps,
-                        capacity_slots: create.capacity_slots,
-                        created_height: height,
-                        create_txid: pool_id,
-                        total_paid_atoms: price,
-                    },
-                );
-            }
-            for (_, topup, _) in pool_topups_in_tx(tx, settings) {
-                if let Some(pool) = registry.get_mut(&topup.pool_id) {
-                    let price = pool_topup_price_atoms(settings, topup.extra_capacity_slots)?;
-                    pool.capacity_slots = pool
-                        .capacity_slots
-                        .saturating_add(topup.extra_capacity_slots)
-                        .min(settings.pools.max_capacity_slots);
-                    pool.total_paid_atoms = pool.total_paid_atoms.saturating_add(price);
-                }
-            }
-            for (_, commission, _) in pool_commissions_in_tx(tx, settings) {
-                if let Some(pool) = registry.get_mut(&commission.pool_id) {
-                    if commission.new_commission_bps <= pool.commission_bps {
-                        pool.commission_bps = commission.new_commission_bps;
-                    }
-                }
-            }
-            for (_, rename, _) in pool_renames_in_tx(tx, settings) {
-                if let Some(pool) = registry.get_mut(&rename.pool_id) {
-                    if rename.manager_address == pool.manager_address {
-                        pool.name = rename.new_name;
-                    }
-                }
-            }
-        }
+        apply_pool_registry_block(settings, &mut registry, block, height as u32)?;
     }
     Ok(registry)
 }
@@ -1128,36 +1427,28 @@ pub fn validate_pools_transaction_against_chain(
     if !has_pool_action && !is_share {
         return Ok(());
     }
-    if !settings.features.pooled_mining_enabled || !settings.pools.enabled {
-        bail!("pooled mining is disabled on this network");
-    }
-    let mut registry = pools_registry_from_blocks(settings, &chain.blocks)?;
-    let mut state = PoolWindowState::from_blocks(settings, &chain.blocks, spend_height);
-    for mem in chain.mempool.iter() {
-        if mem.txid() == tx.txid() {
-            continue;
-        }
-        if let Some(share) = parse_pool_share_tx(mem) {
-            let age = spend_height.saturating_sub(share.parent_height);
-            let parent_known = (share.parent_height as usize) < chain.blocks.len();
-            if parent_known && age > 0 && age <= settings.pools.share_stale_blocks {
-                state.seen_share_keys.insert(pool_share_key(&share));
-                state.add_active_unchecked(&share);
-            }
-        }
-    }
-    if is_share {
-        return validate_share_tx_against_context(
-            tx,
-            settings,
-            &chain.blocks,
-            spend_height,
-            &registry,
-            &mut state,
-        );
-    }
+
+    let mut context = PoolValidationContext::from_confirmed(
+        settings,
+        &chain.blocks,
+        spend_height,
+    )?;
+    context.absorb_mempool_shares(
+        settings,
+        &chain.blocks,
+        &chain.mempool,
+        spend_height,
+        Some(tx.txid()),
+    );
     let fee = crate::validate_tx_contextual(tx, &chain.utxos, spend_height, settings, true)?;
-    validate_pool_action_tx(tx, fee, spend_height, settings, &mut registry, &chain.utxos)
+    context.validate_and_apply(
+        tx,
+        &chain.blocks,
+        &chain.utxos,
+        spend_height,
+        fee,
+        settings,
+    )
 }
 
 pub fn validate_pools_block(
@@ -1186,29 +1477,24 @@ pub fn validate_pools_block(
         );
     }
 
-    let mut registry = pools_registry_from_blocks(settings, prior_blocks)?;
-    let mut state = PoolWindowState::from_blocks(settings, prior_blocks, height);
+    let declared_share_txs = block
+        .transactions
+        .iter()
+        .skip(1)
+        .filter(|tx| is_pool_share_transaction(tx))
+        .count();
+    if declared_share_txs > settings.pools.max_share_txs_per_block {
+        bail!("too many pool share txs in block");
+    }
+
+    let mut context = PoolValidationContext::from_confirmed(settings, prior_blocks, height)?;
     let mut scratch = base_utxos.clone();
     let mut fees = 0u128;
-    let mut share_txs = 0usize;
 
     for tx in block.transactions.iter().skip(1) {
         let fee = crate::validate_tx_contextual(tx, &scratch, height, settings, true)?;
-        if is_pool_share_transaction(tx) {
-            share_txs = share_txs.saturating_add(1);
-            if share_txs > settings.pools.max_share_txs_per_block {
-                bail!("too many pool share txs in block");
-            }
-            validate_share_tx_against_context(
-                tx,
-                settings,
-                prior_blocks,
-                height,
-                &registry,
-                &mut state,
-            )?;
-        } else {
-            validate_pool_action_tx(tx, fee, height, settings, &mut registry, &scratch)?;
+        context.validate_and_apply(tx, prior_blocks, &scratch, height, fee, settings)?;
+        if !is_pool_share_transaction(tx) {
             crate::connect_tx_utxos(tx, &mut scratch, height, false)?;
         }
         fees = fees.checked_add(fee as u128).context("fee overflow")?;
@@ -1330,7 +1616,7 @@ pub fn pool_payout_plan(
     total_amount: u128,
 ) -> Result<PoolPayoutPlan> {
     let height = prior_blocks.len() as u32;
-    let registry = pools_registry_from_blocks(settings, prior_blocks)?;
+    let registry = cached_pools_registry_from_blocks(settings, prior_blocks)?;
     let pool = registry
         .get(&pool_id)
         .context("unknown pool_id for payout")?;

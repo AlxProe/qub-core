@@ -630,6 +630,19 @@ pub fn hf115_template_scan_limit(settings: &Settings) -> usize {
         .min(HF115_MAX_TEMPLATE_SCAN_TXS)
 }
 
+// HF124/v1.8.1 non-consensus liveness policy. A pool share can only be
+// confirmed while its parent is within share_stale_blocks, and each block can
+// include at most max_share_txs_per_block shares. Retaining more than that
+// bounded horizon only amplifies validation, relay and persistence pressure.
+pub fn hf124_pool_share_mempool_limit(settings: &Settings) -> usize {
+    settings
+        .pools
+        .max_share_txs_per_block
+        .max(1)
+        .saturating_mul(settings.pools.share_stale_blocks.max(1) as usize)
+        .min(effective_mempool_max_transactions(settings))
+}
+
 // HF117/v1.7.5 is a non-consensus hotfix. It protects locally-created
 // transactions against stale-chain replacement by keeping exact raw txs in a
 // wallet outbox until finality, and by resurrecting non-coinbase txs from
@@ -1494,12 +1507,156 @@ impl ChainState {
         )
     }
 
+    /// HF124/v1.8.1 local policy cleanup. Shares that cannot possibly be
+    /// confirmed against the current canonical tip must not consume the bounded
+    /// share queue or the general mempool capacity. This is intentionally a
+    /// structural/parent-age prune; full signature/pool validation remains in
+    /// normal admission and deterministic mempool rebuild.
+    fn prune_unconfirmable_pool_shares(&mut self, settings: &Settings) -> usize {
+        let spend_height = self.height().saturating_add(1);
+        let before = self.mempool.len();
+        let blocks = Arc::clone(&self.blocks);
+        Arc::make_mut(&mut self.mempool).retain(|tx| {
+            if !is_pool_share_transaction(tx) {
+                return true;
+            }
+            let Some(share) = parse_pool_share_tx(tx) else {
+                return false;
+            };
+            if share.parent_height >= spend_height {
+                return false;
+            }
+            let age = spend_height.saturating_sub(share.parent_height);
+            if age == 0 || age > settings.pools.share_stale_blocks {
+                return false;
+            }
+            blocks
+                .get(share.parent_height as usize)
+                .map(Block::block_hash)
+                == Some(share.parent_hash)
+        });
+        before.saturating_sub(self.mempool.len())
+    }
+
     pub fn accept_transaction_to_mempool(
         &mut self,
         tx: Transaction,
         settings: &Settings,
     ) -> Result<Hash256> {
-        if self.mempool.len() >= effective_mempool_max_transactions(settings) {
+        let spend_height = self.height().saturating_add(1);
+        let mut pool_context = pools::PoolValidationContext::from_confirmed(
+            settings,
+            &self.blocks,
+            spend_height,
+        )?;
+        pool_context.absorb_mempool_shares(
+            settings,
+            &self.blocks,
+            &self.mempool,
+            spend_height,
+            Some(tx.txid()),
+        );
+        let mut pool_share_count = self
+            .mempool
+            .iter()
+            .filter(|pending| is_pool_share_transaction(pending))
+            .count();
+        self.accept_transaction_to_mempool_with_context(
+            tx,
+            settings,
+            &mut pool_context,
+            &mut pool_share_count,
+        )
+    }
+
+    /// HF124/v1.8.1: validate a bounded inbound batch with one confirmed pool
+    /// registry/window reconstruction. Pool-share bursts previously rebuilt
+    /// that context once per transaction and could monopolize the canonical
+    /// state owner for minutes before the per-block share cap was reached.
+    pub fn accept_transactions_to_mempool_batch<I>(
+        &mut self,
+        txs: I,
+        settings: &Settings,
+    ) -> Result<Vec<Transaction>>
+    where
+        I: IntoIterator<Item = Transaction>,
+    {
+        let spend_height = self.height().saturating_add(1);
+        let mut pool_context = pools::PoolValidationContext::from_confirmed(
+            settings,
+            &self.blocks,
+            spend_height,
+        )?;
+        pool_context.absorb_mempool_shares(
+            settings,
+            &self.blocks,
+            &self.mempool,
+            spend_height,
+            None,
+        );
+        let mut pool_share_count = self
+            .mempool
+            .iter()
+            .filter(|pending| is_pool_share_transaction(pending))
+            .count();
+        let mut accepted = Vec::new();
+        for tx in txs {
+            if self
+                .accept_transaction_to_mempool_with_context(
+                    tx.clone(),
+                    settings,
+                    &mut pool_context,
+                    &mut pool_share_count,
+                )
+                .is_ok()
+            {
+                accepted.push(tx);
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn accept_transaction_to_mempool_with_context(
+        &mut self,
+        tx: Transaction,
+        settings: &Settings,
+        pool_context: &mut pools::PoolValidationContext,
+        pool_share_count: &mut usize,
+    ) -> Result<Hash256> {
+        let incoming_is_share = is_pool_share_transaction(&tx);
+        let total_limit = effective_mempool_max_transactions(settings);
+        let share_limit = hf124_pool_share_mempool_limit(settings);
+        let spend_height = self.height().saturating_add(1);
+        if self.mempool.len() >= total_limit
+            || (incoming_is_share && *pool_share_count >= share_limit)
+        {
+            let removed = self.prune_unconfirmable_pool_shares(settings);
+            if removed > 0 {
+                *pool_share_count = self
+                    .mempool
+                    .iter()
+                    .filter(|pending| is_pool_share_transaction(pending))
+                    .count();
+
+                // The reusable context was created before the structural prune.
+                // Rebuild it from the now-current queue so removed stale/wrong-
+                // parent shares cannot continue to reserve duplicate keys or
+                // active-miner slots for the remainder of this admission batch.
+                *pool_context = pools::PoolValidationContext::from_confirmed(
+                    settings,
+                    &self.blocks,
+                    spend_height,
+                )?;
+                pool_context.absorb_mempool_shares(
+                    settings,
+                    &self.blocks,
+                    &self.mempool,
+                    spend_height,
+                    None,
+                );
+            }
+        }
+        if self.mempool.len() >= total_limit {
             bail!("mempool full");
         }
         let txid = tx.txid();
@@ -1508,42 +1665,70 @@ impl ChainState {
         }
         hf106_jin_sale_standardness_policy(&tx, settings)?;
 
+        if incoming_is_share {
+            if *pool_share_count >= share_limit {
+                bail!("pool share mempool policy full");
+            }
+            validate_tx_contextual(&tx, &self.utxos, spend_height, settings, true)?;
+            pool_context.validate_and_apply(
+                &tx,
+                &self.blocks,
+                &self.utxos,
+                spend_height,
+                0,
+                settings,
+            )?;
+            Arc::make_mut(&mut self.mempool).push(tx);
+            *pool_share_count = (*pool_share_count).saturating_add(1);
+            return Ok(txid);
+        }
+
         // HF117/v1.7.5: reject mempool input conflicts before the expensive
         // JIN/QUB-JIN/Library/QNS contextual validators. This does not change
         // consensus; it makes local mempool behavior deterministic under fast
         // reorg/rebuild pressure and avoids misleading late failures for normal
         // QUB sends.
-        if !is_pool_share_transaction(&tx) {
-            let spent = self
-                .mempool
-                .iter()
-                .flat_map(|t| {
-                    t.inputs
-                        .iter()
-                        .filter(|i| i.previous_output != OutPoint::null())
-                        .map(|i| i.previous_output.clone())
-                })
-                .collect::<HashSet<_>>();
-            for input in &tx.inputs {
-                if input.previous_output != OutPoint::null()
-                    && spent.contains(&input.previous_output)
-                {
-                    bail!("mempool double spend");
-                }
+        let spent = self
+            .mempool
+            .iter()
+            .flat_map(|t| {
+                t.inputs
+                    .iter()
+                    .filter(|i| i.previous_output != OutPoint::null())
+                    .map(|i| i.previous_output.clone())
+            })
+            .collect::<HashSet<_>>();
+        for input in &tx.inputs {
+            if input.previous_output != OutPoint::null()
+                && spent.contains(&input.previous_output)
+            {
+                bail!("mempool double spend");
             }
         }
 
-        let spend_height = self.height() + 1;
         let raw_fee = validate_tx_contextual(&tx, &self.utxos, spend_height, settings, true)?;
         let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, &tx, spend_height)?;
         if raw_fee < qub_melt_burn {
             bail!("QUB melt burn exceeds transaction input-output delta");
         }
         let fee = raw_fee - qub_melt_burn;
-        validate_pools_transaction_against_chain(&tx, self, spend_height, settings)?;
+        let mut pool_context_trial = pool_context.clone();
+        pool_context_trial.validate_and_apply(
+            &tx,
+            &self.blocks,
+            &self.utxos,
+            spend_height,
+            raw_fee,
+            settings,
+        )?;
         let jin_fee_units =
             validate_jin_transaction_against_chain(&tx, self, spend_height, settings)?;
-        validate_qub_jin_infusion_transaction_against_chain(&tx, self, spend_height, settings)?;
+        validate_qub_jin_infusion_transaction_against_chain(
+            &tx,
+            self,
+            spend_height,
+            settings,
+        )?;
         let swap_miner_fee =
             validate_jin_sale_transaction_against_chain(&tx, self, spend_height, settings)?;
         let qns_miner_fee = qns_miner_fee_required_in_tx(settings, &tx, spend_height)?;
@@ -1559,21 +1744,21 @@ impl ChainState {
                 fee
             );
         }
-        if !is_pool_share_transaction(&tx)
-            && !is_blast_claim_transaction(&tx, settings)
+        if !is_blast_claim_transaction(&tx, settings)
             && fee < settings.mempool.min_relay_fee_atoms
             && jin_fee_units == 0
         {
             bail!("fee below min relay fee");
         }
-        validate_qns_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
-        validate_library_transaction_against_chain(&tx, self, self.height() + 1, settings)?;
+        validate_qns_transaction_against_chain(&tx, self, spend_height, settings)?;
+        validate_library_transaction_against_chain(&tx, self, spend_height, settings)?;
         validate_verified_governance_transaction_against_chain(
             &tx,
             self,
-            self.height() + 1,
+            spend_height,
             settings,
         )?;
+        *pool_context = pool_context_trial;
         Arc::make_mut(&mut self.mempool).push(tx);
         Ok(txid)
     }
@@ -1588,39 +1773,104 @@ impl ChainState {
     {
         let old_len = self.mempool.len();
         let mempool_cap = effective_mempool_max_transactions(settings);
-        let mut candidates = Vec::with_capacity(old_len.min(mempool_cap));
-        candidates.extend(txs);
-        candidates.sort_by_cached_key(|tx| {
+        let share_cap = hf124_pool_share_mempool_limit(settings).min(mempool_cap);
+        let mut seen = HashSet::<Hash256>::new();
+        let mut pool_shares = Vec::<Transaction>::new();
+        let mut ordinary = Vec::<Transaction>::new();
+
+        // HF124/v1.8.1: apply the dedicated share policy before the general
+        // mempool cap. Older versions could persist a share-dominated queue;
+        // truncating that mixed list first would discard ordinary QUB/JIN/
+        // Library transactions during startup, block connect or reorg rebuild.
+        for tx in txs {
+            let txid = tx.txid();
+            if !seen.insert(txid) {
+                continue;
+            }
+            if is_pool_share_transaction(&tx) {
+                pool_shares.push(tx);
+            } else {
+                ordinary.push(tx);
+            }
+        }
+        pool_shares.sort_by_cached_key(|tx| {
+            (
+                parse_pool_share_tx(tx)
+                    .map(|share| share.parent_height)
+                    .unwrap_or(u32::MAX),
+                tx.txid().to_string(),
+            )
+        });
+        ordinary.sort_by_cached_key(|tx| {
             (
                 mempool_template_priority(settings, tx),
                 tx.txid().to_string(),
             )
         });
+
         Arc::make_mut(&mut self.mempool).clear();
-        let mut seen = HashSet::<Hash256>::new();
-        let mut pending = Vec::<Transaction>::new();
-        for tx in candidates.into_iter().take(mempool_cap) {
-            let txid = tx.txid();
-            if seen.insert(txid) {
-                pending.push(tx);
-            }
-        }
 
         // HF117/v1.7.5: dependency-aware rebuild. A stale-block suffix can contain
         // parent/child wallet txs. The old one-pass rebuild could drop a valid child
         // if its parent was reaccepted later in the sorted candidate order. Keep this
         // bounded and policy-only: every successful admission still uses the normal
         // mempool validator against the current overlay.
+        let spend_height = self.height().saturating_add(1);
+        let mut pool_context = match pools::PoolValidationContext::from_confirmed(
+            settings,
+            &self.blocks,
+            spend_height,
+        ) {
+            Ok(context) => context,
+            Err(_) => return 0,
+        };
+        let mut pool_share_count = 0usize;
         let mut retained = 0usize;
+
+        // Pool shares have no transaction-dependency chain. Validate them once,
+        // oldest parent first, and keep scanning until the dedicated queue is
+        // actually full. A malformed/stale legacy prefix must not crowd valid
+        // newer shares out merely because it appeared before the policy cutoff.
+        for tx in pool_shares {
+            if self.mempool.len() >= mempool_cap || pool_share_count >= share_cap {
+                break;
+            }
+            if self
+                .accept_transaction_to_mempool_with_context(
+                    tx,
+                    settings,
+                    &mut pool_context,
+                    &mut pool_share_count,
+                )
+                .is_ok()
+            {
+                retained = retained.saturating_add(1);
+            }
+        }
+
+        // Ordinary transactions may depend on one another, so preserve the
+        // bounded multi-pass rebuild. Keep the complete deduplicated candidate
+        // list until valid entries fill the remaining capacity; invalid entries
+        // at the front must not starve valid entries that sort later.
+        let mut pending = ordinary;
         for _ in 0..8 {
-            if pending.is_empty() {
+            if pending.is_empty() || self.mempool.len() >= mempool_cap {
                 break;
             }
             let before = pending.len();
             let mut next = Vec::<Transaction>::new();
-            for tx in pending.into_iter() {
+            let mut iter = pending.into_iter();
+            while let Some(tx) = iter.next() {
+                if self.mempool.len() >= mempool_cap {
+                    break;
+                }
                 if self
-                    .accept_transaction_to_mempool(tx.clone(), settings)
+                    .accept_transaction_to_mempool_with_context(
+                        tx.clone(),
+                        settings,
+                        &mut pool_context,
+                        &mut pool_share_count,
+                    )
                     .is_ok()
                 {
                     retained = retained.saturating_add(1);
@@ -1963,6 +2213,9 @@ fn validate_qns_transaction_against_chain(
     spend_height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if qns_registrations_in_tx(tx, settings).is_empty() {
+        return Ok(());
+    }
     let mut seen = HashSet::new();
     let registry = qns_registry_from_blocks(settings, &chain.blocks)?;
     validate_qns_transaction_with_registry(tx, spend_height, &registry, &mut seen, settings)
@@ -1974,6 +2227,14 @@ fn validate_qns_block(
     height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if !block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(|tx| !qns_registrations_in_tx(tx, settings).is_empty())
+    {
+        return Ok(());
+    }
     let mut seen = HashSet::new();
     let registry = qns_registry_from_blocks(settings, prior_blocks)?;
     for tx in block.transactions.iter().skip(1) {
@@ -2952,6 +3213,9 @@ fn validate_library_transaction_against_chain(
     spend_height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if library_markers_in_tx(tx, settings).is_empty() {
+        return Ok(());
+    }
     let state = library_state_from_blocks(settings, &chain.blocks)?;
     validate_library_transaction_with_state(tx, &state, &chain.utxos, spend_height, settings)
 }
@@ -2963,6 +3227,14 @@ fn validate_library_block(
     height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if !block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(|tx| !library_markers_in_tx(tx, settings).is_empty())
+    {
+        return Ok(());
+    }
     let mut state = library_state_from_blocks(settings, prior_blocks)?;
     let mut scratch = base_utxos.clone();
     for tx in block.transactions.iter().skip(1) {
@@ -3271,6 +3543,76 @@ fn candidate_mempool_transactions(
     solo_miner_for_legacy_jin: Option<&str>,
 ) -> Result<(Vec<Transaction>, u64)> {
     let mut scratch = chain.utxos.as_ref().clone();
+    let mut txs = Vec::new();
+    let mut fees = 0u64;
+    let mut pool_context =
+        pools::PoolValidationContext::from_confirmed(settings, &chain.blocks, height)?;
+
+    let mut pool_share_transactions = Vec::new();
+    let mut non_pool_transactions = Vec::new();
+    for tx in chain.mempool.iter() {
+        if is_pool_share_transaction(tx) {
+            pool_share_transactions.push(tx);
+        } else {
+            non_pool_transactions.push(tx);
+        }
+    }
+    // Drain the oldest still-confirmable shares first. This is deterministic
+    // and minimizes avoidable expiry when a backlog spans several parents.
+    pool_share_transactions.sort_by_cached_key(|tx| {
+        (
+            parse_pool_share_tx(tx)
+                .map(|share| share.parent_height)
+                .unwrap_or(u32::MAX),
+            tx.txid().to_string(),
+        )
+    });
+    non_pool_transactions.sort_by_cached_key(|tx| {
+        (
+            mempool_template_priority(settings, *tx),
+            tx.txid().to_string(),
+        )
+    });
+    // The ordinary scan remains bounded even when the mempool is dominated by
+    // thousands of priority-0 pool shares. Pool shares have their own much
+    // smaller consensus cap and therefore do not consume the ordinary scan
+    // budget or starve QUB/JIN/Library transactions from the template.
+    non_pool_transactions.truncate(hf115_template_scan_limit(settings));
+
+    // HF124/v1.8.1: pool shares are selected first, but never beyond the
+    // existing consensus cap. Additional shares remain in mempool for later
+    // blocks; they must not turn every official template into a block that
+    // validate_pools_block() will reject.
+    let mut selected_pool_shares = 0usize;
+    for tx in pool_share_transactions {
+        if txs.len() + 1 >= settings.consensus.max_block_transactions {
+            break;
+        }
+        if selected_pool_shares >= settings.pools.max_share_txs_per_block {
+            continue;
+        }
+        if validate_tx_contextual(tx, &scratch, height, settings, true).is_err() {
+            continue;
+        }
+        if pool_context
+            .validate_and_apply(tx, &chain.blocks, &scratch, height, 0, settings)
+            .is_err()
+        {
+            continue;
+        }
+        txs.push((*tx).clone());
+        selected_pool_shares = selected_pool_shares.saturating_add(1);
+    }
+
+    if txs.len() + 1 >= settings.consensus.max_block_transactions
+        || non_pool_transactions.is_empty()
+    {
+        return Ok((txs, fees));
+    }
+
+    // The expensive protocol-derived views are built only when at least one
+    // ordinary transaction is considered. A share-only backlog no longer
+    // rebuilds QNS, JIN, Library and governance state for every template.
     let mut jin_ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
     let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
     qub_jin_apply_bootstrap_for_context(
@@ -3280,8 +3622,6 @@ fn candidate_mempool_transactions(
         chain.height(),
         height,
     )?;
-    let mut txs = Vec::new();
-    let mut fees = 0u64;
     let qns_registry = qns_registry_from_blocks(settings, &chain.blocks)?;
     let mut qns_seen = HashSet::new();
     let mut library_state = library_state_from_blocks(settings, &chain.blocks)?;
@@ -3289,25 +3629,7 @@ fn candidate_mempool_transactions(
         verified_governance_state_from_blocks(settings, &chain.blocks)?;
     let mut jin_sale_sold = jin_sale_sold_by_listing_from_blocks(settings, &chain.blocks)?;
 
-    // HF75/v1.5.8: build candidates with the same contextual validators used
-    // by mempool/block acceptance, but maintain scratch state incrementally.
-    // Previously candidate building only checked a subset of feature validators;
-    // JIN sale / Library / multi-action txs could sit in mempool until a later
-    // sync dropped them, or miners could skip them in practice because a stale
-    // per-feature state check was not updated for earlier txs in the same block.
-    // HF105/v1.6.7: keep pool-share markers first, but also make high-impact
-    // protocol txs deterministic. In particular, large JIN public-sale purchases
-    // must be selected/revalidated in the same priority order everywhere, instead
-    // of bouncing between mempool/block-template positions during fast blocks.
-    let mut ordered_mempool = chain.mempool.iter().collect::<Vec<_>>();
-    ordered_mempool.sort_by_cached_key(|tx| {
-        (
-            mempool_template_priority(settings, *tx),
-            tx.txid().to_string(),
-        )
-    });
-    let template_scan_limit = hf115_template_scan_limit(settings);
-    for tx in ordered_mempool.into_iter().take(template_scan_limit) {
+    for tx in non_pool_transactions {
         if txs.len() + 1 >= settings.consensus.max_block_transactions {
             break;
         }
@@ -3351,7 +3673,11 @@ fn candidate_mempool_transactions(
         {
             continue;
         }
-        if validate_pools_transaction_against_chain(tx, chain, height, settings).is_err() {
+        let mut pool_context_trial = pool_context.clone();
+        if pool_context_trial
+            .validate_and_apply(tx, &chain.blocks, &scratch, height, raw_fee, settings)
+            .is_err()
+        {
             continue;
         }
 
@@ -3425,7 +3751,7 @@ fn candidate_mempool_transactions(
 
         let markers = library_markers_in_tx(tx, settings)
             .into_iter()
-            .map(|(_, m, _)| m)
+            .map(|(_, marker, _)| marker)
             .collect::<Vec<_>>();
         let mut library_trial = library_state.clone();
         if !markers.is_empty()
@@ -3442,6 +3768,7 @@ fn candidate_mempool_transactions(
             continue;
         }
 
+        pool_context = pool_context_trial;
         qns_seen = qns_seen_trial;
         jin_ledger = jin_trial;
         qub_jin_state = qub_jin_trial;
@@ -3537,7 +3864,7 @@ pub fn build_candidate_pool_block(
             settings.pools.activation_height
         );
     }
-    let registry = pools_registry_from_blocks(settings, &chain.blocks)?;
+    let registry = pools::cached_pools_registry_from_blocks(settings, &chain.blocks)?;
     if !registry.contains_key(&pool_id) {
         bail!("unknown pool_id");
     }
@@ -6401,6 +6728,12 @@ pub fn remember_pending_tx(
     tx: &Transaction,
     label: impl Into<String>,
 ) -> Result<()> {
+    // HF124/v1.8.1: pool shares are short-lived, zero-value work markers, not
+    // wallet payments. Persisting them in the HF117 wallet outbox caused stale
+    // shares to be recovered and rebroadcast long after their parent window.
+    if is_pool_share_transaction(tx) {
+        return Ok(());
+    }
     let mut pending =
         load_pending_txs(settings).unwrap_or_else(|_| PendingTxFile::new(&settings.network.name));
     pending.ensure_network(settings)?;
@@ -6446,6 +6779,13 @@ pub fn reconcile_pending_txs(
     let mut seen = HashSet::<Hash256>::new();
     for mut rec in pending.txs.into_iter() {
         if !seen.insert(rec.txid) {
+            continue;
+        }
+        // HF124 migration cleanup for shares recorded by older GUI versions.
+        // They are parent-bound work markers and must never be resurrected by
+        // the durable wallet-transaction outbox.
+        if is_pool_share_transaction(&rec.tx) {
+            report.dropped = report.dropped.saturating_add(1);
             continue;
         }
         if let Some((_height, confirmations)) = chain.tx_confirmations(rec.txid) {
@@ -7314,6 +7654,9 @@ fn validate_qub_jin_infusion_transaction_against_chain(
     spend_height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if qub_jin_infusion_markers_in_tx(tx, settings).is_empty() {
+        return Ok(());
+    }
     let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
     let mut state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
     qub_jin_apply_bootstrap_for_context(
@@ -7901,6 +8244,14 @@ fn validate_jin_sale_block(
     height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if !block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(|tx| !jin_sale_purchases_in_tx(tx, settings).is_empty())
+    {
+        return Ok(());
+    }
     let mut sold = jin_sale_sold_by_listing_from_blocks(settings, prior_blocks)?;
     let mut scratch = base_utxos.clone();
     for tx in block.transactions.iter().skip(1) {
@@ -8256,6 +8607,9 @@ fn validate_jin_transaction_against_chain(
     spend_height: u32,
     settings: &Settings,
 ) -> Result<u128> {
+    if !is_jin_protocol_transaction(tx, settings) {
+        return Ok(0);
+    }
     let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
     let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, &chain.blocks)?;
     qub_jin_apply_bootstrap_for_context(
@@ -8306,6 +8660,14 @@ fn validate_jin_block(
     height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if !block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(|tx| is_jin_protocol_transaction(tx, settings))
+    {
+        return Ok(());
+    }
     let mut ledger = jin_ledger_from_blocks(settings, prior_blocks)?;
     let mut qub_jin_state = qub_jin_infusion_state_from_blocks(settings, prior_blocks)?;
     let prior_visible_height = prior_blocks.len().saturating_sub(1) as u32;
@@ -9684,6 +10046,9 @@ fn validate_verified_governance_transaction_against_chain(
     spend_height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if verified_governance_markers_in_tx(tx, settings).is_empty() {
+        return Ok(());
+    }
     let mut state = verified_governance_state_from_blocks(settings, &chain.blocks)?;
     let mut ledger = jin_ledger_from_blocks(settings, &chain.blocks)?;
     validate_verified_governance_transaction_with_state(
@@ -9704,6 +10069,14 @@ fn validate_verified_governance_block(
     height: u32,
     settings: &Settings,
 ) -> Result<()> {
+    if !block
+        .transactions
+        .iter()
+        .skip(1)
+        .any(|tx| !verified_governance_markers_in_tx(tx, settings).is_empty())
+    {
+        return Ok(());
+    }
     let mut state = verified_governance_state_from_blocks(settings, prior_blocks)?;
     let mut ledger = jin_ledger_from_blocks(settings, prior_blocks)?;
     let mut scratch = base_utxos.clone();

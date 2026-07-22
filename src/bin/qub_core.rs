@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.0";
+const APP_VERSION: &str = "v1.8.1";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -912,7 +912,7 @@ impl Default for GuiPrefs {
             mining_peak_gpu_hash_rate_hps: 0.0,
             confirm_plaintext_wallet_risk: false,
             benchmark_seconds: 3,
-            pace_to_target_spacing: true,
+            pace_to_target_spacing: false,
             peer_view_mode: PeerViewMode::Web,
             peer_zoom: 1.0,
             left_mining_controls_expanded: true,
@@ -1935,8 +1935,11 @@ impl QubCoreApp {
             hf88_snapshot_timeout_count: 0,
             hf88_last_snapshot_success: Instant::now(),
         };
-        if !app.prefs.pace_to_target_spacing {
-            app.prefs.pace_to_target_spacing = true;
+        // HF124/v1.8.1: local wall-clock pacing and last-winner cooldowns are
+        // retired. Consensus/DAA and canonical-parent guards determine whether
+        // work is valid; a GUI-only sleep must never make the network stall.
+        if app.prefs.pace_to_target_spacing {
+            app.prefs.pace_to_target_spacing = false;
             app.prefs_dirty = true;
         }
         if app.prefs.gpu_device_selector.trim().is_empty() {
@@ -2031,8 +2034,8 @@ impl QubCoreApp {
                 self.prefs_dirty = true;
             }
         }
-        if !self.prefs.pace_to_target_spacing {
-            self.prefs.pace_to_target_spacing = true;
+        if self.prefs.pace_to_target_spacing {
+            self.prefs.pace_to_target_spacing = false;
             self.prefs_dirty = true;
         }
     }
@@ -3482,14 +3485,14 @@ del "%~f0"
         self.gpu_workers = 0;
         self.gpu_device.clear();
         self.gpu_device_rates.clear();
-        // HF117/v1.7.8: target-spacing pacing is policy, not consensus. It reduces
-        // last-winner head-start streaks and coinbase-only burst races without any
-        // chain upgrade or seed update. Keep the persisted preference defaulted ON.
-        if !self.prefs.pace_to_target_spacing {
-            self.prefs.pace_to_target_spacing = true;
+        // HF124/v1.8.1: retire the legacy GUI-only target-spacing/winner
+        // brake. It was never consensus and could leave updated GUI miners
+        // sleeping while valid work was available.
+        if self.prefs.pace_to_target_spacing {
+            self.prefs.pace_to_target_spacing = false;
             self.prefs_dirty = true;
         }
-        let pace_to_target_spacing = self.prefs.pace_to_target_spacing;
+        let pace_to_target_spacing = false;
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
@@ -10637,6 +10640,13 @@ fn hf119_pre_qub_jin_action_sync(settings: &Settings) {
 
 fn hf117_relay_exact_wallet_tx(settings: &Settings, tx: &Transaction, txid: &Hash256) -> usize {
     if !settings.p2p.enabled { return 0; }
+    if is_pool_share_transaction(tx) {
+        // HF124/v1.8.1: shares are frequent, short-lived work markers. One
+        // bounded relay fanout plus the node's six-second fair relay heartbeat
+        // is sufficient; the old 3 x 24-peer wallet retry path amplified every
+        // share into dozens of new connections.
+        return p2p::broadcast_tx_limited(settings, tx, 8, 450).unwrap_or(0);
+    }
     // HF117/v1.7.8: exact, bounded relay for GUI-created wallet txs. This uses
     // the same safe path as JIN buys, but applies it to normal QUB, MultiSend,
     // QNS, Library, Blast and Pool-management txs too.
@@ -11173,7 +11183,7 @@ fn find_gui_pool_share_nonce(settings: &Settings, pool_id: Hash256, miner_addres
 }
 
 fn create_gui_local_pool_share(settings: &Settings, chain: &mut ChainState, pool_id: Hash256, miner_key: &WalletKey, start_nonce: u64) -> Result<(Hash256, u64, usize)> {
-    let registry = pools_registry_from_blocks(settings, &chain.blocks)?;
+    let registry = cached_pools_registry_from_blocks(settings, &chain.blocks)?;
     if !registry.contains_key(&pool_id) { anyhow::bail!("unknown pool_id; create/confirm pool first"); }
     let parent_height = chain.height();
     let parent_hash = chain.tip_hash();
@@ -11343,7 +11353,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
     let (threads, duty) = resource_plan(logical, cpu_percent);
     let mut total_hashes = 0u64;
     let mut share_nonce_start = 0u64;
-    let mut hf119_last_policy_paced_tip: Option<Hash256> = None;
+    let mut last_share_parent: Option<(u32, Hash256)> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
@@ -11385,14 +11395,47 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
                 }
             }
         }
-        match create_gui_local_pool_share(&settings, &mut chain, pool_id, &key, share_nonce_start) {
-            Ok((share_txid, nonce, _relayed)) => {
-                share_nonce_start = nonce.wrapping_add(1);
-                let _ = events.send(MinerEvent::Status(format!("Pool share submitted: {} nonce={}", shorten_hash(&share_txid.to_string()), nonce)));
-                chain = load_or_init_chain(&settings)?;
-            }
-            Err(err) => {
-                let _ = events.send(MinerEvent::Status(format!("Pool share warning: {err:#}")));
+        // HF124/v1.8.1: submit at most one local share per canonical parent.
+        // The previous outer-loop behavior could mint another share whenever a
+        // mining round restarted, feeding a self-amplifying mempool/rebuild loop.
+        let share_parent = (chain.height(), chain.tip_hash());
+        let own_share_pending = chain.mempool.iter().any(|tx| {
+            parse_pool_share_tx(tx)
+                .map(|share| {
+                    share.pool_id == pool_id
+                        && share.miner_address == key.address
+                        && share.parent_height == share_parent.0
+                        && share.parent_hash == share_parent.1
+                })
+                .unwrap_or(false)
+        });
+        if own_share_pending {
+            last_share_parent = Some(share_parent);
+        }
+        if last_share_parent != Some(share_parent) {
+            match create_gui_local_pool_share(
+                &settings,
+                &mut chain,
+                pool_id,
+                &key,
+                share_nonce_start,
+            ) {
+                Ok((share_txid, nonce, _relayed)) => {
+                    share_nonce_start = nonce.wrapping_add(1);
+                    last_share_parent = Some(share_parent);
+                    let _ = events.send(MinerEvent::Status(format!(
+                        "Pool share submitted once for parent #{}: {} nonce={}",
+                        share_parent.0,
+                        shorten_hash(&share_txid.to_string()),
+                        nonce
+                    )));
+                    chain = load_or_init_chain(&settings)?;
+                }
+                Err(err) => {
+                    let _ = events.send(MinerEvent::Status(format!(
+                        "Pool share warning: {err:#}"
+                    )));
+                }
             }
         }
 
@@ -11406,16 +11449,37 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             continue;
         }
 
-        if !wait_for_target_spacing(&chain, &settings, events, &stop, &mut hf119_last_policy_paced_tip)? { continue; }
-        if stop.load(Ordering::Relaxed) { break; }
-        if let Ok(current) = load_or_init_chain(&settings) {
-            if current.tip_hash() != chain.tip_hash() {
-                let _ = events.send(MinerEvent::Status("Network tip moved during HF117 pool target-spacing wait; rebuilding pool candidate.".to_string()));
-                continue;
-            }
-        }
-        let target_height = chain.height() + 1;
-        let base_mempool_fingerprint = mempool_fingerprint(&chain);
+        // HF124/v1.8.1: build the pool transaction set and payout outputs once
+        // per canonical parent, then share immutable parts across all workers.
+        let candidate_parts = Arc::new(build_candidate_block_parts(
+            &chain,
+            &settings,
+            None,
+        )?);
+        let pool_outputs = Arc::new(expected_pool_coinbase_outputs(
+            &settings,
+            &chain.blocks,
+            pool_id,
+            candidate_parts.reward_atoms as u128,
+        )?);
+        let target_height = candidate_parts.height;
+        let selected_pool_shares = candidate_parts
+            .non_coinbase_transactions
+            .iter()
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count();
+        let available_pool_shares = chain
+            .mempool
+            .iter()
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count();
+        let _ = events.send(MinerEvent::Status(format!(
+            "HF124 stable pool template: {selected_pool_shares}/{available_pool_shares} pool share(s), {} candidate transaction(s) from {} mempool transaction(s), parent #{} {}.",
+            candidate_parts.non_coinbase_transactions.len(),
+            chain.mempool.len(),
+            target_height.saturating_sub(1),
+            shorten_hash(&candidate_parts.prev_block_hash.to_string())
+        )));
         let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
@@ -11430,28 +11494,28 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
         let mut joins = Vec::with_capacity(threads + gpu_device_count);
 
         for worker_id in 0..threads {
-            let worker_chain = chain.clone();
-            let worker_settings = settings.clone();
+            let worker_parts = candidate_parts.clone();
+            let worker_outputs = pool_outputs.clone();
             let worker_found_tx = found_tx.clone();
             let worker_events = events.clone();
             let worker_stop = stop.clone();
             let worker_round_stop = round_stop.clone();
             let worker_hashes = hash_counter.clone();
             joins.push(thread::spawn(move || {
-                pool_mine_worker(worker_id, threads, duty, worker_chain, worker_settings, pool_id, worker_hashes, worker_found_tx, worker_events, worker_stop, worker_round_stop);
+                pool_mine_worker(worker_id, threads, duty, worker_parts, worker_outputs, pool_id, worker_hashes, worker_found_tx, worker_events, worker_stop, worker_round_stop);
             }));
         }
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
-                let gpu_chain = chain.clone();
-                let gpu_settings = settings.clone();
+                let gpu_parts = candidate_parts.clone();
+                let gpu_outputs = pool_outputs.clone();
                 let gpu_found_tx = found_tx.clone();
                 let gpu_events = events.clone();
                 let gpu_stop = stop.clone();
                 let gpu_round_stop = round_stop.clone();
                 let gpu_hashes = gpu_hash_counter.clone();
                 joins.push(thread::spawn(move || {
-                    gpu_pool_mine_worker(gpu_chain, gpu_settings, pool_id, gpu_percent, gpu_selector, gpu_index, target_height, gpu_hashes, gpu_found_tx, gpu_events, gpu_stop, gpu_round_stop);
+                    gpu_pool_mine_worker(gpu_parts, gpu_outputs, pool_id, gpu_percent, gpu_selector, gpu_index, target_height, gpu_hashes, gpu_found_tx, gpu_events, gpu_stop, gpu_round_stop);
                 }));
             }
         }
@@ -11470,11 +11534,6 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             if last_template_check.elapsed() >= Duration::from_secs(4) {
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != chain.tip_hash() {
-                        round_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    if mempool_fingerprint(&current) != base_mempool_fingerprint {
-                        let _ = events.send(MinerEvent::Status("Mempool changed; rebuilding pool block template so pending txs are not left behind.".to_string()));
                         round_stop.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -11574,12 +11633,11 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
     Ok(())
 }
 
-fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, pace_to_target_spacing: bool, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
+fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, _pace_to_target_spacing: bool, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
     let logical = logical_cpus();
     let (threads, duty) = resource_plan(logical, cpu_percent);
     let mut total_hashes = 0u64;
     let mut gpu_total_hashes = 0u64;
-    let mut hf119_last_policy_paced_tip: Option<Hash256> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
@@ -11618,19 +11676,23 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 }
             }
         }
-        if pace_to_target_spacing {
-            if !wait_for_target_spacing(&base_chain, &settings, events, &stop, &mut hf119_last_policy_paced_tip)? { continue; }
-            if stop.load(Ordering::Relaxed) { break; }
-            if let Ok(current) = load_or_init_chain(&settings) {
-                if current.tip_hash() != base_chain.tip_hash() {
-                    let _ = events.send(MinerEvent::Status("Network tip moved during HF117 target-spacing wait; rebuilding candidate.".to_string()));
-                    continue;
-                }
-            }
-        }
         let miner = Address::parse_with_prefix(&payout, &settings.network.address_prefix)?;
-        let target_height = base_chain.height() + 1;
-        let base_mempool_fingerprint = mempool_fingerprint(&base_chain);
+        // HF124/v1.8.1: assemble and contextually validate the transaction set
+        // once per canonical parent. All CPU/GPU workers share these immutable
+        // parts and vary only coinbase extra-nonce/header nonce.
+        let candidate_parts = Arc::new(build_candidate_block_parts(
+            &base_chain,
+            &settings,
+            Some(&miner.to_string()),
+        )?);
+        let target_height = candidate_parts.height;
+        let _ = events.send(MinerEvent::Status(format!(
+            "HF124 stable solo template: {} candidate transaction(s) from {} mempool transaction(s), parent #{} {}.",
+            candidate_parts.non_coinbase_transactions.len(),
+            base_chain.mempool.len(),
+            target_height.saturating_sub(1),
+            shorten_hash(&candidate_parts.prev_block_hash.to_string())
+        )));
         let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
@@ -11639,8 +11701,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
         let mut joins = Vec::with_capacity(threads);
 
         for worker_id in 0..threads {
-            let worker_chain = base_chain.clone();
-            let worker_settings = settings.clone();
+            let worker_parts = candidate_parts.clone();
             let worker_miner = miner.clone();
             let worker_found_tx = found_tx.clone();
             let worker_events = events.clone();
@@ -11652,8 +11713,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                     worker_id,
                     threads,
                     duty,
-                    worker_chain,
-                    worker_settings,
+                    worker_parts,
                     worker_miner,
                     worker_hashes,
                     worker_found_tx,
@@ -11671,8 +11731,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
         let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent).saturating_mul(gpu_device_count);
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
-                let gpu_chain = base_chain.clone();
-                let gpu_settings = settings.clone();
+                let gpu_parts = candidate_parts.clone();
                 let gpu_miner_addr = miner.clone();
                 let gpu_found_tx = found_tx.clone();
                 let gpu_events = events.clone();
@@ -11681,8 +11740,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 let gpu_hashes = gpu_hash_counter.clone();
                 joins.push(thread::spawn(move || {
                     gpu_mine_worker(
-                        gpu_chain,
-                        gpu_settings,
+                        gpu_parts,
                         gpu_miner_addr,
                         gpu_percent,
                         gpu_selector,
@@ -11715,11 +11773,6 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             if last_template_check.elapsed() >= Duration::from_secs(4) {
                 if let Ok(current) = load_or_init_chain(&settings) {
                     if current.tip_hash() != base_chain.tip_hash() {
-                        round_stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    if mempool_fingerprint(&current) != base_mempool_fingerprint {
-                        let _ = events.send(MinerEvent::Status("Mempool changed; rebuilding block template so pending txs are picked up quickly.".to_string()));
                         round_stop.store(true, Ordering::Relaxed);
                         break;
                     }
@@ -11819,124 +11872,41 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
     Ok(())
 }
 
-fn hf119_solo_coinbase_address(settings: &Settings, block: &Block) -> Option<String> {
-    if parse_pool_block_marker(block).is_some() { return None; }
-    block.transactions
-        .first()?
-        .outputs
-        .first()
-        .and_then(|out| address_from_script_pubkey(&settings.network.address_prefix, &out.script_pubkey))
-        .map(|addr| addr.to_string())
+// HF124/v1.8.1 removed the legacy GUI-only target-spacing jitter and
+// last-winner cooldown. Canonical-parent/version/target guards remain active;
+// proof-of-work is no longer delayed by local fairness sleeps.
+
+fn hf124_solo_block_from_parts(
+    parts: &CandidateBlockParts,
+    miner: &Address,
+    extra_nonce: u64,
+) -> Result<Block> {
+    let coinbase = create_coinbase(parts.height, parts.reward_atoms, miner, extra_nonce)?;
+    Ok(block_from_candidate_parts(parts, coinbase))
 }
 
-fn hf119_recent_solo_winner_streak(chain: &ChainState, settings: &Settings) -> u32 {
-    let miner = settings.mining.miner_address.trim();
-    if miner.is_empty() { return 0; }
-    let mut streak = 0u32;
-    for block in chain.blocks.iter().rev().take(64) {
-        let Some(addr) = hf119_solo_coinbase_address(settings, block) else { break; };
-        if addr == miner {
-            streak = streak.saturating_add(1);
-        } else {
-            break;
-        }
-    }
-    streak
-}
-
-fn hf119_gui_winner_brake_secs(chain: &ChainState, settings: &Settings) -> Option<(u32, u32)> {
-    if settings.network.name != "mainnet" { return None; }
-    if settings.mining.miner_address.trim().is_empty() { return None; }
-    let streak = hf119_recent_solo_winner_streak(chain, settings);
-    if streak == 0 { return None; }
-    // HF119/v1.7.8: public GUI mining fairness brake. This is local policy only,
-    // not consensus. If the same local payout address is already the latest solo
-    // winner, wait a wall-clock cooldown before hashing the next height. HF117
-    // used block timestamps only; a fast GPU that found a block after a long
-    // hash round could immediately start the next height because the header time
-    // was already old. The one-tip brake below removes that last-winner head-start
-    // from updated public GUI clients without requiring seeds or a chain upgrade.
-    let target = settings.consensus.target_spacing_secs.max(60);
-    let capped = streak.min(20);
-    let mut seed = Vec::new();
-    seed.extend_from_slice(settings.mining.miner_address.as_bytes());
-    seed.extend_from_slice(&chain.height().saturating_add(1).to_le_bytes());
-    seed.extend_from_slice(b"HF119-public-gui-winner-brake");
-    let jitter = (Hash256::double_sha256(&seed).0[1] as u32) % 31;
-    let streak_extra = capped.saturating_mul(15).min(240);
-    let cooldown = target.saturating_add(streak_extra).saturating_add(jitter).min(360);
-    Some((streak, cooldown))
-}
-
-fn wait_for_target_spacing(chain: &ChainState, settings: &Settings, events: &mpsc::Sender<MinerEvent>, stop: &Arc<AtomicBool>, last_policy_paced_tip: &mut Option<Hash256>) -> Result<bool> {
-    if settings.network.name != "mainnet" { return Ok(true); }
-    if chain.height() == 0 { return Ok(true); }
-    let Some(tip) = chain.blocks.last() else { return Ok(true); };
-    let tip_hash = chain.tip_hash();
-    let now_at_entry = unix_time_u32();
-    let jitter_secs = if settings.p2p.enabled && !settings.mining.miner_address.trim().is_empty() {
-        // HF117/v1.7.8: spread GUI miners across a small deterministic per-height
-        // window. This is local mining policy only; it does not change block validity
-        // or DAA. It removes the last-winner head-start without making seeds a
-        // hard dependency.
-        let mut seed = Vec::new();
-        seed.extend_from_slice(settings.mining.miner_address.as_bytes());
-        seed.extend_from_slice(&chain.height().saturating_add(1).to_le_bytes());
-        let slot_window = (settings.consensus.target_spacing_secs / 3).clamp(4, 20);
-        Hash256::double_sha256(&seed).0[0] as u32 % slot_window
-    } else { 0 };
-    let mut next_allowed = tip.header.time.saturating_add(settings.consensus.target_spacing_secs).saturating_add(jitter_secs);
-    let mut winner_brake: Option<(u32, u32)> = None;
-    if *last_policy_paced_tip != Some(tip_hash) {
-        if let Some((streak, cooldown)) = hf119_gui_winner_brake_secs(chain, settings) {
-            let wall_clock_allowed = now_at_entry.saturating_add(cooldown);
-            if wall_clock_allowed > next_allowed { next_allowed = wall_clock_allowed; }
-            winner_brake = Some((streak, cooldown));
-        }
-    }
-    let mut last_probe = Instant::now() - Duration::from_secs(10);
-    loop {
-        if stop.load(Ordering::Relaxed) { return Ok(true); }
-        let now = unix_time_u32();
-        if now >= next_allowed {
-            *last_policy_paced_tip = Some(tip_hash);
-            return Ok(true);
-        }
-        let remaining = next_allowed.saturating_sub(now);
-        if let Some((streak, cooldown)) = winner_brake {
-            let _ = events.send(MinerEvent::Status(format!("HF119 public-GUI winner brake: this payout mined the last {streak} solo block(s); waiting {remaining}s before the next height (one-tip cooldown {}s).", cooldown)));
-        } else {
-            let _ = events.send(MinerEvent::Status(format!("HF119 target spacing: next block opens in {remaining}s.")));
-        }
-
-        // Do not run a heavy repair/sync loop while the miner is merely pacing.
-        // A lightweight live-tip probe is enough to abort this candidate when
-        // official/direct quorum moved. The next outer mining iteration performs
-        // the normal canonical guard/repair before hashing again.
-        if settings.p2p.enabled && last_probe.elapsed() >= Duration::from_secs(5) {
-            last_probe = Instant::now();
-            if let Some(reason) = p2p::hf113_live_tip_pause_reason(settings, chain.height(), chain.tip_hash(), 520) {
-                let _ = events.send(MinerEvent::Status(format!("HF119 target-spacing wait cancelled: {reason}")));
-                return Ok(false);
-            }
-            if let Ok(current) = load_or_init_chain(settings) {
-                if current.height() != chain.height() || current.tip_hash() != chain.tip_hash() {
-                    let _ = events.send(MinerEvent::Status("HF119 target-spacing wait cancelled because local tip changed.".to_string()));
-                    return Ok(false);
-                }
-            }
-        }
-        for _ in 0..10 {
-            if stop.load(Ordering::Relaxed) { return Ok(true); }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
+fn hf124_pool_block_from_parts(
+    parts: &CandidateBlockParts,
+    outputs: &[TxOut],
+    pool_id: Hash256,
+    extra_nonce: u64,
+) -> Block {
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: pool_block_marker_script(parts.height, extra_nonce, pool_id),
+            sequence: u32::MAX,
+        }],
+        outputs: outputs.to_vec(),
+        locktime: 0,
+    };
+    block_from_candidate_parts(parts, coinbase)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn gpu_mine_worker(
-    base_chain: ChainState,
-    settings: Settings,
+    candidate_parts: Arc<CandidateBlockParts>,
     miner: Address,
     gpu_percent: u8,
     gpu_selector: String,
@@ -11971,7 +11941,7 @@ fn gpu_mine_worker(
     let mut best_hps = 0.0f64;
     let mut tuning_announced = false;
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = match build_candidate_block(&base_chain, &settings, &miner, extra_nonce) {
+        let mut block = match hf124_solo_block_from_parts(&candidate_parts, &miner, extra_nonce) {
             Ok(block) => block,
             Err(err) => {
                 let _ = events.send(MinerEvent::GpuStatus(format!("GPU candidate build failed; CPU mining continues. {err:#}")));
@@ -12069,8 +12039,7 @@ fn mine_worker(
     worker_id: usize,
     threads: usize,
     duty: u8,
-    base_chain: ChainState,
-    settings: Settings,
+    candidate_parts: Arc<CandidateBlockParts>,
     miner: Address,
     hash_counter: Arc<AtomicU64>,
     found_tx: mpsc::Sender<Block>,
@@ -12083,7 +12052,7 @@ fn mine_worker(
     let batch_size = 8_192u64;
 
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = match build_candidate_block(&base_chain, &settings, &miner, extra_nonce) {
+        let mut block = match hf124_solo_block_from_parts(&candidate_parts, &miner, extra_nonce) {
             Ok(block) => block,
             Err(err) => {
                 round_stop.store(true, Ordering::Relaxed);
@@ -12153,8 +12122,8 @@ fn mine_worker(
 
 #[allow(clippy::too_many_arguments)]
 fn gpu_pool_mine_worker(
-    base_chain: ChainState,
-    settings: Settings,
+    candidate_parts: Arc<CandidateBlockParts>,
+    pool_outputs: Arc<Vec<TxOut>>,
     pool_id: Hash256,
     gpu_percent: u8,
     gpu_selector: String,
@@ -12189,13 +12158,12 @@ fn gpu_pool_mine_worker(
     let mut best_hps = 0.0f64;
     let mut tuning_announced = false;
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = match build_candidate_pool_block(&base_chain, &settings, pool_id, extra_nonce) {
-            Ok(block) => block,
-            Err(err) => {
-                let _ = events.send(MinerEvent::GpuStatus(format!("GPU pool candidate build failed; CPU pool mining continues. {err:#}")));
-                return;
-            }
-        };
+        let mut block = hf124_pool_block_from_parts(
+            &candidate_parts,
+            pool_outputs.as_slice(),
+            pool_id,
+            extra_nonce,
+        );
 
         let serialized = block.header.serialize();
         if serialized.len() != 80 {
@@ -12286,8 +12254,8 @@ fn pool_mine_worker(
     worker_id: usize,
     threads: usize,
     duty: u8,
-    base_chain: ChainState,
-    settings: Settings,
+    candidate_parts: Arc<CandidateBlockParts>,
+    pool_outputs: Arc<Vec<TxOut>>,
     pool_id: Hash256,
     hash_counter: Arc<AtomicU64>,
     found_tx: mpsc::Sender<Block>,
@@ -12300,14 +12268,12 @@ fn pool_mine_worker(
     let batch_size = 8_192u64;
 
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = match build_candidate_pool_block(&base_chain, &settings, pool_id, extra_nonce) {
-            Ok(block) => block,
-            Err(err) => {
-                round_stop.store(true, Ordering::Relaxed);
-                let _ = events.send(MinerEvent::Status(format!("Pool candidate rebuild warning: {err:#}")));
-                return;
-            }
-        };
+        let mut block = hf124_pool_block_from_parts(
+            &candidate_parts,
+            pool_outputs.as_slice(),
+            pool_id,
+            extra_nonce,
+        );
         let target = match target_from_compact(block.header.bits) {
             Ok(target) => target,
             Err(err) => {
@@ -12365,10 +12331,6 @@ fn pool_mine_worker(
         if batch_hashes > 0 { hash_counter.fetch_add(batch_hashes, Ordering::Relaxed); }
         extra_nonce = extra_nonce.wrapping_add(step);
     }
-}
-
-fn mempool_fingerprint(chain: &ChainState) -> Vec<Hash256> {
-    chain.mempool.iter().map(|tx| tx.txid()).collect()
 }
 
 fn header_bytes_for_mining(header: &BlockHeader) -> Result<[u8; 80]> {

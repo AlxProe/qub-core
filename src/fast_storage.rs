@@ -1431,13 +1431,40 @@ pub(crate) fn publish_live_chain(settings: &Settings, candidate: &ChainState) {
         // already current and no secondary publication is needed.
         return;
     };
+    if current.tip_hash() == candidate.tip_hash() {
+        // HF124/v1.8.1: same-tip saves are commonly produced by GUI/CLI
+        // transaction submission while the embedded node is concurrently
+        // receiving other mempool entries. Replacing the live owner with one
+        // snapshot could silently drop the other side of that race.
+        let current_txids = current.mempool_txids();
+        let candidate_txids = candidate.mempool_txids();
+
+        // The normal coalesced P2P save publishes an older copy-on-write
+        // snapshot after the live owner has already accepted the same or newer
+        // transactions. If every candidate entry is already in the owner,
+        // preserve the owner without revalidating the whole mempool under its
+        // mutex; the dirty post-save identity check will persist any newer
+        // entries in the next bounded commit.
+        if candidate_txids.is_subset(&current_txids) {
+            return;
+        }
+
+        // A GUI/CLI writer can instead carry additional same-tip transactions.
+        // Merge and revalidate the deterministic union only for that real
+        // divergence; invalid/conflicting entries are filtered by normal policy.
+        let candidates = current.reorg_mempool_candidates_for(candidate);
+        let mut merged = current.clone();
+        merged.rebuild_mempool_from(candidates, settings);
+        *current = merged;
+        return;
+    }
+
     let candidate_work = total_work_value(candidate).ok();
     let current_work = total_work_value(&current).ok();
-    let should_publish = current.tip_hash() == candidate.tip_hash()
-        || match (candidate_work, current_work) {
-            (Some(candidate_work), Some(current_work)) => candidate_work > current_work,
-            _ => candidate.height() > current.height(),
-        };
+    let should_publish = match (candidate_work, current_work) {
+        (Some(candidate_work), Some(current_work)) => candidate_work > current_work,
+        _ => candidate.height() > current.height(),
+    };
     if should_publish {
         *current = candidate.clone();
     }

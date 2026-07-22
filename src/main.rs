@@ -547,17 +547,10 @@ fn cmd_relay_mempool(settings: &Settings) -> Result<()> {
             save_chain(settings, &chain)?;
         }
     }
-    let mut txs = 0usize;
-    let mut peers_total = 0usize;
-    for tx in chain.mempool.iter() {
-        txs += 1;
-        match p2p::broadcast_tx(settings, tx) {
-            Ok(sent) => peers_total = peers_total.saturating_add(sent),
-            Err(err) => eprintln!("relay warning for {}: {err:#}", tx.txid()),
-        }
-    }
+    let txs = chain.mempool.len();
+    let peers_total = p2p::rebroadcast_local_mempool(settings, 512)?;
     println!("mempooltx: {txs}");
-    println!("relayed_to_peers_total: {peers_total}");
+    println!("relayed_tx_peer_deliveries: {peers_total}");
     if txs > 0 && peers_total == 0 {
         eprintln!("WARNING: no peers accepted outbound relay; check peers/connectivity or keep this node mining.");
     }
@@ -2411,6 +2404,11 @@ fn explorer_chain_cache() -> &'static StdMutex<HashMap<String, ExplorerChainCach
     CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
+fn explorer_chain_load_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}
+
 fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
     // Embedded mode can clone the canonical view in O(1): HF123 ChainState
     // snapshots share immutable blocks/UTXOs/mempool through copy-on-write Arcs.
@@ -2420,6 +2418,25 @@ fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
 
     if let Some(identity) = fast_storage_identity(settings)? {
         let key = settings.node.data_dir.clone();
+        if let Ok(cache) = explorer_chain_cache().lock() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.identity == identity {
+                    return Ok(Arc::clone(&entry.chain));
+                }
+            }
+        }
+
+        // Single-flight cache refill. Without this guard, a burst of browser
+        // requests after a new block/mempool commit could make every worker
+        // deserialize the complete committed chain simultaneously.
+        let _load_guard = explorer_chain_load_lock()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("explorer chain load lock poisoned"))?;
+
+        // Another request may have completed the refill while this request
+        // waited for the single-flight guard.
+        let identity = fast_storage_identity(settings)?
+            .context("Fast Chain Engine identity disappeared during Explorer cache refill")?;
         if let Ok(cache) = explorer_chain_cache().lock() {
             if let Some(entry) = cache.get(&key) {
                 if entry.identity == identity {
@@ -2559,7 +2576,7 @@ fn explorer_route(
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.0",
+            "version": "1.8.1",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -3024,10 +3041,15 @@ fn explorer_qns_name(
 }
 
 fn explorer_mempool(settings: &Settings, chain: &ChainState) -> serde_json::Value {
+    // HF123 Explorer API hotfix: building the full confirmed-output index once
+    // per mempool response avoids an O(mempool_tx_count * chain_size) scan.
+    // Previously tx_json rebuilt this index independently for every pending tx,
+    // which made the public endpoint effectively unusable as the mempool grew.
+    let index = build_output_index(settings, chain);
     let txs = chain
         .mempool
         .iter()
-        .map(|tx| tx_json(settings, chain, tx, None))
+        .map(|tx| tx_json_with_index(settings, chain, &index, tx, None))
         .collect::<Vec<_>>();
     serde_json::json!({"network": settings.network.name, "count": txs.len(), "transactions": txs})
 }
@@ -3072,6 +3094,16 @@ fn tx_json(
     confirmed_height: Option<u32>,
 ) -> serde_json::Value {
     let index = build_output_index(settings, chain);
+    tx_json_with_index(settings, chain, &index, tx, confirmed_height)
+}
+
+fn tx_json_with_index(
+    settings: &Settings,
+    chain: &ChainState,
+    index: &ExplorerIndex,
+    tx: &Transaction,
+    confirmed_height: Option<u32>,
+) -> serde_json::Value {
     let txid = tx.txid().to_string();
     let outputs = tx.outputs.iter().enumerate().map(|(vout, out)| {
         let address = address_from_script_pubkey(&settings.network.address_prefix, &out.script_pubkey).map(|a| a.to_string());
@@ -3369,5 +3401,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.0\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.1\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

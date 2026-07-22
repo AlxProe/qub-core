@@ -10,13 +10,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.8.0/"; // HF123 Fast Chain Engine
+const USER_AGENT: &str = "/QUB Core:1.8.1/"; // HF124 mining liveness
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -472,7 +472,33 @@ pub fn run_node(settings: Settings) -> Result<()> {
         bail!("p2p.enabled=false in config; set it true for node mode");
     }
 
-    let chain = Arc::new(Mutex::new(load_or_init_chain(&settings)?));
+    let mut initial_chain = load_or_init_chain(&settings)?;
+    if !initial_chain.mempool.is_empty() {
+        // HF124/v1.8.1 startup policy migration. Older versions could persist
+        // stale, malformed or over-policy pool-share queues. Rebuild once with
+        // the bounded batch-aware admission path before exposing the canonical
+        // owner, then persist only when the deterministic queue changed.
+        let before = initial_chain
+            .mempool
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        let retained = initial_chain.revalidate_mempool(&settings);
+        let after = initial_chain
+            .mempool
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        if before != after {
+            eprintln!(
+                "HF124 startup mempool policy retained {retained}/{} transaction(s)",
+                before.len()
+            );
+            save_chain(&settings, &initial_chain)?;
+        }
+    }
+    let chain = Arc::new(Mutex::new(initial_chain));
+    let mempool_dirty = Arc::new(AtomicBool::new(false));
     register_live_chain(&settings, &chain);
     if settings.rpc.enabled {
         crate::rpc::start_embedded(settings.clone(), chain.clone())?;
@@ -520,6 +546,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
         let accept_peers = peers.clone();
         let accept_active = active.clone();
         let accept_inbound = inbound_count.clone();
+        let accept_mempool_dirty = mempool_dirty.clone();
         thread::spawn(move || loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
@@ -534,9 +561,10 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     let p = accept_peers.clone();
                     let a = accept_active.clone();
                     let inbound = accept_inbound.clone();
+                    let dirty = accept_mempool_dirty.clone();
                     thread::spawn(move || {
                         let peer = addr.to_string();
-                        if let Err(err) = handle_peer(stream, peer.clone(), false, s, c, p, a) {
+                        if let Err(err) = handle_peer(stream, peer.clone(), false, s, c, p, a, dirty) {
                             if !is_benign_disconnect(&err) {
                                 eprintln!("p2p inbound {peer} ended: {err:#}");
                             }
@@ -573,6 +601,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
     );
 
     let mut last_mempool_relay = Instant::now() - Duration::from_secs(30);
+    let mut last_mempool_persist = Instant::now();
     let mut last_light_catchup = Instant::now() - Duration::from_secs(60);
 
     loop {
@@ -602,8 +631,9 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     let c = chain.clone();
                     let p = peers.clone();
                     let a = active.clone();
+                    let dirty = mempool_dirty.clone();
                     thread::spawn(move || {
-                        if let Err(err) = handle_peer(stream, addr.clone(), true, s, c, p, a) {
+                        if let Err(err) = handle_peer(stream, addr.clone(), true, s, c, p, a, dirty) {
                             if !is_benign_disconnect(&err) {
                                 eprintln!("p2p outbound {addr} ended: {err:#}");
                             }
@@ -634,6 +664,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
         if committed_changed {
             match load_committed_chain(&settings, false) {
                 Ok(disk_chain) => {
+                    let disk_mempool_txids = disk_chain.mempool_txids();
                     let mut local = chain.lock().expect("chain mutex poisoned");
                     relay_after_merge.extend(merge_mempool_from_chain(
                         &mut local,
@@ -650,6 +681,14 @@ pub fn run_node(settings: Settings) -> Result<()> {
                         relay_after_merge.extend(adopted.mempool.iter().take(64).cloned());
                         *local = adopted;
                     }
+                    // A same-tip GUI/CLI save may contain only one side of a
+                    // concurrent mempool update. The live owner merges both
+                    // sides; if that union differs from the committed state,
+                    // schedule one coalesced commit so restart durability and
+                    // the lightweight identity check converge again.
+                    if local.mempool_txids() != disk_mempool_txids {
+                        mempool_dirty.store(true, Ordering::Release);
+                    }
                 }
                 Err(err) => {
                     eprintln!("HF123 committed-state reconcile skipped: {err:#}");
@@ -662,33 +701,69 @@ pub fn run_node(settings: Settings) -> Result<()> {
             let mut local = chain.lock().expect("chain mutex poisoned");
             if let Ok(report) = reconcile_pending_txs(&settings, &mut local) {
                 if report.reaccepted > 0 {
-                    if let Err(err) = save_chain(&settings, &local) {
-                        eprintln!("HF123 pending-outbox persistence failed: {err:#}");
-                    }
+                    mempool_dirty.store(true, Ordering::Relaxed);
                 }
             }
-            let mut txs = local
-                .mempool
-                .iter()
-                .filter(|tx| hf106_jin_sale_standardness_policy(tx, &settings).is_ok())
-                .cloned()
-                .collect::<Vec<_>>();
-            txs.sort_by_key(|tx| {
-                (
-                    mempool_template_priority(&settings, tx),
-                    tx.txid().to_string(),
-                )
-            });
-            txs.into_iter().take(96).collect::<Vec<_>>()
+            hf124_fair_mempool_relay_batch(&settings, &local.mempool, 96)
         } else {
             Vec::new()
         };
 
-        for tx in relay_after_merge
+        // HF124/v1.8.1: coalesce mempool-only Fast Chain Engine commits. Clone
+        // the copy-on-write canonical state under the mutex, then perform the
+        // state-file commit after releasing it so inbound blocks and mining are
+        // not paused by disk I/O. save_chain()/publish_live_chain() protects
+        // same-tip mempool unions; a post-save identity check schedules another
+        // commit if the canonical owner moved while this snapshot was written.
+        if last_mempool_persist.elapsed() >= Duration::from_secs(5)
+            && mempool_dirty.swap(false, Ordering::AcqRel)
+        {
+            last_mempool_persist = Instant::now();
+            let snapshot = match chain.try_lock() {
+                Ok(local) => Some(local.clone()),
+                Err(_) => {
+                    mempool_dirty.store(true, Ordering::Release);
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                if let Err(err) = save_chain(&settings, &snapshot) {
+                    mempool_dirty.store(true, Ordering::Release);
+                    eprintln!("HF124 coalesced mempool persistence failed: {err:#}");
+                } else {
+                    match chain.try_lock() {
+                        Ok(current) => {
+                            if current.tip_hash() != snapshot.tip_hash()
+                                || current.mempool_txids() != snapshot.mempool_txids()
+                            {
+                                mempool_dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(_) => mempool_dirty.store(true, Ordering::Release),
+                    }
+                }
+            }
+        }
+
+        // HF124/v1.8.1: relay the heartbeat as one bounded Mempool message per
+        // peer, not one fresh TCP connection per transaction. A share backlog
+        // can contain hundreds of entries; per-tx fanout would otherwise create
+        // another self-amplifying connection storm even after validation and
+        // persistence were fixed.
+        let mut relay_seen = HashSet::<Hash256>::new();
+        let relay_candidates = relay_after_merge
             .into_iter()
             .chain(mempool_for_periodic.into_iter())
-        {
-            let _ = relay_tx_to_known_peers(&settings, &tx, None);
+            .filter(|tx| relay_seen.insert(tx.txid()))
+            .collect::<Vec<_>>();
+        let relay_batch = hf124_fair_mempool_relay_batch(&settings, &relay_candidates, 96);
+        if !relay_batch.is_empty() {
+            let _ = relay_mempool_batch_to_known_peers(
+                &settings,
+                &relay_batch,
+                None,
+                settings.p2p.max_outbound_peers.max(4).min(8),
+            );
         }
         // HF88/v1.6.2: outbound loop is the always-on lifeline. Keep a bounded
         // catch-up heartbeat running even if the GUI is idle or inbound bind is
@@ -5556,21 +5631,72 @@ fn hf115_mempool_inbound_limit(settings: &Settings) -> usize {
         .max(1)
 }
 
-fn hf115_mempool_relay_batch(settings: &Settings, mempool: &[Transaction]) -> Vec<Transaction> {
-    let mut txs = mempool
+fn hf124_fair_mempool_relay_batch(
+    settings: &Settings,
+    mempool: &[Transaction],
+    max_count: usize,
+) -> Vec<Transaction> {
+    let max_count = max_count.max(1);
+    let mut shares = Vec::new();
+    let mut ordinary = Vec::new();
+    for tx in mempool
         .iter()
         .filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok())
-        .collect::<Vec<_>>();
-    txs.sort_by_cached_key(|tx| {
+    {
+        if is_pool_share_transaction(tx) {
+            shares.push(tx);
+        } else {
+            ordinary.push(tx);
+        }
+    }
+    // Relay the oldest still-confirmable shares first so a multi-parent
+    // backlog drains before earlier shares expire. Mempool admission already
+    // guarantees these markers are structurally valid.
+    shares.sort_by_cached_key(|tx| {
+        (
+            parse_pool_share_tx(tx)
+                .map(|share| share.parent_height)
+                .unwrap_or(u32::MAX),
+            tx.txid().to_string(),
+        )
+    });
+    ordinary.sort_by_cached_key(|tx| {
         (
             mempool_template_priority(settings, *tx),
             tx.txid().to_string(),
         )
     });
-    txs.into_iter()
-        .take(hf115_mempool_inbound_limit(settings).min(HF116_MEMPOOL_RELAY_BATCH_TXS))
-        .cloned()
-        .collect::<Vec<_>>()
+
+    // HF124/v1.8.1: reserve relay space for ordinary transactions so a pool-
+    // share burst cannot starve QUB/JIN/Library traffic. Shares are also capped
+    // to one block's consensus capacity per relay batch.
+    let ordinary_reserve = if ordinary.is_empty() {
+        0
+    } else {
+        ordinary.len().min((max_count / 4).max(1))
+    };
+    let share_quota = settings
+        .pools
+        .max_share_txs_per_block
+        .min(max_count.saturating_sub(ordinary_reserve));
+
+    let mut out = Vec::with_capacity(max_count);
+    out.extend(shares.iter().take(share_quota).map(|tx| (*tx).clone()));
+    out.extend(
+        ordinary
+            .iter()
+            .take(max_count.saturating_sub(out.len()))
+            .map(|tx| (*tx).clone()),
+    );
+    out
+}
+
+fn hf115_mempool_relay_batch(settings: &Settings, mempool: &[Transaction]) -> Vec<Transaction> {
+    hf124_fair_mempool_relay_batch(
+        settings,
+        mempool,
+        hf115_mempool_inbound_limit(settings).min(HF116_MEMPOOL_RELAY_BATCH_TXS),
+    )
 }
 
 fn merge_mempool_from_chain(
@@ -5578,30 +5704,60 @@ fn merge_mempool_from_chain(
     source: &ChainState,
     settings: &Settings,
 ) -> Vec<Transaction> {
-    // HF76/v1.5.8: merge by txid and let full mempool admission resolve feature-state
-    // conflicts. This is used before any p2p loop save so GUI/CLI-created txs cannot
-    // be overwritten by an older in-memory node view.
-    let mut accepted = Vec::<Transaction>::new();
-    let mut known = local.mempool_txids();
-    for tx in source
+    // HF124/v1.8.1: merge by txid with the same bounded batch-aware admission
+    // used for peer mempool messages. A GUI/CLI snapshot carrying a share burst
+    // must not rebuild confirmed pool context once per transaction while the
+    // canonical owner is being reconciled.
+    let known = local.mempool_txids();
+    let candidates = source
         .mempool
         .iter()
-        .cloned()
+        .filter(|tx| !known.contains(&tx.txid()))
         .take(effective_mempool_max_transactions(settings))
-    {
-        let txid = tx.txid();
-        if known.contains(&txid) {
+        .cloned()
+        .collect::<Vec<_>>();
+    local
+        .accept_transactions_to_mempool_batch(candidates, settings)
+        .unwrap_or_default()
+}
+
+fn relay_mempool_batch_to_known_peers(
+    settings: &Settings,
+    txs: &[Transaction],
+    source_peer: Option<&str>,
+    max_peers: usize,
+) -> Result<usize> {
+    if !settings.p2p.enabled || txs.is_empty() {
+        return Ok(0);
+    }
+    let source = source_peer.map(normalize_peer_addr).unwrap_or_default();
+    let chain = load_chain_for_hf90_catchup(settings)?;
+    let message = WireMessage::Mempool {
+        txs: txs
+            .iter()
+            .take(HF116_MEMPOOL_RELAY_BATCH_TXS)
+            .cloned()
+            .collect(),
+    };
+    let mut sent = 0usize;
+    for addr in prioritized_outbound_peers(settings, max_peers.max(1).min(16))? {
+        let normalized = normalize_peer_addr(&addr);
+        if normalized.is_empty() || (!source.is_empty() && normalized == source) {
             continue;
         }
-        if local
-            .accept_transaction_to_mempool(tx.clone(), settings)
-            .is_ok()
-        {
-            known.insert(txid);
-            accepted.push(tx);
+        let Ok(mut stream) = connect_peer(&normalized, Duration::from_secs(2)) else {
+            continue;
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        if send_version(&mut stream, settings, &chain).is_err() {
+            continue;
+        }
+        if send_wire(&mut stream, &message).is_ok() {
+            sent = sent.saturating_add(1);
         }
     }
-    accepted
+    Ok(sent)
 }
 
 pub fn rebroadcast_local_mempool(settings: &Settings, max_txs: usize) -> Result<usize> {
@@ -5609,25 +5765,18 @@ pub fn rebroadcast_local_mempool(settings: &Settings, max_txs: usize) -> Result<
         return Ok(0);
     }
     let chain = load_chain_for_hf90_catchup(settings)?;
-    let mut txs = chain.mempool.iter().collect::<Vec<_>>();
-    // HF107/v1.6.9: prioritize pool shares and high-impact JIN protocol txs
-    // deterministically so large JIN sale purchases do not bounce around the
-    // network while ordinary traffic is relayed first.
-    txs.sort_by_cached_key(|tx| {
-        (
-            mempool_template_priority(settings, *tx),
-            tx.txid().to_string(),
-        )
-    });
-    let mut sent = 0usize;
-    for tx in txs
-        .into_iter()
-        .filter(|tx| hf106_jin_sale_standardness_policy(tx, settings).is_ok())
-        .take(max_txs.max(1).min(HF116_MEMPOOL_RELAY_BATCH_TXS))
-    {
-        sent = sent.saturating_add(relay_tx_to_known_peers(settings, tx, None).unwrap_or(0));
-    }
-    Ok(sent)
+    let txs = hf124_fair_mempool_relay_batch(
+        settings,
+        &chain.mempool,
+        max_txs.max(1).min(HF116_MEMPOOL_RELAY_BATCH_TXS),
+    );
+    let peers = relay_mempool_batch_to_known_peers(
+        settings,
+        &txs,
+        None,
+        settings.p2p.max_outbound_peers.max(4).min(8),
+    )?;
+    Ok(peers.saturating_mul(txs.len()))
 }
 
 pub fn broadcast_block(settings: &Settings, block: &Block) -> Result<usize> {
@@ -5784,11 +5933,22 @@ fn relay_tx_to_known_peers(
     if !settings.p2p.enabled {
         return Ok(0);
     }
+    // HF124/v1.8.1: capture one immutable Fast Chain Engine snapshot for the
+    // whole relay fanout. The old loop reloaded canonical state once per peer,
+    // multiplying every accepted share into several unnecessary storage reads.
+    let chain = load_chain_for_hf90_catchup(settings)?;
     let source = source_peer.map(normalize_peer_addr).unwrap_or_default();
+    let max_peers = if is_pool_share_transaction(tx) {
+        // HF124/v1.8.1: prevent share storms from opening up to 48 fresh TCP
+        // connections per accepted marker. Periodic fair batches provide
+        // continued propagation, while eight official-first peers are enough
+        // for immediate network diffusion.
+        settings.p2p.max_outbound_peers.max(4).min(8)
+    } else {
+        settings.p2p.max_outbound_peers.max(16).min(48)
+    };
     let mut sent = 0usize;
-    for addr in
-        prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(16).min(48))?
-    {
+    for addr in prioritized_outbound_peers(settings, max_peers)? {
         let normalized = normalize_peer_addr(&addr);
         if normalized.is_empty() || (!source.is_empty() && normalized == source) {
             continue;
@@ -5798,7 +5958,6 @@ fn relay_tx_to_known_peers(
         };
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let chain = load_chain_for_hf90_catchup(settings)?;
         if send_version(&mut stream, settings, &chain).is_err() {
             continue;
         }
@@ -5810,6 +5969,9 @@ fn relay_tx_to_known_peers(
 }
 
 fn broadcast(settings: &Settings, message: WireMessage) -> Result<usize> {
+    // Capture one state snapshot for the full fanout; do not reload Fast Chain
+    // Engine state for every destination socket.
+    let chain = load_chain_for_hf90_catchup(settings)?;
     let mut sent = 0usize;
     for addr in
         prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(16).min(48))?
@@ -5819,7 +5981,6 @@ fn broadcast(settings: &Settings, message: WireMessage) -> Result<usize> {
         };
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let chain = load_chain_for_hf90_catchup(settings)?;
         let _ = send_version(&mut stream, settings, &chain);
         if send_wire(&mut stream, &message).is_ok() {
             sent += 1;
@@ -5836,6 +5997,7 @@ fn handle_peer(
     chain: Arc<Mutex<ChainState>>,
     peers: Arc<Mutex<HashSet<String>>>,
     active: Arc<Mutex<HashSet<String>>>,
+    mempool_dirty: Arc<AtomicBool>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
@@ -5872,6 +6034,7 @@ fn handle_peer(
                         &mut stream,
                         &chain,
                         &peers,
+                        &mempool_dirty,
                         &mut session,
                     ) {
                         peer_errors = peer_errors.saturating_add(1);
@@ -5921,6 +6084,7 @@ fn process_peer_message(
     stream: &mut TcpStream,
     chain: &Arc<Mutex<ChainState>>,
     peers: &Arc<Mutex<HashSet<String>>>,
+    mempool_dirty: &Arc<AtomicBool>,
     session: &mut PeerSession,
 ) -> Result<()> {
     match message {
@@ -6035,6 +6199,7 @@ fn process_peer_message(
                 ) {
                     Ok(true) => {
                         save_chain(settings, &local)?;
+                        mempool_dirty.store(false, Ordering::Release);
                         changed = true;
                     }
                     Ok(false) => {
@@ -6074,6 +6239,7 @@ fn process_peer_message(
             if block.header.prev_block_hash == local.tip_hash() {
                 local.connect_block(block, settings)?;
                 save_chain(settings, &local)?;
+                mempool_dirty.store(false, Ordering::Release);
                 changed = true;
             } else {
                 let h = local.height();
@@ -6085,21 +6251,26 @@ fn process_peer_message(
             }
         }
         WireMessage::Tx { tx } => {
-            let accepted = {
+            let (accepted, mempool_changed) = {
                 let mut local = chain.lock().expect("chain mutex poisoned");
-                if local
+                let before_len = local.mempool.len();
+                let accepted = local
                     .accept_transaction_to_mempool(tx.clone(), settings)
-                    .is_ok()
-                {
-                    save_chain(settings, &local)?;
-                    true
-                } else {
-                    false
-                }
+                    .is_ok();
+                (accepted, accepted || local.mempool.len() != before_len)
             };
-            if accepted {
+            if mempool_changed {
+                // Admission may also prune structurally stale pool shares before
+                // rejecting a new transaction. Persist that real local policy
+                // change even when the incoming transaction itself was rejected.
+                mempool_dirty.store(true, Ordering::Release);
+            }
+            if accepted && !is_pool_share_transaction(&tx) {
                 let _ = relay_tx_to_known_peers(settings, &tx, Some(peer_addr));
             }
+            // Inbound pool shares are propagated by the six-second fair batch
+            // heartbeat. Deferring their fanout prevents legacy peers that send
+            // shares one-by-one from forcing a new outbound socket burst here.
         }
         WireMessage::GetMempool => {
             let txs = {
@@ -6109,23 +6280,32 @@ fn process_peer_message(
             send_wire(stream, &WireMessage::Mempool { txs })?;
         }
         WireMessage::Mempool { txs } => {
-            let mut accepted_txs = Vec::new();
-            {
+            let (accepted_txs, mempool_changed) = {
                 let mut local = chain.lock().expect("chain mutex poisoned");
-                for tx in txs.into_iter().take(hf115_mempool_inbound_limit(settings)) {
-                    if local
-                        .accept_transaction_to_mempool(tx.clone(), settings)
-                        .is_ok()
-                    {
-                        accepted_txs.push(tx);
-                    }
-                }
-                if !accepted_txs.is_empty() {
-                    save_chain(settings, &local)?;
-                }
+                let before_len = local.mempool.len();
+                let accepted = local.accept_transactions_to_mempool_batch(
+                    txs.into_iter()
+                        .take(hf115_mempool_inbound_limit(settings)),
+                    settings,
+                )?;
+                let changed = !accepted.is_empty() || local.mempool.len() != before_len;
+                (accepted, changed)
+            };
+            if mempool_changed {
+                mempool_dirty.store(true, Ordering::Release);
             }
-            for tx in accepted_txs {
-                let _ = relay_tx_to_known_peers(settings, &tx, Some(peer_addr));
+            if !accepted_txs.is_empty() {
+                let relay_batch = hf124_fair_mempool_relay_batch(
+                    settings,
+                    &accepted_txs,
+                    HF116_MEMPOOL_RELAY_BATCH_TXS,
+                );
+                let _ = relay_mempool_batch_to_known_peers(
+                    settings,
+                    &relay_batch,
+                    Some(peer_addr),
+                    settings.p2p.max_outbound_peers.max(4).min(8),
+                );
             }
         }
         WireMessage::GetAddr => {
@@ -6320,13 +6500,21 @@ fn process_client_message(
         }
         WireMessage::Tx { tx } => {
             let mut local = load_chain_for_hf90_catchup(settings)?;
-            if local
+            let before_len = local.mempool.len();
+            let accepted = local
                 .accept_transaction_to_mempool(tx.clone(), settings)
-                .is_ok()
-            {
+                .is_ok();
+            if accepted || local.mempool.len() != before_len {
+                // Even a rejected transaction may trigger deterministic cleanup
+                // of stale/unconfirmable pool shares. Persist that real policy
+                // change in the standalone sync/client path as well.
                 save_chain(settings, &local)?;
+            }
+            if accepted {
                 report.txs_accepted += 1;
-                let _ = relay_tx_to_known_peers(settings, &tx, Some(addr));
+                if !is_pool_share_transaction(&tx) {
+                    let _ = relay_tx_to_known_peers(settings, &tx, Some(addr));
+                }
             }
         }
         WireMessage::Addr { addrs } => {
@@ -6369,21 +6557,30 @@ fn process_client_message(
         }
         WireMessage::Mempool { txs } => {
             let mut local = load_chain_for_hf90_catchup(settings)?;
-            let mut accepted_txs = Vec::<Transaction>::new();
-            for tx in txs.into_iter().take(hf115_mempool_inbound_limit(settings)) {
-                if local
-                    .accept_transaction_to_mempool(tx.clone(), settings)
-                    .is_ok()
-                {
-                    accepted_txs.push(tx);
-                }
+            let before_len = local.mempool.len();
+            let accepted_txs = local.accept_transactions_to_mempool_batch(
+                txs.into_iter()
+                    .take(hf115_mempool_inbound_limit(settings)),
+                settings,
+            )?;
+            if !accepted_txs.is_empty() || local.mempool.len() != before_len {
+                save_chain(settings, &local)?;
             }
             if !accepted_txs.is_empty() {
-                save_chain(settings, &local)?;
                 report.txs_accepted = report.txs_accepted.saturating_add(accepted_txs.len());
             }
-            for tx in accepted_txs {
-                let _ = relay_tx_to_known_peers(settings, &tx, Some(addr));
+            if !accepted_txs.is_empty() {
+                let relay_batch = hf124_fair_mempool_relay_batch(
+                    settings,
+                    &accepted_txs,
+                    HF116_MEMPOOL_RELAY_BATCH_TXS,
+                );
+                let _ = relay_mempool_batch_to_known_peers(
+                    settings,
+                    &relay_batch,
+                    Some(addr),
+                    settings.p2p.max_outbound_peers.max(4).min(8),
+                );
             }
         }
         WireMessage::Ping { nonce } => send_wire(stream, &WireMessage::Pong { nonce })?,
@@ -7850,4 +8047,65 @@ fn finish_report(settings: &Settings, mut report: P2PSyncReport) -> Result<P2PSy
     report.height = chain.height();
     report.tip_hash = chain.tip_hash().to_string();
     Ok(report)
+}
+
+#[cfg(test)]
+mod hf124_tests {
+    use super::*;
+
+    fn regtest_settings() -> Settings {
+        toml::from_str(include_str!("../config/regtest.toml"))
+            .expect("regtest config parses")
+    }
+
+    fn dummy_tx(version: u32, marker: u8) -> Transaction {
+        Transaction {
+            version,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::null(),
+                signature_script: ScriptBuf(vec![marker]),
+                sequence: u32::MAX,
+            }],
+            outputs: Vec::new(),
+            locktime: marker as u32,
+        }
+    }
+
+    #[test]
+    fn hf124_relay_batch_reserves_space_for_ordinary_transactions() {
+        let settings = regtest_settings();
+        let mut mempool = (0u8..20)
+            .map(|marker| dummy_tx(TX_VERSION_POOL_SHARE, marker))
+            .collect::<Vec<_>>();
+        let ordinary = dummy_tx(1, 250);
+        let ordinary_txid = ordinary.txid();
+        mempool.push(ordinary);
+
+        let batch = hf124_fair_mempool_relay_batch(&settings, &mempool, 8);
+        assert_eq!(batch.len(), 8);
+        assert!(batch.iter().any(|tx| tx.txid() == ordinary_txid));
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|tx| is_pool_share_transaction(tx))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn hf124_relay_batch_never_relays_more_than_one_block_of_shares() {
+        let settings = regtest_settings();
+        let mempool = (0u16..200)
+            .map(|marker| {
+                let mut tx = dummy_tx(TX_VERSION_POOL_SHARE, marker as u8);
+                tx.locktime = marker as u32;
+                tx
+            })
+            .collect::<Vec<_>>();
+
+        let batch = hf124_fair_mempool_relay_batch(&settings, &mempool, 200);
+        assert_eq!(batch.len(), settings.pools.max_share_txs_per_block);
+        assert!(batch.iter().all(is_pool_share_transaction));
+    }
 }
