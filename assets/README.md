@@ -1,5 +1,5 @@
-﻿# Assets
+# Runtime assets intentionally excluded
 
-Runtime image, audio and font assets are intentionally excluded from the public source package.
+This is a no-assets QUB Core source package. Copy the known-good runtime `assets/` directory from the currently deployed QUB Core source tree before producing the Windows distribution.
 
-Never commit private keys, wallet files, chain state, installers, build artifacts or user-specific runtime files.
+Do not place wallet files, private keys, chain data, installers, build outputs or user-specific files in this directory.

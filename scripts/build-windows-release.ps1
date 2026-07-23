@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.8.1'
+$Version = '1.8.2'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
@@ -74,6 +74,12 @@ foreach ($Doc in @(
     'RELEASE_NOTES-v1.8.1-HF124.md',
     'HF124-v181-RELIABILITY-REVIEW.md',
     'HF124-v181-DEPLOY-RUNBOOK.md',
+    'RELEASE_NOTES-v1.8.2-HF125.md',
+    'HF125-v182-RELIABILITY-REVIEW.md',
+    'HF125-v182-DEPLOY-RUNBOOK.md',
+    'RELEASE_NOTES-v1.8.2-HF126.md',
+    'HF126-v182-RELIABILITY-REVIEW.md',
+    'HF126-v182-DEPLOY-RUNBOOK.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',

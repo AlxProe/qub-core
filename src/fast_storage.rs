@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,6 +22,16 @@ pub const HF123_FAST_STATUS_RECENT_BLOCKS: usize = 64;
 pub const HF123_LEGACY_EXPORT_INTERVAL_SECS: u64 = 6 * 60 * 60;
 pub const HF123_LEGACY_EXPORT_BLOCK_INTERVAL: u32 = 256;
 pub const HF123_STORAGE_LOCK_STALE_SECS: u64 = 15 * 60;
+
+/// HF126/v1.8.2 keeps normal Fast Chain Engine commits strictly
+/// cumulative-work monotonic, while permitting one explicitly verified
+/// equal-work/same-height branch replacement during stale-local re-anchoring.
+/// The verified policy is never used by ordinary block, mempool or RPC writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FastCommitPolicy {
+    Normal,
+    VerifiedEqualWorkReanchor,
+}
 
 static FAST_LOADS: AtomicU64 = AtomicU64::new(0);
 static FAST_COMMITS: AtomicU64 = AtomicU64::new(0);
@@ -1034,27 +1045,54 @@ pub(crate) fn migrate_legacy_chain(
 }
 
 fn ensure_candidate_not_behind_committed(
+    settings: &Settings,
     chain: &ChainState,
     current: &FastStoragePointer,
+    policy: FastCommitPolicy,
 ) -> Result<()> {
     let candidate_work = total_work_value(chain)?;
     let committed_work = parse_work(&current.total_work_hex)?;
-    if candidate_work < committed_work {
+    let candidate_height = chain.height();
+    let candidate_tip = chain.tip_hash();
+    let equal_work_sibling = settings.network.name == "mainnet"
+        && candidate_work == committed_work
+        && candidate_height == current.committed_height
+        && candidate_tip != current.tip_hash;
+    let verified_equal_work_reanchor =
+        policy == FastCommitPolicy::VerifiedEqualWorkReanchor && equal_work_sibling;
+    let stale = candidate_work < committed_work
+        || (candidate_work == committed_work && candidate_height < current.committed_height)
+        || (equal_work_sibling && !verified_equal_work_reanchor);
+    if stale {
         bail!(
-            "stale Fast Chain Engine persistence rejected: candidate #{} {} has less work than committed #{} {}",
-            chain.height(),
-            chain.tip_hash(),
+            "stale Fast Chain Engine persistence rejected: candidate #{} {} work={} cannot replace committed #{} {} work={}",
+            candidate_height,
+            candidate_tip,
+            candidate_work.to_str_radix(16),
             current.committed_height,
-            current.tip_hash
+            current.tip_hash,
+            committed_work.to_str_radix(16),
+        );
+    }
+    if policy == FastCommitPolicy::VerifiedEqualWorkReanchor
+        && !verified_equal_work_reanchor
+    {
+        bail!(
+            "verified equal-work re-anchor rejected: candidate #{} {} must be a different same-height/same-work mainnet tip from committed #{} {}",
+            candidate_height,
+            candidate_tip,
+            current.committed_height,
+            current.tip_hash,
         );
     }
     Ok(())
 }
 
-pub(crate) fn commit_chain(
+fn commit_chain_with_policy(
     settings: &Settings,
     paths: &NodePaths,
     chain: &ChainState,
+    policy: FastCommitPolicy,
 ) -> Result<FastStorageIdentity> {
     let started = Instant::now();
     let _lease = acquire_lease(paths)?;
@@ -1068,7 +1106,7 @@ pub(crate) fn commit_chain(
                 pointer.tip_hash
             );
         }
-        ensure_candidate_not_behind_committed(chain, &pointer)?;
+        ensure_candidate_not_behind_committed(settings, chain, &pointer, policy)?;
         Some(pointer)
     } else {
         None
@@ -1118,6 +1156,27 @@ pub(crate) fn commit_chain(
     FAST_LAST_COMMIT_MILLIS.store(millis, Ordering::Relaxed);
     record_max(&FAST_MAX_COMMIT_MILLIS, millis);
     Ok(pointer.identity())
+}
+
+pub(crate) fn commit_chain(
+    settings: &Settings,
+    paths: &NodePaths,
+    chain: &ChainState,
+) -> Result<FastStorageIdentity> {
+    commit_chain_with_policy(settings, paths, chain, FastCommitPolicy::Normal)
+}
+
+pub(crate) fn commit_chain_verified_equal_work_reanchor(
+    settings: &Settings,
+    paths: &NodePaths,
+    chain: &ChainState,
+) -> Result<FastStorageIdentity> {
+    commit_chain_with_policy(
+        settings,
+        paths,
+        chain,
+        FastCommitPolicy::VerifiedEqualWorkReanchor,
+    )
 }
 
 fn fast_status_from_pointer(
@@ -1422,36 +1481,20 @@ pub fn live_chain_snapshot(settings: &Settings) -> Option<ChainState> {
     Some(snapshot)
 }
 
-pub(crate) fn publish_live_chain(settings: &Settings, candidate: &ChainState) {
-    let Some(live) = live_chain_arc(settings) else {
-        return;
-    };
-    let Ok(mut current) = live.try_lock() else {
-        // Caller may already hold the canonical mutex; in that case the state is
-        // already current and no secondary publication is needed.
-        return;
-    };
+fn apply_live_candidate_locked(
+    settings: &Settings,
+    current: &mut ChainState,
+    candidate: &ChainState,
+) {
     if current.tip_hash() == candidate.tip_hash() {
-        // HF124/v1.8.1: same-tip saves are commonly produced by GUI/CLI
-        // transaction submission while the embedded node is concurrently
-        // receiving other mempool entries. Replacing the live owner with one
-        // snapshot could silently drop the other side of that race.
+        // Same-tip saves are commonly produced by GUI/CLI transaction
+        // submission while the embedded node concurrently receives other
+        // mempool entries. Never replace one side of that race blindly.
         let current_txids = current.mempool_txids();
         let candidate_txids = candidate.mempool_txids();
-
-        // The normal coalesced P2P save publishes an older copy-on-write
-        // snapshot after the live owner has already accepted the same or newer
-        // transactions. If every candidate entry is already in the owner,
-        // preserve the owner without revalidating the whole mempool under its
-        // mutex; the dirty post-save identity check will persist any newer
-        // entries in the next bounded commit.
         if candidate_txids.is_subset(&current_txids) {
             return;
         }
-
-        // A GUI/CLI writer can instead carry additional same-tip transactions.
-        // Merge and revalidate the deterministic union only for that real
-        // divergence; invalid/conflicting entries are filtered by normal policy.
         let candidates = current.reorg_mempool_candidates_for(candidate);
         let mut merged = current.clone();
         merged.rebuild_mempool_from(candidates, settings);
@@ -1460,7 +1503,7 @@ pub(crate) fn publish_live_chain(settings: &Settings, candidate: &ChainState) {
     }
 
     let candidate_work = total_work_value(candidate).ok();
-    let current_work = total_work_value(&current).ok();
+    let current_work = total_work_value(current).ok();
     let should_publish = match (candidate_work, current_work) {
         (Some(candidate_work), Some(current_work)) => candidate_work > current_work,
         _ => candidate.height() > current.height(),
@@ -1468,6 +1511,160 @@ pub(crate) fn publish_live_chain(settings: &Settings, candidate: &ChainState) {
     if should_publish {
         *current = candidate.clone();
     }
+}
+
+fn deferred_live_publications() -> &'static StdMutex<HashMap<PathBuf, ChainState>> {
+    static PENDING: OnceLock<StdMutex<HashMap<PathBuf, ChainState>>> = OnceLock::new();
+    PENDING.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn deferred_live_workers() -> &'static StdMutex<HashSet<PathBuf>> {
+    static WORKERS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
+    WORKERS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn merge_deferred_candidate(settings: &Settings, existing: &mut ChainState, candidate: &ChainState) {
+    if existing.tip_hash() == candidate.tip_hash() {
+        apply_live_candidate_locked(settings, existing, candidate);
+        return;
+    }
+    let candidate_work = total_work_value(candidate).ok();
+    let existing_work = total_work_value(existing).ok();
+    let replace = match (candidate_work, existing_work) {
+        (Some(candidate_work), Some(existing_work)) => candidate_work > existing_work,
+        _ => candidate.height() > existing.height(),
+    };
+    if replace {
+        *existing = candidate.clone();
+    }
+}
+
+fn spawn_deferred_live_worker(settings: Settings, key: PathBuf) {
+    let should_spawn = {
+        let Ok(mut workers) = deferred_live_workers().lock() else {
+            return;
+        };
+        workers.insert(key.clone())
+    };
+    if !should_spawn {
+        return;
+    }
+
+    thread::spawn(move || {
+        loop {
+            let candidate = deferred_live_publications()
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.remove(&key));
+            let Some(candidate) = candidate else {
+                break;
+            };
+            let Some(live) = live_chain_arc(&settings) else {
+                continue;
+            };
+            if let Ok(mut current) = live.lock() {
+                apply_live_candidate_locked(&settings, &mut current, &candidate);
+            };
+        }
+
+        if let Ok(mut workers) = deferred_live_workers().lock() {
+            workers.remove(&key);
+        }
+
+        // Close the small insertion/removal race: a publisher may have queued a
+        // candidate while this worker was finishing but still registered.
+        let restart = deferred_live_publications()
+            .lock()
+            .map(|pending| pending.contains_key(&key))
+            .unwrap_or(false);
+        if restart {
+            spawn_deferred_live_worker(settings, key);
+        }
+    });
+}
+
+pub(crate) fn publish_live_chain(settings: &Settings, candidate: &ChainState) {
+    let Some(live) = live_chain_arc(settings) else {
+        return;
+    };
+    if let Ok(mut current) = live.try_lock() {
+        apply_live_candidate_locked(settings, &mut current, candidate);
+        return;
+    }
+
+    // HF125/v1.8.2: a GUI/CLI block can be durably committed while the embedded
+    // P2P owner briefly holds its mutex. HF123/HF124 silently dropped this live
+    // publication, leaving persistent peer sessions advertising the old tip.
+    // Queue one best candidate per data directory and publish it from a detached
+    // single-flight worker as soon as the canonical mutex becomes available.
+    let key = registry_key(settings);
+    if let Ok(mut pending) = deferred_live_publications().lock() {
+        match pending.get_mut(&key) {
+            Some(existing) => merge_deferred_candidate(settings, existing, candidate),
+            None => {
+                pending.insert(key.clone(), candidate.clone());
+            }
+        }
+    } else {
+        return;
+    }
+    spawn_deferred_live_worker(settings.clone(), key);
+}
+
+/// HF126/v1.8.2 publishes a fully validated equal-work re-anchor synchronously
+/// after its durable commit. The storage mutex is released by the caller before
+/// this blocking live-owner update, avoiding the storage/live lock inversion.
+pub(crate) fn publish_live_chain_verified_equal_work_reanchor(
+    settings: &Settings,
+    candidate: &ChainState,
+) -> Result<()> {
+    let Some(live) = live_chain_arc(settings) else {
+        return Ok(());
+    };
+    let mut current = live
+        .lock()
+        .map_err(|_| anyhow::anyhow!("live chain mutex poisoned during verified re-anchor"))?;
+    if current.tip_hash() == candidate.tip_hash() {
+        apply_live_candidate_locked(settings, &mut current, candidate);
+        return Ok(());
+    }
+    let candidate_work = total_work_value(candidate)?;
+    let current_work = total_work_value(&current)?;
+
+    // The durable commit happened before this live-owner publication. Another
+    // thread may have advanced the live owner while we were waiting for its
+    // mutex. Never replace a stronger live chain with the verified sibling.
+    if current_work > candidate_work
+        || (current_work == candidate_work && current.height() > candidate.height())
+    {
+        return Ok(());
+    }
+
+    // A delayed live owner may still be behind the already committed candidate.
+    if candidate_work > current_work
+        || (candidate_work == current_work && candidate.height() > current.height())
+    {
+        *current = candidate.clone();
+        return Ok(());
+    }
+
+    let allowed_equal_height_sibling = settings.network.name == "mainnet"
+        && candidate_work == current_work
+        && candidate.height() == current.height()
+        && candidate.tip_hash() != current.tip_hash();
+    if !allowed_equal_height_sibling {
+        bail!(
+            "verified live re-anchor rejected: candidate #{} {} work={} does not safely replace current #{} {} work={}",
+            candidate.height(),
+            candidate.tip_hash(),
+            candidate_work.to_str_radix(16),
+            current.height(),
+            current.tip_hash(),
+            current_work.to_str_radix(16),
+        );
+    }
+    *current = candidate.clone();
+    Ok(())
 }
 
 pub fn live_chain_identity(settings: &Settings) -> Option<FastStorageIdentity> {

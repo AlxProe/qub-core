@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.8.1";
+const RPC_VERSION: &str = "1.8.2";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;
@@ -279,7 +279,7 @@ pub fn start_embedded(settings: Settings, chain: Arc<Mutex<ChainState>>) -> Resu
     let bind = settings.rpc.bind.clone();
     let listener = prepare_listener(&settings, &bind)?;
     let state = Arc::new(build_server_state(settings, RpcBackend::Embedded(chain))?);
-    println!("QUB HF124 embedded RPC listening on http://{bind}");
+    println!("QUB HF126 embedded RPC listening on http://{bind}");
     println!(
         "RPC mode={} remote={} state_changes=true mining_templates=true",
         state.backend.mode_name(),
@@ -301,7 +301,7 @@ pub fn run_standalone(settings: Settings, bind_override: Option<&str>) -> Result
         settings,
         RpcBackend::StandaloneReadOnly,
     )?);
-    println!("QUB HF124 standalone read-only RPC listening on http://{bind}");
+    println!("QUB HF126 standalone read-only RPC listening on http://{bind}");
     println!("State-changing endpoints require embedded `qubd node` mode.");
     serve(listener, state);
     Ok(())
@@ -1211,8 +1211,7 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
         if block.header.version != expected_block_version(&state.settings, job.height) {
             bail!("job block version is no longer valid");
         }
-        chain.connect_block(block.clone(), &state.settings)?;
-        save_chain(&state.settings, chain)?;
+        connect_block_persist_atomic(&state.settings, chain, block.clone())?;
         Ok(true)
     });
 
@@ -1223,10 +1222,10 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
         }
         Err(err) => return Err(err),
     };
-    let relayed = if accepted {
-        crate::p2p::broadcast_block(&state.settings, &block).unwrap_or(0)
+    let relay_report = if accepted {
+        crate::p2p::broadcast_block_confirmed(&state.settings, &block).unwrap_or_default()
     } else {
-        0
+        crate::p2p::BlockRelayReport::default()
     };
     if let Ok(mut jobs) = state.jobs.lock() {
         jobs.invalidate_parent(job.parent_hash);
@@ -1241,7 +1240,9 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
             "hash":block_hash.to_string(),
             "mode":job.mode,
             "payout_label":job.payout_label,
-            "relayed_to_peers":relayed,
+            "relay_acknowledged":relay_report.acknowledged(),
+            "relay_pending_retry":relay_report.pending_retry,
+            "relay_report":relay_report,
         }),
     ))
 }

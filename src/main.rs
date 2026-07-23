@@ -50,6 +50,8 @@ fn run() -> Result<()> {
         "melt-qub-jin" => cmd_melt_qub_jin(&settings, args.get(1).context("usage: melt-qub-jin <amount_qub> [fee] [min_jin]")?, args.get(2).map(String::as_str).unwrap_or("0.00001"), args.get(3).map(String::as_str)),
         "mempool" => cmd_mempool(&settings),
         "relay-mempool" => cmd_relay_mempool(&settings),
+        "block-relay-status" => cmd_block_relay_status(&settings),
+        "relay-pending-block" => cmd_relay_pending_block(&settings),
         "send" => cmd_send(&settings, args.get(1).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(2).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(3).map(String::as_str).unwrap_or("0.00001")),
         "send-jin" => cmd_send_jin(&settings, args.get(1).context("usage: send-jin <address-or-name.qub> <amount_jin> [fee] [fee_asset=JIN|QUB]")?, args.get(2).context("usage: send-jin <address-or-name.qub> <amount_jin> [fee] [fee_asset=JIN|QUB]")?, args.get(3).map(String::as_str).unwrap_or("0.001"), args.get(4).map(String::as_str).unwrap_or("JIN")),
         "send-multi" => cmd_send_multi(&settings, args.get(1).context("usage: send-multi <asset=QUB|JIN> <entries addr:amount,...> [fee] [fee_asset=JIN|QUB]")?, args.get(2).context("usage: send-multi <asset=QUB|JIN> <entries addr:amount,...> [fee] [fee_asset=JIN|QUB]")?, args.get(3).map(String::as_str).unwrap_or("0.00001"), args.get(4).map(String::as_str).unwrap_or("QUB")),
@@ -101,6 +103,28 @@ fn cmd_status_fast(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+
+fn cmd_block_relay_status(settings: &Settings) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&p2p::block_relay_status(settings)?)?
+    );
+    Ok(())
+}
+
+fn cmd_relay_pending_block(settings: &Settings) -> Result<()> {
+    let value = match p2p::relay_pending_block_now(settings)? {
+        Some(report) => serde_json::to_value(report)?,
+        None => serde_json::json!({
+            "ok": true,
+            "pending": false,
+            "detail": "no pending local block relay",
+        }),
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
 fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<serde_json::Value> {
     let paths = NodePaths::from_settings(settings);
     let now = SystemTime::now()
@@ -118,6 +142,10 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
             "fast_storage_exists": false,
             "storage_engine": "uninitialized",
             "hf123_fast_chain_engine": true,
+            "hf125_reliable_block_delivery": true,
+            "hf125_fork_safe_publication": true,
+            "hf126_equal_height_recovery": true,
+            "hf126_equal_height_ties_mineable": true,
             "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
             "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
             "hf121_status_fast": true,
@@ -195,6 +223,10 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "hf121_r2_bounded_memory": true,
         "hf123_fast_chain_engine": true,
         "hf123_single_canonical_owner": live_chain_arc(settings).is_some(),
+        "hf125_reliable_block_delivery": true,
+        "hf125_fork_safe_publication": true,
+        "hf126_equal_height_recovery": true,
+        "hf126_equal_height_ties_mineable": true,
         "generated_at_unix": now,
         "status_generated_at_unix": status.generated_at_unix,
         "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
@@ -1600,12 +1632,20 @@ fn cmd_pool_mine(
                     bail!("pool block became stale before submit: local tip is #{} {}, candidate parent was #{} {}", chain.height(), chain.tip_hash(), candidate_parent_height, candidate_parent_hash);
                 }
                 let relay_block = block.clone();
-                let hash = chain.connect_block(block, settings)?;
-                save_chain(settings, &chain)?;
-                match p2p::broadcast_block(settings, &relay_block) {
-                    Ok(sent) if sent > 0 => println!("relayed_to_peers: {sent}"),
-                    Ok(_) => {}
-                    Err(err) => eprintln!("p2p relay warning: {err:#}"),
+                let hash = connect_block_persist_atomic(settings, &mut chain, block)?;
+                match p2p::broadcast_block_confirmed(settings, &relay_block) {
+                    Ok(report) if report.delivered() => {
+                        println!("block_delivery: {}", report.summary());
+                    }
+                    Ok(report) => {
+                        println!(
+                            "block_delivery_pending: {}; automatic retry is active",
+                            report.summary()
+                        );
+                    }
+                    Err(err) => eprintln!(
+                        "block delivery warning: {err:#}; automatic retry remains active"
+                    ),
                 }
                 println!(
                     "pooled mined height={} hash={} pool_id={}",
@@ -1676,12 +1716,20 @@ fn cmd_mine(settings: &Settings, blocks: u32, address: Option<&str>) -> Result<(
             bail!("block became stale before submit: local tip is #{} {}, candidate parent was #{} {}", chain.height(), chain.tip_hash(), candidate_parent_height, candidate_parent_hash);
         }
         let relay_block = block.clone();
-        let hash = chain.connect_block(block, settings)?;
-        save_chain(settings, &chain)?;
-        match p2p::broadcast_block(settings, &relay_block) {
-            Ok(sent) if sent > 0 => println!("relayed_to_peers: {sent}"),
-            Ok(_) => {}
-            Err(err) => eprintln!("p2p relay warning: {err:#}"),
+        let hash = connect_block_persist_atomic(settings, &mut chain, block)?;
+        match p2p::broadcast_block_confirmed(settings, &relay_block) {
+            Ok(report) if report.delivered() => {
+                println!("block_delivery: {}", report.summary());
+            }
+            Ok(report) => {
+                println!(
+                    "block_delivery_pending: {}; automatic retry is active",
+                    report.summary()
+                );
+            }
+            Err(err) => eprintln!(
+                "block delivery warning: {err:#}; automatic retry remains active"
+            ),
         }
         println!("mined height={} hash={}", chain.height(), hash);
     }
@@ -2576,7 +2624,7 @@ fn explorer_route(
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.1",
+            "version": "1.8.2",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -3401,5 +3449,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.1\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.2\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "qubd"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2612,8 +2612,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tiny-keccak",
  "toml 0.8.23",
+ "tiny-keccak",
  "webbrowser",
  "wgpu",
  "wgpu-core",

@@ -1913,3 +1913,160 @@ fn hf124_pool_shares_are_not_persisted_or_resurrected_by_wallet_outbox() {
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
+
+#[test]
+fn hf125_atomic_block_connect_persists_before_publishing_caller_state() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf125-atomic-connect-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+
+    let mut chain = ChainState::new_with_genesis(&settings).unwrap();
+    let mut wallet = WalletFile::new(&settings.network.name);
+    let key = wallet.create_key(&settings, "hf125-miner", 0).unwrap();
+    let miner = Address::parse_with_prefix(&key.address, &settings.network.address_prefix).unwrap();
+    let options = MiningOptions {
+        duty_cycle_percent: 100,
+        max_hashes: Some(5_000_000),
+    };
+    let block = mine_next_block(&chain, &settings, &miner, options).unwrap();
+    let expected_hash = block.block_hash();
+
+    let hash = connect_block_persist_atomic(&settings, &mut chain, block).unwrap();
+    assert_eq!(hash, expected_hash);
+    assert_eq!(chain.height(), 1);
+    assert_eq!(chain.tip_hash(), expected_hash);
+
+    let reloaded = load_or_init_chain_for_ui_fast(&settings).unwrap();
+    assert_eq!(reloaded.height(), 1);
+    assert_eq!(reloaded.tip_hash(), expected_hash);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf125_mainnet_storage_rejects_equal_work_same_height_tip_overwrite() {
+    let mut settings = regtest();
+    settings.network.name = "mainnet".to_string();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf125-equal-work-storage-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+
+    let base = ChainState::new_with_genesis(&settings).unwrap();
+    let mut wallet_a = WalletFile::new(&settings.network.name);
+    let mut wallet_b = WalletFile::new(&settings.network.name);
+    let a = Address::parse_with_prefix(
+        &wallet_a.create_key(&settings, "a", 0).unwrap().address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let b = Address::parse_with_prefix(
+        &wallet_b.create_key(&settings, "b", 0).unwrap().address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let options = MiningOptions {
+        duty_cycle_percent: 100,
+        max_hashes: Some(10_000_000),
+    };
+
+    let block_a = mine_next_block(&base, &settings, &a, options).unwrap();
+    let block_b = mine_next_block(&base, &settings, &b, options).unwrap();
+    assert_ne!(block_a.block_hash(), block_b.block_hash());
+
+    let mut chain_a = base.clone();
+    chain_a.connect_block(block_a, &settings).unwrap();
+    save_chain(&settings, &chain_a).unwrap();
+
+    let mut chain_b = base;
+    chain_b.connect_block(block_b, &settings).unwrap();
+    let err = save_chain(&settings, &chain_b).unwrap_err();
+    assert!(err.to_string().contains("stale Fast Chain Engine persistence rejected"));
+
+    let reloaded = load_or_init_chain_for_ui_fast(&settings).unwrap();
+    assert_eq!(reloaded.tip_hash(), chain_a.tip_hash());
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf126_verified_equal_work_reanchor_persists_and_updates_live_owner() {
+    let mut settings = regtest();
+    settings.network.name = "mainnet".to_string();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf126-equal-work-reanchor-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+
+    let base = ChainState::new_with_genesis(&settings).unwrap();
+    let mut wallet_a = WalletFile::new(&settings.network.name);
+    let mut wallet_b = WalletFile::new(&settings.network.name);
+    let a = Address::parse_with_prefix(
+        &wallet_a
+            .create_key(&settings, "hf126-a", 0)
+            .unwrap()
+            .address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let b = Address::parse_with_prefix(
+        &wallet_b
+            .create_key(&settings, "hf126-b", 0)
+            .unwrap()
+            .address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let options = MiningOptions {
+        duty_cycle_percent: 100,
+        max_hashes: Some(10_000_000),
+    };
+
+    let block_a = mine_next_block(&base, &settings, &a, options).unwrap();
+    let block_b = mine_next_block(&base, &settings, &b, options).unwrap();
+    assert_ne!(block_a.block_hash(), block_b.block_hash());
+
+    let mut chain_a = base.clone();
+    chain_a.connect_block(block_a, &settings).unwrap();
+    save_chain(&settings, &chain_a).unwrap();
+
+    let live = std::sync::Arc::new(std::sync::Mutex::new(chain_a.clone()));
+    register_live_chain(&settings, &live);
+
+    let mut chain_b = base;
+    chain_b.connect_block(block_b, &settings).unwrap();
+
+    // Ordinary persistence must remain fork-monotonic.
+    assert!(save_chain(&settings, &chain_b).is_err());
+
+    // The explicit HF126 path is the only equal-work sibling replacement.
+    save_chain_verified_equal_work_reanchor(&settings, &chain_b).unwrap();
+
+    let reloaded = load_or_init_chain_for_ui_fast(&settings).unwrap();
+    assert_eq!(reloaded.height(), chain_b.height());
+    assert_eq!(reloaded.tip_hash(), chain_b.tip_hash());
+
+    let live_snapshot = live_chain_snapshot(&settings).expect("live chain registered");
+    assert_eq!(live_snapshot.height(), chain_b.height());
+    assert_eq!(live_snapshot.tip_hash(), chain_b.tip_hash());
+
+    unregister_live_chain(&settings);
+    let _ = std::fs::remove_dir_all(data_dir);
+}

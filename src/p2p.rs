@@ -11,12 +11,12 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.8.1/"; // HF124 mining liveness
+const USER_AGENT: &str = "/QUB Core:1.8.2/"; // HF126 equal-height fork recovery and mining liveness
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -65,6 +65,15 @@ const HF82_LIGHT_TIP_PROBE_MS: u64 = 320;
 // for non-mainnet diagnostics only; mainnet waits for official/direct catch-up.
 const HF98_UNCATCHABLE_TIP_QUARANTINE_SECS: u64 = 900;
 const HF98_UNCATCHABLE_TIP_MAX_GAP: u32 = 512;
+const HF125_BLOCK_ACK_TIMEOUT_SECS: u64 = 30;
+const HF125_BLOCK_RELAY_TOTAL_SECS: u64 = 40;
+const HF125_BLOCK_RELAY_MAX_PEERS: usize = 24;
+const HF125_BLOCK_RELAY_RETRY_SECS: u64 = 6;
+const HF125_PRIORITY_INBOUND_RESERVE: usize = 16;
+const HF125_PRIORITY_MAX_MESSAGES: usize = 96;
+const HF125_PRIORITY_MAX_SUBMISSIONS: usize = 2;
+const HF125_PENDING_BLOCK_RELAY_VERSION: u32 = 1;
+
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct P2PSyncReport {
@@ -76,6 +85,128 @@ pub struct P2PSyncReport {
     pub txs_accepted: usize,
     pub height: u32,
     pub tip_hash: String,
+}
+
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockRelayPeerResult {
+    pub peer: String,
+    pub official: bool,
+    pub transport: String,
+    pub status: String,
+    pub height: u32,
+    pub tip_hash: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockRelayReport {
+    pub block_hash: String,
+    pub height: u32,
+    pub attempts: usize,
+    pub official_attempts: usize,
+    pub connected: usize,
+    pub acknowledgements: usize,
+    pub official_acknowledgements: usize,
+    pub accepted: usize,
+    pub already_known: usize,
+    pub stale_parent: usize,
+    pub rejected: usize,
+    pub legacy_sent: usize,
+    pub timed_out: usize,
+    pub pending_retry: bool,
+    pub peer_results: Vec<BlockRelayPeerResult>,
+}
+
+impl BlockRelayReport {
+    pub fn acknowledged(&self) -> usize {
+        self.accepted.saturating_add(self.already_known)
+    }
+
+    pub fn delivered(&self) -> bool {
+        // Public networks always try the configured official seeds first. Do
+        // not clear the durable relay merely because an arbitrary peer accepted
+        // the block while every official delivery attempt timed out. Regtest and
+        // isolated deployments have no official attempts, so any explicit ACK is
+        // sufficient there.
+        if self.official_attempts > 0 {
+            self.official_acknowledgements > 0
+        } else {
+            self.acknowledged() > 0
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "acknowledged={} official_acknowledged={} accepted={} already_known={} stale_parent={} rejected={} legacy_sent={} timed_out={} attempts={} official_attempts={}",
+            self.acknowledged(),
+            self.official_acknowledgements,
+            self.accepted,
+            self.already_known,
+            self.stale_parent,
+            self.rejected,
+            self.legacy_sent,
+            self.timed_out,
+            self.attempts,
+            self.official_attempts,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingBlockRelay {
+    version: u32,
+    network: String,
+    block_hash: String,
+    height: u32,
+    block: Block,
+    created_unix: u64,
+    last_attempt_unix: u64,
+    attempts: u64,
+    last_acknowledgements: usize,
+    last_error: String,
+    #[serde(default)]
+    last_stale_parent_height: u32,
+    #[serde(default)]
+    last_stale_parent_tip: String,
+    #[serde(default)]
+    last_stale_parent_reports: usize,
+    #[serde(default)]
+    last_official_stale_parent_reports: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BlockAcceptance {
+    status: String,
+    block_hash: String,
+    height: u32,
+    tip_hash: String,
+    reason: String,
+    changed: bool,
+}
+
+static HF125_AUTO_CATCHUP_RUNNING: AtomicBool = AtomicBool::new(false);
+static HF125_BLOCK_RETRY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct Hf125AutoCatchupGuard;
+
+impl Drop for Hf125AutoCatchupGuard {
+    fn drop(&mut self) {
+        HF125_AUTO_CATCHUP_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct Hf125BlockRetryGuard;
+
+impl Drop for Hf125BlockRetryGuard {
+    fn drop(&mut self) {
+        HF125_BLOCK_RETRY_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn hf125_block_relay_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn load_chain_for_hf90_catchup(settings: &Settings) -> Result<ChainState> {
@@ -436,6 +567,18 @@ enum WireMessage {
     Block {
         block: Block,
     },
+    SubmitBlock {
+        request_id: u64,
+        block: Block,
+    },
+    BlockAck {
+        request_id: u64,
+        block_hash: String,
+        status: String,
+        height: u32,
+        tip_hash: String,
+        reason: String,
+    },
     Tx {
         tx: Transaction,
     },
@@ -550,11 +693,17 @@ pub fn run_node(settings: Settings) -> Result<()> {
         thread::spawn(move || loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    if accept_inbound.load(Ordering::Relaxed)
-                        >= accept_settings.p2p.max_inbound_peers
-                    {
+                    // HF125/v1.8.2 reserves a small short-lived inbound lane
+                    // for block submission/acknowledgement connections. HF124
+                    // silently dropped every new socket once the normal peer cap
+                    // was full, so a valid found block could never reach a seed.
+                    let normal_limit = accept_settings.p2p.max_inbound_peers;
+                    let inbound_limit = normal_limit.saturating_add(HF125_PRIORITY_INBOUND_RESERVE);
+                    let current_inbound = accept_inbound.load(Ordering::Relaxed);
+                    if current_inbound >= inbound_limit {
                         continue;
                     }
+                    let priority_only = current_inbound >= normal_limit;
                     accept_inbound.fetch_add(1, Ordering::Relaxed);
                     let s = accept_settings.clone();
                     let c = accept_chain.clone();
@@ -564,7 +713,17 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     let dirty = accept_mempool_dirty.clone();
                     thread::spawn(move || {
                         let peer = addr.to_string();
-                        if let Err(err) = handle_peer(stream, peer.clone(), false, s, c, p, a, dirty) {
+                        if let Err(err) = handle_peer(
+                            stream,
+                            peer.clone(),
+                            false,
+                            priority_only,
+                            s,
+                            c,
+                            p,
+                            a,
+                            dirty,
+                        ) {
                             if !is_benign_disconnect(&err) {
                                 eprintln!("p2p inbound {peer} ended: {err:#}");
                             }
@@ -603,6 +762,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
     let mut last_mempool_relay = Instant::now() - Duration::from_secs(30);
     let mut last_mempool_persist = Instant::now();
     let mut last_light_catchup = Instant::now() - Duration::from_secs(60);
+    let mut last_block_relay_retry = Instant::now() - Duration::from_secs(30);
 
     loop {
         let known = {
@@ -633,7 +793,17 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     let a = active.clone();
                     let dirty = mempool_dirty.clone();
                     thread::spawn(move || {
-                        if let Err(err) = handle_peer(stream, addr.clone(), true, s, c, p, a, dirty) {
+                        if let Err(err) = handle_peer(
+                            stream,
+                            addr.clone(),
+                            true,
+                            false,
+                            s,
+                            c,
+                            p,
+                            a,
+                            dirty,
+                        ) {
                             if !is_benign_disconnect(&err) {
                                 eprintln!("p2p outbound {addr} ended: {err:#}");
                             }
@@ -765,12 +935,47 @@ pub fn run_node(settings: Settings) -> Result<()> {
                 settings.p2p.max_outbound_peers.max(4).min(8),
             );
         }
-        // HF88/v1.6.2: outbound loop is the always-on lifeline. Keep a bounded
-        // catch-up heartbeat running even if the GUI is idle or inbound bind is
-        // unavailable. This is detached from UI snapshots.
+        // HF125/v1.8.2: a locally accepted block remains durably queued until
+        // at least one updated peer explicitly acknowledges it. Retry delivery
+        // independently of mempool traffic and GUI state.
+        if last_block_relay_retry.elapsed() >= Duration::from_secs(3) {
+            last_block_relay_retry = Instant::now();
+            if !HF125_BLOCK_RETRY_RUNNING.swap(true, Ordering::AcqRel) {
+                let relay_settings = settings.clone();
+                let relay_chain = chain.clone();
+                thread::spawn(move || {
+                    let _reset = Hf125BlockRetryGuard;
+                    if let Ok(Some(report)) =
+                        retry_pending_block_relay(&relay_settings, &relay_chain)
+                    {
+                        if report.delivered() {
+                            eprintln!(
+                                "HF125 pending block delivery acknowledged: {}",
+                                report.summary()
+                            );
+                        } else if report.pending_retry {
+                            eprintln!(
+                                "HF125 pending block delivery retry: {}",
+                                report.summary()
+                            );
+                        }
+                    }
+                });
+            }
+        }
+
+        // HF125/v1.8.2: the heavy repair ladder no longer runs synchronously in
+        // the outbound/relay coordinator. One detached worker at a time keeps
+        // peer spawning, mempool relay and pending-block delivery responsive.
         if last_light_catchup.elapsed() >= Duration::from_secs(18) {
             last_light_catchup = Instant::now();
-            let _ = hf90_auto_catchup(&settings, 120_000);
+            if !HF125_AUTO_CATCHUP_RUNNING.swap(true, Ordering::AcqRel) {
+                let catchup_settings = settings.clone();
+                thread::spawn(move || {
+                    let _reset = Hf125AutoCatchupGuard;
+                    let _ = hf90_auto_catchup(&catchup_settings, 120_000);
+                });
+            }
         }
 
         let local = chain.lock().expect("chain mutex poisoned");
@@ -1425,11 +1630,37 @@ fn hf104_canonical_greenlight(
         }
         return false;
     }
-    // HF114: exact mainnet acknowledgement only. HF113 still allowed
-    // "official tip is an ancestor of my longer local branch", which is the
-    // all-self-mined stale mode users were seeing. If local is ahead of the
-    // official/direct tip, do not hash on that suffix; the repair/re-anchor path
-    // will roll back or replace it before mining resumes.
+    // HF125/v1.8.2: an official/public tip that is a lower ancestor is a
+    // publication lag, not authority to erase a valid higher-work suffix. Keep
+    // the local chain and rely on explicit block acknowledgements plus normal
+    // cumulative-work fork choice. A just-mined unacknowledged tip pauses only
+    // the next mining round while automatic relay retry remains active.
+    if best_height > 0
+        && best_height < local.height()
+        && !best_tip.trim().is_empty()
+        && local_chain_contains_tip(local, best_height, &best_tip)
+    {
+        if pending_block_relay_waiting(settings, local) {
+            return false;
+        }
+        mark_fresh_tip_trusted(settings, local);
+        return true;
+    }
+
+    if hf126_is_same_height_competing_tip(
+        local.height(),
+        &local.tip_hash().to_string(),
+        best_height,
+        &best_tip,
+    ) && !pending_block_relay_waiting(settings, local)
+    {
+        // HF126: an ordinary equal-height sibling is an unresolved PoW tie. It
+        // must remain mineable so the next block can produce the higher-work
+        // branch; only a locally mined unacknowledged tip enters verified re-anchor.
+        mark_fresh_tip_trusted(settings, local);
+        return true;
+    }
+
     if !hf114_official_tip_acknowledges_local(settings, local, best_height, &best_tip) {
         // HF116: if an official TCP seed is reachable but stale/lower, do not let
         // it freeze the network after the next public block. Exact HTTP/public
@@ -1622,6 +1853,14 @@ fn hf113_peer_quorum_greenlight(
         return false;
     }
     if conflict_counts.values().any(|count| *count >= 2) {
+        if settings.network.name == "mainnet" && !pending_block_relay_waiting(settings, local) {
+            // HF126: two peers reporting the same-height sibling prove a live
+            // PoW tie, not an invalid parent. Keep ordinary validated branches
+            // mineable so cumulative work can resolve the tie. A locally mined,
+            // unacknowledged tip still enters the verified re-anchor path.
+            mark_fresh_tip_trusted(settings, local);
+            return true;
+        }
         return false;
     }
 
@@ -1740,18 +1979,11 @@ pub fn hf113_live_tip_pause_reason(
                     ));
                 }
                 if !official_tip.trim().is_empty() && official_tip != parent_hash_s {
-                    if hf115_http_tip_acknowledges_parent(
-                        settings,
-                        parent_height,
-                        &parent_hash_s,
-                        timeout_ms.max(900),
-                    ) {
-                        return None;
-                    }
-                    return Some(format!(
-                        "official seed reports a different hash at #{}",
-                        parent_height
-                    ));
+                    // HF126/v1.8.2: an equal-height sibling is a normal PoW tie,
+                    // not proof that the active candidate became invalid. The
+                    // next higher-work block or the verified pending-tip re-anchor
+                    // resolves it without globally stopping hashers.
+                    return None;
                 }
             }
             return None;
@@ -1798,21 +2030,19 @@ pub fn hf113_live_tip_pause_reason(
         ));
     }
     if let Some((_, count)) = conflict_counts.iter().find(|(_, count)| **count >= 2) {
-        return Some(format!(
-            "direct peer quorum ({count}) disagrees at candidate parent #{}",
-            parent_height
-        ));
+        if settings.network.name != "mainnet" {
+            return Some(format!(
+                "direct peer quorum ({count}) disagrees at candidate parent #{}",
+                parent_height
+            ));
+        }
+        return None;
     }
     if settings.network.name == "mainnet" && contacted >= 2 && same_parent < 2 {
-        if hf115_http_tip_acknowledges_parent(
-            settings,
-            parent_height,
-            &parent_hash_s,
-            timeout_ms.max(900),
-        ) {
-            return None;
-        }
-        return Some(format!("candidate parent #{} is not acknowledged by two direct peers; preventing local-stale self-mining", parent_height));
+        // HF126: absence of a two-peer acknowledgement at the same height is
+        // not sufficient to invalidate a parent. Only an ahead/higher-work view
+        // stops the round; equal-height competition remains live.
+        return None;
     }
     None
 }
@@ -2610,6 +2840,26 @@ fn hf90_catchup_ladder(
         let wrong_tip = best_h == current.height()
             && !best_tip.trim().is_empty()
             && best_tip != current.tip_hash().to_string();
+
+        // HF126/v1.8.2: resolve a locally mined, unacknowledged equal-height
+        // sibling before entering the expensive generic ladder. The dedicated
+        // path requires multi-source evidence, full replay validation and the
+        // explicit equal-work Fast Chain Engine commit policy.
+        if wrong_tip && pending_block_relay_waiting(settings, &current) {
+            let budget = remaining_ms(deadline).min(35_000).max(4_000);
+            if let Ok(reanchor) = sync_official_http_tail_reanchor_hf114(settings, budget) {
+                merge_sync_reports(&mut report, reanchor);
+                let repaired = load_chain_for_hf90_catchup(settings)?;
+                validate_chain_consensus_checkpoints(settings, &repaired.blocks)?;
+                if repaired.tip_hash() != current.tip_hash() {
+                    report.height = repaired.height();
+                    report.tip_hash = repaired.tip_hash().to_string();
+                    mark_fresh_tip_trusted(settings, &repaired);
+                    return finish_report(settings, report);
+                }
+            }
+        }
+
         if best_h > 0 && local_is_at_or_past_tip(&current, best_h, &best_tip) && !wrong_tip {
             mark_fresh_tip_trusted(settings, &current);
             return finish_report(settings, report);
@@ -2911,7 +3161,21 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
                 }) => {
                     report.best_peer_height = report.best_peer_height.max(height);
                     if height >= report.best_peer_height {
-                        peer_tip = tip_hash;
+                        peer_tip = tip_hash.clone();
+                    }
+                    if hf126_is_same_height_competing_tip(
+                        before_height,
+                        &before_tip,
+                        height,
+                        &tip_hash,
+                    ) {
+                        let _ = send_adaptive_chain_requests(
+                            &mut stream,
+                            &local_before,
+                            height,
+                            &tip_hash,
+                        );
+                        last_request_at = Instant::now();
                     }
                 }
                 Ok(WireMessage::Headers { headers }) => {
@@ -2953,7 +3217,7 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
                             start_height,
                             blocks,
                             settings,
-                            true,
+                            settings.network.name != "mainnet",
                         )
                         .unwrap_or(false)
                     };
@@ -3383,6 +3647,150 @@ fn apply_official_tail_snapshot(
     Ok((repaired, appended_from_tail))
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Hf126EqualHeightTipEvidence {
+    height: u32,
+    tip_hash: String,
+    http_matches: usize,
+    official_tcp_matches: usize,
+    direct_matches: usize,
+}
+
+impl Hf126EqualHeightTipEvidence {
+    fn confirmed(&self) -> bool {
+        (self.http_matches > 0 && self.official_tcp_matches > 0)
+            || self.official_tcp_matches >= 2
+            || (self.http_matches > 0 && self.direct_matches >= 2)
+    }
+}
+
+fn hf126_is_same_height_competing_tip(
+    local_height: u32,
+    local_tip: &str,
+    remote_height: u32,
+    remote_tip: &str,
+) -> bool {
+    remote_height == local_height
+        && !remote_tip.trim().is_empty()
+        && remote_tip.trim() != local_tip
+}
+
+/// HF126/v1.8.2: an equal-work sibling can only replace a locally mined tip
+/// through the explicit re-anchor path when the durable relay record proves the
+/// local tip is unacknowledged and independent official/direct sources agree on
+/// the exact competing hash. Ordinary equal-height forks remain normal PoW ties.
+fn hf126_verified_equal_height_competing_tip(
+    settings: &Settings,
+    local: &ChainState,
+    timeout_ms: u64,
+) -> Option<Hf126EqualHeightTipEvidence> {
+    if settings.network.name != "mainnet" || !pending_block_relay_waiting(settings, local) {
+        return None;
+    }
+
+    let local_height = local.height();
+    let local_tip = local.tip_hash().to_string();
+    let mut evidence: HashMap<String, Hf126EqualHeightTipEvidence> = HashMap::new();
+
+    // Reuse durable HF125 stale-parent acknowledgements as one evidence source.
+    // They came from explicit SubmitBlock/BlockAck exchanges for this exact
+    // unacknowledged local tip, not from a UI heuristic or cached height alone.
+    if let Ok(Some(pending)) = load_pending_block_relay(settings) {
+        if pending.height == local_height
+            && pending.block_hash == local_tip
+            && hf126_is_same_height_competing_tip(
+                local_height,
+                &local_tip,
+                pending.last_stale_parent_height,
+                &pending.last_stale_parent_tip,
+            )
+        {
+            let tip = pending.last_stale_parent_tip.clone();
+            let entry = evidence.entry(tip.clone()).or_insert_with(|| {
+                Hf126EqualHeightTipEvidence {
+                    height: pending.last_stale_parent_height,
+                    tip_hash: tip.clone(),
+                    ..Hf126EqualHeightTipEvidence::default()
+                }
+            });
+            entry.official_tcp_matches = entry
+                .official_tcp_matches
+                .saturating_add(pending.last_official_stale_parent_reports);
+            entry.direct_matches = entry.direct_matches.saturating_add(
+                pending
+                    .last_stale_parent_reports
+                    .saturating_sub(pending.last_official_stale_parent_reports),
+            );
+        }
+    }
+
+    if let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700).min(2_500)) {
+        if hf126_is_same_height_competing_tip(local_height, &local_tip, height, &tip) {
+            let entry = evidence.entry(tip.clone()).or_insert_with(|| {
+                Hf126EqualHeightTipEvidence {
+                    height,
+                    tip_hash: tip.clone(),
+                    ..Hf126EqualHeightTipEvidence::default()
+                }
+            });
+            entry.http_matches = entry.http_matches.saturating_add(1);
+        }
+    }
+
+    for (_, height, tip, _) in
+        official_snapshot_peer_candidates(settings, timeout_ms.max(220).min(900))
+    {
+        if hf126_is_same_height_competing_tip(local_height, &local_tip, height, &tip) {
+            let entry = evidence.entry(tip.clone()).or_insert_with(|| {
+                Hf126EqualHeightTipEvidence {
+                    height,
+                    tip_hash: tip.clone(),
+                    ..Hf126EqualHeightTipEvidence::default()
+                }
+            });
+            entry.official_tcp_matches = entry.official_tcp_matches.saturating_add(1);
+        }
+    }
+
+    if let Ok(peers) = prioritized_outbound_peers(settings, 12) {
+        let per_peer = Duration::from_millis(timeout_ms.max(180).min(650));
+        for addr in peers {
+            if should_skip_outbound(settings, &addr) {
+                continue;
+            }
+            let Ok(info) = probe_peer(settings, &addr, per_peer) else {
+                continue;
+            };
+            if hf126_is_same_height_competing_tip(
+                local_height,
+                &local_tip,
+                info.height,
+                &info.tip_hash,
+            ) {
+                let tip = info.tip_hash;
+                let entry = evidence.entry(tip.clone()).or_insert_with(|| {
+                    Hf126EqualHeightTipEvidence {
+                        height: info.height,
+                        tip_hash: tip.clone(),
+                        ..Hf126EqualHeightTipEvidence::default()
+                    }
+                });
+                entry.direct_matches = entry.direct_matches.saturating_add(1);
+            }
+        }
+    }
+
+    evidence
+        .into_values()
+        .filter(Hf126EqualHeightTipEvidence::confirmed)
+        .max_by_key(|item| {
+            item.official_tcp_matches
+                .saturating_mul(100)
+                .saturating_add(item.http_matches.saturating_mul(25))
+                .saturating_add(item.direct_matches)
+        })
+}
+
 /// HF114/v1.7.2: official-tail re-anchor for local-ahead/self-mined stale
 /// branches. The normal tail sync is append/reorg-forward only; this path is
 /// deliberately separate because it is allowed to replace a longer local suffix
@@ -3492,31 +3900,30 @@ fn sync_official_http_tail_reanchor_hf114(
     let local_height_before = local_before.height();
     let local_tip_before = local_before.tip_hash().to_string();
 
-    let (_, mut official_height, mut official_tip) =
-        official_tip_summary(settings, &mut report, 420);
-    if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
-        report.peers_contacted = report.peers_contacted.max(1);
-        report.best_peer_height = report.best_peer_height.max(http_height);
-        if http_height >= official_height || official_tip.trim().is_empty() {
-            official_height = http_height;
-            official_tip = http_tip;
-        }
-    }
-
-    let same_height_conflict = official_height == local_height_before
-        && !official_tip.trim().is_empty()
-        && official_tip != local_tip_before;
-    let local_ahead = hf114_official_tip_is_local_ancestor(
-        settings,
-        &local_before,
-        official_height,
-        &official_tip,
-    );
-    if !same_height_conflict && !local_ahead {
+    let Some(evidence) =
+        hf126_verified_equal_height_competing_tip(settings, &local_before, 900)
+    else {
         report.height = local_height_before;
         report.tip_hash = local_tip_before;
         return finish_report(settings, report);
-    }
+    };
+    let official_height = evidence.height;
+    let official_tip = evidence.tip_hash.clone();
+    report.peers_contacted = report.peers_contacted.max(
+        evidence
+            .official_tcp_matches
+            .saturating_add(evidence.direct_matches)
+            .saturating_add(evidence.http_matches),
+    );
+    report.best_peer_height = report.best_peer_height.max(official_height);
+    eprintln!(
+        "HF126 verified equal-height re-anchor evidence at #{} {}: http={} official_tcp={} direct={}",
+        official_height,
+        official_tip,
+        evidence.http_matches,
+        evidence.official_tcp_matches,
+        evidence.direct_matches,
+    );
 
     urls.sort_by_key(|url| official_tail_window_from_url(url));
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
@@ -3560,11 +3967,21 @@ fn sync_official_http_tail_reanchor_hf114(
                     continue;
                 }
             };
-        if candidate.height() < local_height_before
-            || (candidate.height() == local_height_before
-                && candidate.tip_hash().to_string() != local_tip_before)
+        if candidate.height() == local_height_before
+            && candidate.tip_hash().to_string() != local_tip_before
         {
-            save_chain(settings, &candidate)?;
+            let candidate_work = chain_work_for_blocks(&candidate.blocks)?;
+            let local_work = chain_work_for_blocks(&local_before.blocks)?;
+            if candidate_work < local_work {
+                report.peer_errors = report.peer_errors.saturating_add(1);
+                continue;
+            }
+            if candidate_work == local_work {
+                save_chain_verified_equal_work_reanchor(settings, &candidate)?;
+            } else {
+                save_chain(settings, &candidate)?;
+            }
+            clear_pending_block_relay(settings);
             mark_fresh_tip_trusted(settings, &candidate);
             report.chains_adopted = report.chains_adopted.saturating_add(1);
             report.blocks_connected = report.blocks_connected.saturating_add(replaced_hint);
@@ -3667,7 +4084,24 @@ fn sync_official_http_snapshot_reanchor_hf114(
         {
             let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
             candidate.rebuild_mempool_from(keep_mempool, settings);
-            save_chain(settings, &candidate)?;
+            if candidate.height() == local_height_before
+                && candidate.tip_hash().to_string() != local_tip_before
+            {
+                let candidate_work = chain_work_for_blocks(&candidate.blocks)?;
+                let local_work = chain_work_for_blocks(&local_before.blocks)?;
+                if candidate_work < local_work {
+                    report.peer_errors = report.peer_errors.saturating_add(1);
+                    continue;
+                }
+                if candidate_work == local_work {
+                    save_chain_verified_equal_work_reanchor(settings, &candidate)?;
+                } else {
+                    save_chain(settings, &candidate)?;
+                }
+                clear_pending_block_relay(settings);
+            } else {
+                save_chain(settings, &candidate)?;
+            }
             mark_fresh_tip_trusted(settings, &candidate);
             let height_delta = if candidate.height() >= local_height_before {
                 candidate.height().saturating_sub(local_height_before) as usize
@@ -3753,20 +4187,24 @@ pub fn sync_official_http_tail(
                     continue;
                 }
             };
-        if candidate.height() > local_height_before
-            || (candidate.height() == local_height_before
-                && candidate.tip_hash().to_string() != local_tip_before)
-        {
-            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
-            candidate.rebuild_mempool_from(keep_mempool, settings);
-            save_chain(settings, &candidate)?;
-            mark_fresh_tip_trusted(settings, &candidate);
+        let mut selected = local_before.clone();
+        let adopted = selected.try_adopt_peer_chain(
+            candidate.blocks.as_ref().clone(),
+            settings,
+            false,
+        )?;
+        if adopted {
+            // HF125/v1.8.2: HTTP snapshots are bootstrap transports, not an
+            // equal-work chain-selection authority. Only normal cumulative-work
+            // fork choice may replace the current canonical state.
+            save_chain(settings, &selected)?;
+            mark_fresh_tip_trusted(settings, &selected);
             report.chains_adopted = report.chains_adopted.saturating_add(1);
             report.blocks_connected = report.blocks_connected.saturating_add(
-                connected_hint.max(candidate.height().saturating_sub(local_height_before) as usize),
+                connected_hint.max(selected.height().saturating_sub(local_height_before) as usize),
             );
-            report.height = candidate.height();
-            report.tip_hash = candidate.tip_hash().to_string();
+            report.height = selected.height();
+            report.tip_hash = selected.tip_hash().to_string();
             return finish_report(settings, report);
         }
         report.height = local_height_before;
@@ -3822,20 +4260,23 @@ pub fn sync_official_http_snapshot(
                 .with_context(|| format!("snapshot failed consensus repair from {url}"))?;
 
         report.best_peer_height = report.best_peer_height.max(candidate.height());
-        if candidate.height() > local_height_before
-            || (candidate.height() == local_height_before
-                && candidate.tip_hash().to_string() != local_tip_before)
-        {
-            let keep_mempool = local_before.reorg_mempool_candidates_for(&candidate);
-            candidate.rebuild_mempool_from(keep_mempool, settings);
-            save_chain(settings, &candidate)?;
-            mark_fresh_tip_trusted(settings, &candidate);
+        let mut selected = local_before.clone();
+        let adopted = selected.try_adopt_peer_chain(
+            candidate.blocks.as_ref().clone(),
+            settings,
+            false,
+        )?;
+        if adopted {
+            // HF125/v1.8.2: a published full snapshot must win by validated
+            // cumulative work, never by hostname or publication status alone.
+            save_chain(settings, &selected)?;
+            mark_fresh_tip_trusted(settings, &selected);
             report.chains_adopted = report.chains_adopted.saturating_add(1);
             report.blocks_connected = report.blocks_connected.saturating_add(
-                connected_hint.max(candidate.height().saturating_sub(local_height_before) as usize),
+                connected_hint.max(selected.height().saturating_sub(local_height_before) as usize),
             );
-            report.height = candidate.height();
-            report.tip_hash = candidate.tip_hash().to_string();
+            report.height = selected.height();
+            report.tip_hash = selected.tip_hash().to_string();
             let _ = fs::remove_file(&tmp);
             return finish_report(settings, report);
         }
@@ -4983,7 +5424,7 @@ fn force_official_tip_if_ahead(
     report: &mut P2PSyncReport,
     local: &mut ChainState,
     timeout_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let (_, mut official_height, mut official_tip) = official_tip_summary(settings, report, 420);
     if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
         report.peers_contacted = report.peers_contacted.max(1);
@@ -4996,37 +5437,30 @@ fn force_official_tip_if_ahead(
 
     if hf114_official_tip_acknowledges_local(settings, local, official_height, &official_tip) {
         mark_fresh_tip_trusted(settings, local);
-        return Ok(());
+        return Ok(false);
     }
 
-    // HF114: local-ahead is not "safe but ahead"; it is an unacknowledged
-    // private suffix. Re-anchor it immediately to the official HTTP tail if the
-    // official tip is an ancestor, instead of waiting for canonical height to pass
-    // the local height while the user manually stops mining.
-    let initial_same_height_conflict = official_height == local.height()
-        && !official_tip.trim().is_empty()
-        && official_tip != local.tip_hash().to_string();
-    let initial_local_ahead =
-        hf114_official_tip_is_local_ancestor(settings, local, official_height, &official_tip);
-    if settings.network.name == "mainnet" && (initial_local_ahead || initial_same_height_conflict) {
-        let reanchor =
-            sync_official_http_tail_reanchor_hf114(settings, timeout_ms.min(18_000).max(6_000))?;
-        merge_sync_reports(report, reanchor);
-        *local = load_chain_for_hf90_catchup(settings)?;
-        validate_chain_consensus_checkpoints(settings, &local.blocks)?;
-        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
-            return Ok(());
+    // A published lower ancestor does not erase a validated higher-work suffix.
+    // A locally mined suffix without acknowledgement still waits for HF125 relay
+    // confirmation, exactly as before HF126.
+    let local_ahead = hf114_official_tip_is_local_ancestor(
+        settings,
+        local,
+        official_height,
+        &official_tip,
+    );
+    if settings.network.name == "mainnet" && local_ahead {
+        report.height = local.height();
+        report.tip_hash = local.tip_hash().to_string();
+        if pending_block_relay_waiting(settings, local) {
+            bail!(
+                "mining paused: valid local tip #{} {} is awaiting explicit peer acknowledgement; HF125 automatic block-delivery retry is active",
+                local.height(),
+                local.tip_hash()
+            );
         }
-        let (_, check_height, check_tip) = official_tip_summary(settings, report, 420);
-        if hf114_official_tip_acknowledges_local(settings, local, check_height, &check_tip) {
-            mark_fresh_tip_trusted(settings, local);
-            return Ok(());
-        }
-        bail!(
-            "mining green-light wait: local tip #{} is not acknowledged by official/direct canonical tip #{} after HF114 re-anchor attempt. Mining is paused before extending a self-mined stale branch.",
-            local.height(),
-            check_height
-        );
+        mark_fresh_tip_trusted(settings, local);
+        return Ok(false);
     }
 
     if official_height > local.height()
@@ -5036,130 +5470,129 @@ fn force_official_tip_if_ahead(
         report.height = local.height();
         report.tip_hash = local.tip_hash().to_string();
         mark_fresh_tip_trusted(settings, local);
-        return Ok(());
+        return Ok(false);
     }
 
-    let official_tip_differs = official_height == local.height()
-        && !official_tip.trim().is_empty()
-        && official_tip != local.tip_hash().to_string();
-    if official_height > local.height() || official_tip_differs {
+    // HF126/v1.8.2: durable stale-parent acknowledgements may know the
+    // competing tip even while one official probe is temporarily unavailable.
+    // Try the strict multi-source/full-replay re-anchor before classifying the
+    // remaining state as an ordinary mineable tie.
+    if pending_block_relay_waiting(settings, local)
+        && (official_height == 0 || official_height == local.height())
+    {
+        let before_tip = local.tip_hash();
+        let repair = sync_official_http_tail_reanchor_hf114(
+            settings,
+            timeout_ms.max(HF82_PARENT_CATCHUP_MS).min(45_000),
+        )?;
+        merge_sync_reports(report, repair);
+        *local = load_chain_for_hf90_catchup(settings)?;
+        validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+        if local.tip_hash() != before_tip {
+            mark_fresh_tip_trusted(settings, local);
+            return Ok(false);
+        }
+    }
+
+    let same_height_conflict = hf126_is_same_height_competing_tip(
+        local.height(),
+        &local.tip_hash().to_string(),
+        official_height,
+        &official_tip,
+    );
+
+    // If strict re-anchor evidence or transport is temporarily unavailable,
+    // equal-height competition remains a normal PoW tie and must not deadlock
+    // every miner.
+    if same_height_conflict {
+        report.height = local.height();
+        report.tip_hash = local.tip_hash().to_string();
+        eprintln!(
+            "HF126 equal-height PoW tie at #{}: local={} observed={}; continuing on the active validated tip until cumulative work or verified re-anchor resolves it",
+            local.height(),
+            local.tip_hash(),
+            official_tip,
+        );
+        mark_fresh_tip_trusted(settings, local);
+        return Ok(true);
+    }
+
+    if official_height > local.height() {
         let heal = hf90_mining_catchup(settings, timeout_ms.max(HF82_PARENT_CATCHUP_MS))?;
         merge_sync_reports(report, heal);
         *local = load_chain_for_hf90_catchup(settings)?;
-        if settings.network.name == "mainnet" {
-            let reanchor = sync_official_http_tail_reanchor_hf114(
-                settings,
-                timeout_ms.min(18_000).max(6_000),
-            )?;
-            merge_sync_reports(report, reanchor);
-            *local = load_chain_for_hf90_catchup(settings)?;
-        }
         validate_chain_consensus_checkpoints(settings, &local.blocks)?;
-        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS) {
-            return Ok(());
+
+        if hf104_canonical_greenlight(settings, report, local, HF82_LIGHT_TIP_PROBE_MS.max(700)) {
+            return Ok(false);
         }
 
-        let (_, mut latest_official_height, mut latest_official_tip) =
+        let (_, mut latest_height, mut latest_tip) =
             official_tip_summary(settings, report, 350);
         if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
             report.peers_contacted = report.peers_contacted.max(1);
             report.best_peer_height = report.best_peer_height.max(http_height);
-            if http_height >= latest_official_height || latest_official_tip.trim().is_empty() {
-                latest_official_height = http_height;
-                latest_official_tip = http_tip;
+            if http_height >= latest_height || latest_tip.trim().is_empty() {
+                latest_height = http_height;
+                latest_tip = http_tip;
             }
         }
-        if hf114_official_tip_acknowledges_local(
-            settings,
-            local,
-            latest_official_height,
-            &latest_official_tip,
-        ) {
+
+        if hf114_official_tip_acknowledges_local(settings, local, latest_height, &latest_tip) {
             mark_fresh_tip_trusted(settings, local);
-            return Ok(());
+            return Ok(false);
         }
 
-        let latest_same_height_conflict = latest_official_height == local.height()
-            && !latest_official_tip.trim().is_empty()
-            && latest_official_tip != local.tip_hash().to_string();
         let latest_local_ahead = hf114_official_tip_is_local_ancestor(
             settings,
             local,
-            latest_official_height,
-            &latest_official_tip,
+            latest_height,
+            &latest_tip,
         );
-        if settings.network.name == "mainnet" && (latest_local_ahead || latest_same_height_conflict)
-        {
-            let reanchor = sync_official_http_tail_reanchor_hf114(
-                settings,
-                timeout_ms.min(18_000).max(6_000),
-            )?;
-            merge_sync_reports(report, reanchor);
-            *local = load_chain_for_hf90_catchup(settings)?;
-            validate_chain_consensus_checkpoints(settings, &local.blocks)?;
-            if hf104_canonical_greenlight(settings, report, local, 700) {
-                return Ok(());
+        if latest_local_ahead {
+            if pending_block_relay_waiting(settings, local) {
+                bail!(
+                    "mining paused: valid local tip #{} {} is awaiting explicit peer acknowledgement; HF125 automatic block-delivery retry is active",
+                    local.height(),
+                    local.tip_hash()
+                );
             }
+            mark_fresh_tip_trusted(settings, local);
+            return Ok(false);
         }
 
-        if latest_official_height > local.height() {
-            let gap = latest_official_height.saturating_sub(local.height());
-            if gap > 4096 {
-                let http =
-                    sync_official_http_snapshot(settings, timeout_ms.min(20_000).max(10_000))?;
-                merge_sync_reports(report, http);
-                *local = load_chain_for_hf90_catchup(settings)?;
-                if hf104_canonical_greenlight(settings, report, local, 700) {
-                    return Ok(());
-                }
-            }
-        }
-
-        if latest_official_height > local.height() {
+        if latest_height > local.height() {
             if hf97_greenlight_local_tip_after_uncatchable_height(
                 settings,
                 report,
                 local,
-                latest_official_height,
+                latest_height,
                 "mining-greenlight-official-ahead",
             )? {
-                return Ok(());
+                return Ok(false);
             }
             bail!(
-                "mining green-light wait: official seed height {} is {} block(s) ahead of local height {}. QUB Core is auto-catching up with HF98 detached catch-up; manual Sync is optional only if progress stops.",
-                latest_official_height,
-                latest_official_height.saturating_sub(local.height()),
+                "mining paused: reachable chain height {} is {} block(s) ahead of local height {}; detached catch-up remains active",
+                latest_height,
+                latest_height.saturating_sub(local.height()),
                 local.height()
             );
         }
-        if latest_official_height == local.height()
-            && !latest_official_tip.trim().is_empty()
-            && latest_official_tip != local.tip_hash().to_string()
-        {
-            bail!(
-                "mining green-light wait: official seed tip at #{} differs from local tip. HF114 bounded repair/re-anchor is running before hashing.",
-                latest_official_height
-            );
-        }
-        if settings.network.name == "mainnet"
-            && latest_official_height > 0
-            && latest_official_height < local.height()
-            && !hf114_official_tip_acknowledges_local(
-                settings,
-                local,
-                latest_official_height,
-                &latest_official_tip,
-            )
-        {
-            bail!(
-                "mining green-light wait: local height #{} is ahead of official/direct height #{} without acknowledgement. HF116 prevents extending this stale suffix.",
-                local.height(),
-                latest_official_height
-            );
+
+        if hf126_is_same_height_competing_tip(
+            local.height(),
+            &local.tip_hash().to_string(),
+            latest_height,
+            &latest_tip,
+        ) {
+            mark_fresh_tip_trusted(settings, local);
+            return Ok(true);
         }
     }
-    Ok(())
+
+    Ok(false)
 }
+
 /// HF54/v1.5.2 hard template gate. This runs immediately before building a
 /// mining candidate and again immediately before submitting a found block.
 /// It prevents GUI/CLI miners from extending a local branch when direct peers
@@ -5225,13 +5658,14 @@ pub fn mining_parent_guard(
     merge_sync_reports(&mut report, quick);
     local = load_chain_for_hf90_catchup(settings)?;
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
-    force_official_tip_if_ahead(
+    let equal_height_tie = force_official_tip_if_ahead(
         settings,
         &mut report,
         &mut local,
         HF80_MINING_PARENT_GATE_MS,
     )?;
     if settings.network.name == "mainnet"
+        && !equal_height_tie
         && !hf104_canonical_greenlight(
             settings,
             &mut report,
@@ -5342,7 +5776,7 @@ pub fn mining_parent_guard(
                 );
             }
         }
-        if !retry_conflicts.is_empty() {
+        if !retry_conflicts.is_empty() && settings.network.name != "mainnet" {
             bail!(
                 "mining paused: direct peer(s) disagree at candidate parent #{}: {}. Candidate discarded; sync/repair first.",
                 parent_height,
@@ -5351,7 +5785,7 @@ pub fn mining_parent_guard(
         }
     }
 
-    if !conflicts.is_empty() {
+    if !conflicts.is_empty() && settings.network.name != "mainnet" {
         bail!(
             "mining paused: direct peer(s) disagree at candidate parent #{}: {}. Candidate discarded; sync/repair first.",
             parent_height,
@@ -5406,7 +5840,7 @@ pub fn mining_parent_submit_guard(
     )?;
     report.peers_contacted = report.peers_contacted.max(direct_contacted);
     report.best_peer_height = report.best_peer_height.max(best_direct_height);
-    if !conflicts.is_empty() {
+    if !conflicts.is_empty() && settings.network.name != "mainnet" {
         bail!(
             "mining submit paused: direct peer(s) disagree at candidate parent #{}: {}",
             parent_height,
@@ -5489,8 +5923,10 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     }
 
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
-    force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_FAST_GATE_MS)?;
+    let equal_height_tie =
+        force_official_tip_if_ahead(settings, &mut report, &mut local, HF80_MINING_FAST_GATE_MS)?;
     if settings.network.name == "mainnet"
+        && !equal_height_tie
         && !hf104_canonical_greenlight(
             settings,
             &mut report,
@@ -5573,7 +6009,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     )?;
     report.peers_contacted = report.peers_contacted.max(direct_contacted);
     report.best_peer_height = report.best_peer_height.max(best_direct_height);
-    if !conflicting_direct.is_empty() {
+    if !conflicting_direct.is_empty() && settings.network.name != "mainnet" {
         bail!(
             "mining paused: direct peer(s) report a different hash at local height #{}: {}. Do not mine until branches converge.",
             local_height,
@@ -5779,48 +6215,750 @@ pub fn rebroadcast_local_mempool(settings: &Settings, max_txs: usize) -> Result<
     Ok(peers.saturating_mul(txs.len()))
 }
 
-pub fn broadcast_block(settings: &Settings, block: &Block) -> Result<usize> {
-    if !settings.p2p.enabled {
-        return Ok(0);
+fn hf125_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn pending_block_relay_path(settings: &Settings) -> PathBuf {
+    PathBuf::from(&settings.node.data_dir).join("pending-block-relay.json")
+}
+
+fn write_pending_block_relay(settings: &Settings, pending: &PendingBlockRelay) -> Result<()> {
+    let path = pending_block_relay_path(settings);
+    crate::write_text_replace(&path, &serde_json::to_string_pretty(pending)?)
+}
+
+fn load_pending_block_relay(settings: &Settings) -> Result<Option<PendingBlockRelay>> {
+    let path = pending_block_relay_path(settings);
+    if !path.exists() {
+        return Ok(None);
     }
-    let chain = load_chain_for_hf90_catchup(settings)?;
-    let mut sent = 0usize;
-    // HF116: relay the found block plus a small recent suffix, not the entire
-    // chain to every peer. HF114 could spend the submit window serializing/sending
-    // the whole chain repeatedly, which amplified JIN/Library/mempool load and
-    // made block propagation look stalled on weak links. Peers that are far behind
-    // can still request older windows through GetChain/GetHeaders.
-    let tail_from = chain.height().saturating_sub(128);
-    for addr in
-        prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(16).min(48))?
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let pending: PendingBlockRelay = match serde_json::from_str(&raw) {
+        Ok(pending) => pending,
+        Err(err) => {
+            let corrupt = path.with_file_name(format!(
+                "pending-block-relay.corrupt.{}.json",
+                hf125_now_secs()
+            ));
+            let _ = fs::rename(&path, &corrupt);
+            return Err(err.into());
+        }
+    };
+    if pending.version != HF125_PENDING_BLOCK_RELAY_VERSION
+        || pending.network != settings.network.name
     {
-        let Ok(mut stream) = connect_peer(&addr, Duration::from_secs(2)) else {
-            continue;
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    }
+    Ok(Some(pending))
+}
+
+fn clear_pending_block_relay(settings: &Settings) {
+    let _ = fs::remove_file(pending_block_relay_path(settings));
+}
+
+fn schedule_pending_block_relay(settings: &Settings, block: &Block, height: u32) -> Result<()> {
+    let block_hash = block.block_hash().to_string();
+    let now = hf125_now_secs();
+    let existing = load_pending_block_relay(settings).ok().flatten();
+    let pending = match existing {
+        Some(mut existing) if existing.block_hash == block_hash => {
+            existing.block = block.clone();
+            existing.height = height;
+            existing
+        }
+        _ => PendingBlockRelay {
+            version: HF125_PENDING_BLOCK_RELAY_VERSION,
+            network: settings.network.name.clone(),
+            block_hash,
+            height,
+            block: block.clone(),
+            created_unix: now,
+            last_attempt_unix: 0,
+            attempts: 0,
+            last_acknowledgements: 0,
+            last_error: String::new(),
+            last_stale_parent_height: 0,
+            last_stale_parent_tip: String::new(),
+            last_stale_parent_reports: 0,
+            last_official_stale_parent_reports: 0,
+        },
+    };
+    write_pending_block_relay(settings, &pending)
+}
+
+fn pending_block_relay_waiting(settings: &Settings, local: &ChainState) -> bool {
+    let Ok(Some(pending)) = load_pending_block_relay(settings) else {
+        return false;
+    };
+    pending.height == local.height()
+        && pending.block_hash == local.tip_hash().to_string()
+}
+
+fn block_acceptance_from_chain(
+    settings: &Settings,
+    local: &mut ChainState,
+    block: Block,
+) -> BlockAcceptance {
+    let block_hash = block.block_hash().to_string();
+    if let Some((height, _)) = local
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, existing)| existing.block_hash().to_string() == block_hash)
+    {
+        return BlockAcceptance {
+            status: "already_known".to_string(),
+            block_hash,
+            height: height as u32,
+            tip_hash: local.tip_hash().to_string(),
+            reason: String::new(),
+            changed: false,
         };
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-        let _ = send_version(&mut stream, settings, &chain);
-        let mut ok = send_wire(
+    }
+
+    if block.header.prev_block_hash != local.tip_hash() {
+        return BlockAcceptance {
+            status: "stale_parent".to_string(),
+            block_hash,
+            height: local.height(),
+            tip_hash: local.tip_hash().to_string(),
+            reason: format!(
+                "candidate parent {} does not match current tip {}",
+                block.header.prev_block_hash,
+                local.tip_hash()
+            ),
+            changed: false,
+        };
+    }
+
+    match connect_block_persist_atomic(settings, local, block) {
+        Ok(_) => {
+            mark_fresh_tip_trusted(settings, local);
+            BlockAcceptance {
+                status: "accepted".to_string(),
+                block_hash,
+                height: local.height(),
+                tip_hash: local.tip_hash().to_string(),
+                reason: String::new(),
+                changed: true,
+            }
+        }
+        Err(err) => BlockAcceptance {
+            status: "rejected".to_string(),
+            block_hash,
+            height: local.height(),
+            tip_hash: local.tip_hash().to_string(),
+            reason: err.to_string(),
+            changed: false,
+        },
+    }
+}
+
+fn accept_submitted_block_live(
+    settings: &Settings,
+    chain: &Arc<Mutex<ChainState>>,
+    mempool_dirty: &Arc<AtomicBool>,
+    block: Block,
+) -> BlockAcceptance {
+    let mut local = match chain.lock() {
+        Ok(local) => local,
+        Err(_) => {
+            return BlockAcceptance {
+                status: "rejected".to_string(),
+                block_hash: block.block_hash().to_string(),
+                height: 0,
+                tip_hash: String::new(),
+                reason: "canonical chain mutex poisoned".to_string(),
+                changed: false,
+            }
+        }
+    };
+    let accepted = block_acceptance_from_chain(settings, &mut local, block);
+    if accepted.changed {
+        mempool_dirty.store(false, Ordering::Release);
+    }
+    accepted
+}
+
+fn send_block_ack(
+    stream: &mut TcpStream,
+    request_id: u64,
+    accepted: &BlockAcceptance,
+) -> Result<()> {
+    send_wire(
+        stream,
+        &WireMessage::BlockAck {
+            request_id,
+            block_hash: accepted.block_hash.clone(),
+            status: accepted.status.clone(),
+            height: accepted.height,
+            tip_hash: accepted.tip_hash.clone(),
+            reason: accepted.reason.clone(),
+        },
+    )
+}
+
+fn is_official_block_relay_peer(settings: &Settings, addr: &str) -> bool {
+    let normalized = normalize_peer_addr(addr);
+    official_snapshot_peers(settings)
+        .into_iter()
+        .chain(release_bootnodes(settings))
+        .map(|peer| normalize_peer_addr(&peer))
+        .any(|peer| peer == normalized)
+}
+
+fn send_block_delivery_suffix(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    chain: &ChainState,
+    from_height: u32,
+) -> Result<()> {
+    let mut from = from_height;
+    let max_blocks = settings.p2p.max_blocks_per_message.max(1) as u32;
+    let final_height = chain.height();
+    let floor = final_height.saturating_sub(4_096);
+    if from < floor {
+        from = floor;
+    }
+    while from <= final_height {
+        send_headers(stream, settings, chain, from)?;
+        send_chain(stream, settings, chain, from)?;
+        let next = from.saturating_add(max_blocks);
+        if next <= from {
+            break;
+        }
+        from = next;
+    }
+    Ok(())
+}
+
+fn respond_during_block_submit(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    chain: &ChainState,
+    message: WireMessage,
+) -> Result<bool> {
+    match message {
+        WireMessage::GetHeaders { from_height } => {
+            send_headers(stream, settings, chain, from_height)?;
+            Ok(true)
+        }
+        WireMessage::GetChain { from_height } => {
+            send_chain(stream, settings, chain, from_height)?;
+            Ok(true)
+        }
+        WireMessage::GetMempool => {
+            let txs = hf115_mempool_relay_batch(settings, &chain.mempool);
+            send_wire(stream, &WireMessage::Mempool { txs })?;
+            Ok(true)
+        }
+        WireMessage::GetAddr => {
+            send_wire(
+                stream,
+                &WireMessage::Addr {
+                    addrs: release_bootnodes(settings),
+                },
+            )?;
+            Ok(true)
+        }
+        WireMessage::GetPeerList => {
+            send_wire(
+                stream,
+                &WireMessage::PeerList {
+                    peers: load_peer_registry(settings).unwrap_or_default().peers,
+                },
+            )?;
+            Ok(true)
+        }
+        WireMessage::Ping { nonce } => {
+            send_wire(stream, &WireMessage::Pong { nonce })?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn legacy_send_block_to_peer(
+    settings: &Settings,
+    addr: &str,
+    block: &Block,
+    chain: &ChainState,
+) -> BlockRelayPeerResult {
+    let mut result = BlockRelayPeerResult {
+        peer: addr.to_string(),
+        official: is_official_block_relay_peer(settings, addr),
+        transport: "legacy".to_string(),
+        ..BlockRelayPeerResult::default()
+    };
+    let attempt = (|| -> Result<()> {
+        let mut stream = connect_peer(addr, Duration::from_secs(3))?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(4)))?;
+        send_version_with_role(&mut stream, settings, chain, "block-submit")?;
+        send_wire(
             &mut stream,
             &WireMessage::Block {
                 block: block.clone(),
             },
-        )
-        .is_ok();
-        if ok {
-            ok = send_inv(&mut stream, &chain).is_ok();
+        )?;
+        send_inv(&mut stream, chain)?;
+        let tail_from = chain.height().saturating_sub(128);
+        send_headers(&mut stream, settings, chain, tail_from)?;
+        send_chain(&mut stream, settings, chain, tail_from)?;
+        Ok(())
+    })();
+    match attempt {
+        Ok(()) => {
+            result.status = "legacy_sent".to_string();
+            result.height = chain.height();
+            result.tip_hash = chain.tip_hash().to_string();
         }
-        if ok {
-            ok = send_headers(&mut stream, settings, &chain, tail_from).is_ok();
-        }
-        if ok {
-            ok = send_chain(&mut stream, settings, &chain, tail_from).is_ok();
-        }
-        if ok {
-            sent += 1;
+        Err(err) => {
+            result.status = "transport_error".to_string();
+            result.reason = err.to_string();
         }
     }
-    Ok(sent)
+    result
+}
+
+fn submit_block_to_peer(
+    settings: &Settings,
+    addr: &str,
+    block: &Block,
+    chain: &ChainState,
+) -> BlockRelayPeerResult {
+    let mut result = BlockRelayPeerResult {
+        peer: addr.to_string(),
+        official: is_official_block_relay_peer(settings, addr),
+        transport: "ack".to_string(),
+        ..BlockRelayPeerResult::default()
+    };
+    let request_id = rand::thread_rng().next_u64();
+    let attempt = (|| -> Result<Option<BlockRelayPeerResult>> {
+        let mut stream = connect_peer(addr, Duration::from_secs(3))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        send_version_with_role(&mut stream, settings, chain, "block-submit")?;
+        send_wire(
+            &mut stream,
+            &WireMessage::SubmitBlock {
+                request_id,
+                block: block.clone(),
+            },
+        )?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut deadline = Instant::now() + Duration::from_secs(HF125_BLOCK_ACK_TIMEOUT_SECS);
+        let mut repair_mode: Option<&'static str> = None;
+        while Instant::now() < deadline {
+            match read_wire(&mut reader, settings.p2p.max_message_bytes) {
+                Ok(WireMessage::BlockAck {
+                    request_id: ack_id,
+                    block_hash,
+                    status,
+                    height,
+                    tip_hash,
+                    reason,
+                }) if ack_id == request_id => {
+                    if block_hash != block.block_hash().to_string() {
+                        return Ok(Some(BlockRelayPeerResult {
+                            peer: addr.to_string(),
+                            official: is_official_block_relay_peer(settings, addr),
+                            transport: "ack".to_string(),
+                            status: "rejected".to_string(),
+                            height,
+                            tip_hash,
+                            reason: format!(
+                                "acknowledgement hash mismatch: {block_hash}; {reason}"
+                            ),
+                        }));
+                    }
+
+                    // HF125/HF126: repair the receiver on the same connection
+                    // before retrying the exact block. If its tip is our ancestor,
+                    // send only the missing suffix. If it reports an equal-height
+                    // sibling, send a bounded overlap window including the common
+                    // ancestor and our higher-work suffix. This is required after
+                    // HF126 keeps equal-height PoW ties mineable: the winning next
+                    // block must be able to carry its parent branch to a seed whose
+                    // current tip is the competing sibling.
+                    if status == "stale_parent" && repair_mode.is_none() && height < chain.height()
+                    {
+                        let peer_is_ancestor = chain
+                            .blocks
+                            .get(height as usize)
+                            .map(|candidate| candidate.block_hash().to_string())
+                            .as_deref()
+                            == Some(tip_hash.as_str());
+                        let (from_height, mode) = if peer_is_ancestor {
+                            (height.saturating_add(1), "ack_after_suffix")
+                        } else {
+                            (height.saturating_sub(32), "ack_after_overlap")
+                        };
+                        send_block_delivery_suffix(&mut stream, settings, chain, from_height)?;
+                        send_wire(
+                            &mut stream,
+                            &WireMessage::SubmitBlock {
+                                request_id,
+                                block: block.clone(),
+                            },
+                        )?;
+                        repair_mode = Some(mode);
+                        // Give the receiver a fresh bounded window to validate the
+                        // overlap/suffix before it acknowledges the exact block.
+                        deadline = Instant::now() + Duration::from_secs(25);
+                        continue;
+                    }
+
+                    return Ok(Some(BlockRelayPeerResult {
+                        peer: addr.to_string(),
+                        official: is_official_block_relay_peer(settings, addr),
+                        transport: repair_mode.unwrap_or("ack").to_string(),
+                        status,
+                        height,
+                        tip_hash,
+                        reason,
+                    }));
+                }
+                Ok(WireMessage::Version {
+                    protocol,
+                    network,
+                    magic,
+                    genesis_hash,
+                    ..
+                }) => {
+                    if protocol != PROTOCOL_VERSION {
+                        bail!("unsupported protocol {protocol}");
+                    }
+                    validate_remote_network(settings, &network, &magic, &genesis_hash)?;
+                }
+                Ok(WireMessage::Reject { reason }) => {
+                    result.reason = reason;
+                    return Ok(None);
+                }
+                Ok(message) => {
+                    let _ = respond_during_block_submit(
+                        &mut stream,
+                        settings,
+                        chain,
+                        message,
+                    )?;
+                }
+                Err(err) if is_timeout(&err) => continue,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(None)
+    })();
+
+    match attempt {
+        Ok(Some(ack)) => ack,
+        Ok(None) => legacy_send_block_to_peer(settings, addr, block, chain),
+        Err(err) => {
+            result.status = if is_timeout_text(&err.to_string()) {
+                "timeout".to_string()
+            } else {
+                "transport_error".to_string()
+            };
+            result.reason = err.to_string();
+            result
+        }
+    }
+}
+
+fn is_timeout_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("would block")
+}
+
+fn update_block_relay_report(report: &mut BlockRelayReport, result: BlockRelayPeerResult) {
+    if result.status != "transport_error" && result.status != "timeout" {
+        report.connected = report.connected.saturating_add(1);
+    }
+    match result.status.as_str() {
+        "accepted" => {
+            report.acknowledgements = report.acknowledgements.saturating_add(1);
+            if result.official {
+                report.official_acknowledgements =
+                    report.official_acknowledgements.saturating_add(1);
+            }
+            report.accepted = report.accepted.saturating_add(1);
+        }
+        "already_known" => {
+            report.acknowledgements = report.acknowledgements.saturating_add(1);
+            if result.official {
+                report.official_acknowledgements =
+                    report.official_acknowledgements.saturating_add(1);
+            }
+            report.already_known = report.already_known.saturating_add(1);
+        }
+        "stale_parent" => report.stale_parent = report.stale_parent.saturating_add(1),
+        "rejected" => report.rejected = report.rejected.saturating_add(1),
+        "legacy_sent" => report.legacy_sent = report.legacy_sent.saturating_add(1),
+        "timeout" => report.timed_out = report.timed_out.saturating_add(1),
+        _ => {}
+    }
+    report.peer_results.push(result);
+}
+
+fn broadcast_block_confirmed_internal(
+    settings: &Settings,
+    block: &Block,
+    source_peer: Option<&str>,
+    track_pending: bool,
+) -> Result<BlockRelayReport> {
+    let _relay_guard = hf125_block_relay_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("HF125 block-relay mutex poisoned"))?;
+    let block_hash = block.block_hash().to_string();
+    let chain = load_committed_chain(settings, false)
+        .or_else(|_| load_chain_for_hf90_catchup(settings))?;
+    let height = chain
+        .blocks
+        .iter()
+        .position(|candidate| candidate.block_hash().to_string() == block_hash)
+        .map(|height| height as u32)
+        .unwrap_or_else(|| chain.height().saturating_add(1));
+
+    if track_pending {
+        schedule_pending_block_relay(settings, block, height)?;
+    }
+
+    let source = source_peer.map(normalize_peer_addr).unwrap_or_default();
+    let peers = prioritized_outbound_peers(
+        settings,
+        HF125_BLOCK_RELAY_MAX_PEERS
+            .max(settings.p2p.max_outbound_peers)
+            .min(48),
+    )?
+    .into_iter()
+    .filter(|addr| source.is_empty() || normalize_peer_addr(addr) != source)
+    .take(HF125_BLOCK_RELAY_MAX_PEERS)
+    .collect::<Vec<_>>();
+
+    let official_attempts = peers
+        .iter()
+        .filter(|addr| is_official_block_relay_peer(settings, addr))
+        .count();
+    let mut report = BlockRelayReport {
+        block_hash,
+        height,
+        attempts: peers.len(),
+        official_attempts,
+        ..BlockRelayReport::default()
+    };
+    if peers.is_empty() {
+        report.pending_retry = track_pending;
+        return Ok(report);
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    for addr in peers {
+        let sender = sender.clone();
+        let settings = settings.clone();
+        let block = block.clone();
+        let chain = chain.clone();
+        thread::spawn(move || {
+            let _ = sender.send(submit_block_to_peer(&settings, &addr, &block, &chain));
+        });
+    }
+    drop(sender);
+
+    let deadline = Instant::now() + Duration::from_secs(HF125_BLOCK_RELAY_TOTAL_SECS);
+    while report.peer_results.len() < report.attempts && Instant::now() < deadline {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(wait.min(Duration::from_millis(500))) {
+            Ok(result) => update_block_relay_report(&mut report, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    report.timed_out = report
+        .timed_out
+        .saturating_add(report.attempts.saturating_sub(report.peer_results.len()));
+
+    if report.delivered() {
+        clear_pending_block_relay(settings);
+        report.pending_retry = false;
+    } else if track_pending {
+        let now = hf125_now_secs();
+        if let Ok(Some(mut pending)) = load_pending_block_relay(settings) {
+            if pending.block_hash == report.block_hash {
+                pending.last_attempt_unix = now;
+                pending.attempts = pending.attempts.saturating_add(report.attempts as u64);
+                pending.last_acknowledgements = report.acknowledged();
+                pending.last_error = report
+                    .peer_results
+                    .iter()
+                    .filter(|result| !result.reason.trim().is_empty())
+                    .map(|result| format!("{}: {}", result.peer, result.reason))
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                let mut stale_views: HashMap<(u32, String), (usize, usize)> = HashMap::new();
+                for result in report
+                    .peer_results
+                    .iter()
+                    .filter(|result| result.status == "stale_parent")
+                {
+                    if result.height == 0 || result.tip_hash.trim().is_empty() {
+                        continue;
+                    }
+                    let entry = stale_views
+                        .entry((result.height, result.tip_hash.clone()))
+                        .or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(1);
+                    if result.official {
+                        entry.1 = entry.1.saturating_add(1);
+                    }
+                }
+                if let Some(((height, tip), (count, official_count))) = stale_views
+                    .into_iter()
+                    .max_by_key(|(_, (count, official_count))| {
+                        official_count.saturating_mul(100).saturating_add(*count)
+                    })
+                {
+                    pending.last_stale_parent_height = height;
+                    pending.last_stale_parent_tip = tip;
+                    pending.last_stale_parent_reports = count;
+                    pending.last_official_stale_parent_reports = official_count;
+                }
+                // Keep earlier explicit stale-parent evidence across a later
+                // transport-only retry. The record is scoped to this exact local
+                // block hash and is still combined with fresh HTTP/TCP/direct
+                // evidence before HF126 can re-anchor.
+                let _ = write_pending_block_relay(settings, &pending);
+            }
+        }
+        report.pending_retry = true;
+    }
+
+    Ok(report)
+}
+
+pub fn broadcast_block_confirmed(settings: &Settings, block: &Block) -> Result<BlockRelayReport> {
+    if !settings.p2p.enabled {
+        return Ok(BlockRelayReport {
+            block_hash: block.block_hash().to_string(),
+            ..BlockRelayReport::default()
+        });
+    }
+    broadcast_block_confirmed_internal(settings, block, None, true)
+}
+
+
+pub fn block_relay_status(settings: &Settings) -> Result<serde_json::Value> {
+    let pending = load_pending_block_relay(settings)?;
+    let local = load_chain_for_hf90_catchup(settings)?;
+    Ok(match pending {
+        Some(pending) => serde_json::json!({
+            "ok": true,
+            "pending": true,
+            "network": settings.network.name,
+            "local_height": local.height(),
+            "local_tip": local.tip_hash().to_string(),
+            "block_height": pending.height,
+            "block_hash": pending.block_hash,
+            "created_unix": pending.created_unix,
+            "last_attempt_unix": pending.last_attempt_unix,
+            "attempts": pending.attempts,
+            "last_acknowledgements": pending.last_acknowledgements,
+            "last_error": pending.last_error,
+            "competing_tip_height": pending.last_stale_parent_height,
+            "competing_tip_hash": pending.last_stale_parent_tip,
+            "competing_tip_reports": pending.last_stale_parent_reports,
+            "official_competing_tip_reports": pending.last_official_stale_parent_reports,
+            "hf125_reliable_block_delivery": true,
+            "hf126_equal_height_recovery": true,
+            "delivery_rule": "official seed acknowledgement when official delivery is attempted; otherwise any explicit accepted/already-known peer acknowledgement",
+        }),
+        None => serde_json::json!({
+            "ok": true,
+            "pending": false,
+            "network": settings.network.name,
+            "local_height": local.height(),
+            "local_tip": local.tip_hash().to_string(),
+            "hf125_reliable_block_delivery": true,
+            "hf126_equal_height_recovery": true,
+            "delivery_rule": "official seed acknowledgement when official delivery is attempted; otherwise any explicit accepted/already-known peer acknowledgement",
+        }),
+    })
+}
+
+pub fn relay_pending_block_now(settings: &Settings) -> Result<Option<BlockRelayReport>> {
+    let Some(pending) = load_pending_block_relay(settings)? else {
+        return Ok(None);
+    };
+    let local = load_chain_for_hf90_catchup(settings)?;
+    if local
+        .blocks
+        .get(pending.height as usize)
+        .map(|block| block.block_hash().to_string())
+        != Some(pending.block_hash.clone())
+    {
+        clear_pending_block_relay(settings);
+        return Ok(None);
+    }
+    broadcast_block_confirmed_internal(settings, &pending.block, None, true).map(Some)
+}
+
+fn retry_pending_block_relay(
+    settings: &Settings,
+    chain: &Arc<Mutex<ChainState>>,
+) -> Result<Option<BlockRelayReport>> {
+    let Some(pending) = load_pending_block_relay(settings)? else {
+        return Ok(None);
+    };
+    let (local_height, local_at_height) = {
+        let snapshot = chain
+            .lock()
+            .map_err(|_| anyhow::anyhow!("chain mutex poisoned"))?;
+        (
+            snapshot.height(),
+            snapshot
+                .blocks
+                .get(pending.height as usize)
+                .map(Block::block_hash),
+        )
+    };
+    match local_at_height {
+        Some(hash) if hash.to_string() == pending.block_hash => {
+            if local_height > pending.height {
+                clear_pending_block_relay(settings);
+                return Ok(None);
+            }
+        }
+        _ => {
+            clear_pending_block_relay(settings);
+            return Ok(None);
+        }
+    }
+    if pending.last_attempt_unix > 0
+        && hf125_now_secs().saturating_sub(pending.last_attempt_unix)
+            < HF125_BLOCK_RELAY_RETRY_SECS
+    {
+        return Ok(None);
+    }
+    let report = broadcast_block_confirmed_internal(settings, &pending.block, None, true)?;
+    Ok(Some(report))
+}
+
+pub fn broadcast_block(settings: &Settings, block: &Block) -> Result<usize> {
+    let report = broadcast_block_confirmed(settings, block)?;
+    Ok(report.acknowledged().saturating_add(report.legacy_sent))
 }
 
 fn relay_chain_to_known_peers(settings: &Settings, source_peer: Option<&str>) -> Result<usize> {
@@ -5993,6 +7131,7 @@ fn handle_peer(
     mut stream: TcpStream,
     peer_addr: String,
     outbound: bool,
+    priority_only: bool,
     settings: Settings,
     chain: Arc<Mutex<ChainState>>,
     peers: Arc<Mutex<HashSet<String>>>,
@@ -6012,21 +7151,76 @@ fn handle_peer(
     let result = (|| -> Result<()> {
         let local_chain = chain.lock().expect("chain mutex poisoned").clone();
         send_version(&mut stream, &settings, &local_chain)?;
-        send_wire(&mut stream, &WireMessage::GetAddr)?;
-        send_wire(&mut stream, &WireMessage::GetPeerList)?;
-        send_wire(&mut stream, &WireMessage::GetMempool)?;
-        if outbound {
-            send_wire(&mut stream, &WireMessage::GetHeaders { from_height: 0 })?;
-            send_wire(&mut stream, &WireMessage::GetChain { from_height: 0 })?;
+        // A reserve-lane connection is a short-lived delivery channel. Do not
+        // front-load address, mempool or full-chain requests before the submitter
+        // can deliver its block. Normal inbound/outbound sessions retain the
+        // existing discovery and synchronization handshake.
+        if !priority_only {
+            send_wire(&mut stream, &WireMessage::GetAddr)?;
+            send_wire(&mut stream, &WireMessage::GetPeerList)?;
+            send_wire(&mut stream, &WireMessage::GetMempool)?;
+            if outbound {
+                send_wire(&mut stream, &WireMessage::GetHeaders { from_height: 0 })?;
+                send_wire(&mut stream, &WireMessage::GetChain { from_height: 0 })?;
+            }
         }
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut peer_errors = 0u32;
         let mut last_inv = Instant::now();
         let mut session = PeerSession::default();
+        let priority_deadline = Instant::now() + Duration::from_secs(30);
+        let mut priority_verified = !priority_only;
+        let mut priority_messages = 0usize;
+        let mut priority_submissions = 0usize;
 
         loop {
             match read_wire(&mut reader, settings.p2p.max_message_bytes) {
                 Ok(message) => {
+                    if priority_only {
+                        priority_messages = priority_messages.saturating_add(1);
+                        if priority_messages > HF125_PRIORITY_MAX_MESSAGES {
+                            let _ = send_wire(
+                                &mut stream,
+                                &WireMessage::Reject {
+                                    reason: "priority block-submit session exceeded its message budget"
+                                        .to_string(),
+                                },
+                            );
+                            break;
+                        }
+
+                        if !priority_verified {
+                            match &message {
+                                WireMessage::Version { role, .. } if role == "block-submit" => {
+                                    priority_verified = true;
+                                }
+                                _ => {
+                                    let _ = send_wire(
+                                        &mut stream,
+                                        &WireMessage::Reject {
+                                            reason: "priority inbound slot requires block-submit Version as the first message"
+                                                .to_string(),
+                                        },
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if matches!(&message, WireMessage::SubmitBlock { .. }) {
+                            priority_submissions = priority_submissions.saturating_add(1);
+                            if priority_submissions > HF125_PRIORITY_MAX_SUBMISSIONS {
+                                let _ = send_wire(
+                                    &mut stream,
+                                    &WireMessage::Reject {
+                                        reason: "priority block-submit session exceeded its submission budget"
+                                            .to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    }
                     if let Err(err) = process_peer_message(
                         &settings,
                         &peer_key,
@@ -6048,8 +7242,21 @@ fn handle_peer(
                             bail!("peer exceeded invalid-message score");
                         }
                     }
+                    // HF125/v1.8.2: heartbeat scheduling is wall-clock based,
+                    // not timeout based. A continuous pool-share stream used to
+                    // prevent read timeouts forever and therefore suppress tip
+                    // announcements on otherwise healthy persistent sessions.
+                    if last_inv.elapsed() >= Duration::from_secs(4) {
+                        let local = chain.lock().expect("chain mutex poisoned").clone();
+                        send_version(&mut stream, &settings, &local)?;
+                        send_inv(&mut stream, &local)?;
+                        last_inv = Instant::now();
+                    }
                 }
                 Err(err) if is_timeout(&err) => {
+                    if priority_only && Instant::now() >= priority_deadline {
+                        break;
+                    }
                     if last_inv.elapsed() >= Duration::from_secs(4) {
                         let local = chain.lock().expect("chain mutex poisoned").clone();
                         // Heartbeat identity/status too, not just inv. This keeps the seed
@@ -6186,25 +7393,41 @@ fn process_peer_message(
             }
             let more_expected = blocks.len() == settings.p2p.max_blocks_per_message;
             let next_from = start_height.saturating_add(blocks.len() as u32);
-            let mut local = chain.lock().expect("chain mutex poisoned");
+            let base = chain.lock().expect("chain mutex poisoned").clone();
+            let local_height_before = base.height();
+            let mut candidate = base.clone();
             let mut changed = false;
-            if start_height <= local.height().saturating_add(1) {
-                let local_height_before = local.height();
+            if start_height <= candidate.height().saturating_add(1) {
                 match try_adopt_overlapping_blocks(
-                    &mut local,
+                    &mut candidate,
                     start_height,
                     blocks,
                     settings,
                     prefer_peer_tip_on_equal_work(settings, peer_addr),
                 ) {
                     Ok(true) => {
-                        save_chain(settings, &local)?;
-                        mempool_dirty.store(false, Ordering::Release);
-                        changed = true;
+                        // HF125/v1.8.2 transactional chain adoption: persist the
+                        // isolated candidate before publishing it to the live
+                        // owner. A failed disk commit cannot advance memory.
+                        save_chain(settings, &candidate)?;
+                        let mut live = chain.lock().expect("chain mutex poisoned");
+                        if live.tip_hash() == base.tip_hash() {
+                            *live = candidate;
+                            changed = true;
+                        } else {
+                            let blocks = candidate.blocks.as_ref().clone();
+                            changed = live.try_adopt_peer_chain(
+                                blocks,
+                                settings,
+                                prefer_peer_tip_on_equal_work(settings, peer_addr),
+                            )?;
+                        }
+                        if changed {
+                            mempool_dirty.store(false, Ordering::Release);
+                        }
                     }
                     Ok(false) => {
                         if start_height == local_height_before.saturating_add(1) {
-                            // Missing suffix did not connect; request an overlapping fork window instead of full genesis history.
                             request_earlier_fork_window(stream, local_height_before, start_height)?;
                         }
                     }
@@ -6216,13 +7439,16 @@ fn process_peer_message(
                 send_wire(
                     stream,
                     &WireMessage::GetChain {
-                        from_height: local.height().saturating_add(1),
+                        from_height: base.height().saturating_add(1),
                     },
                 )?;
             }
-            drop(local);
             if changed {
-                let _ = relay_chain_to_known_peers(settings, Some(peer_addr));
+                let relay_settings = settings.clone();
+                let source = peer_addr.to_string();
+                thread::spawn(move || {
+                    let _ = relay_chain_to_known_peers(&relay_settings, Some(&source));
+                });
             }
             if more_expected {
                 send_wire(
@@ -6234,22 +7460,43 @@ fn process_peer_message(
             }
         }
         WireMessage::Block { block } => {
-            let mut local = chain.lock().expect("chain mutex poisoned");
-            let mut changed = false;
-            if block.header.prev_block_hash == local.tip_hash() {
-                local.connect_block(block, settings)?;
-                save_chain(settings, &local)?;
-                mempool_dirty.store(false, Ordering::Release);
-                changed = true;
-            } else {
-                let h = local.height();
+            let relay_block = block.clone();
+            let accepted = accept_submitted_block_live(settings, chain, mempool_dirty, block);
+            if accepted.status == "stale_parent" {
+                let h = chain.lock().expect("chain mutex poisoned").height();
                 request_earlier_fork_window(stream, h, h.saturating_add(1))?;
             }
-            drop(local);
-            if changed {
-                let _ = relay_chain_to_known_peers(settings, Some(peer_addr));
+            if accepted.changed {
+                let relay_settings = settings.clone();
+                let source = peer_addr.to_string();
+                thread::spawn(move || {
+                    let _ = broadcast_block_confirmed_internal(
+                        &relay_settings,
+                        &relay_block,
+                        Some(&source),
+                        false,
+                    );
+                });
             }
         }
+        WireMessage::SubmitBlock { request_id, block } => {
+            let relay_block = block.clone();
+            let accepted = accept_submitted_block_live(settings, chain, mempool_dirty, block);
+            send_block_ack(stream, request_id, &accepted)?;
+            if accepted.changed {
+                let relay_settings = settings.clone();
+                let source = peer_addr.to_string();
+                thread::spawn(move || {
+                    let _ = broadcast_block_confirmed_internal(
+                        &relay_settings,
+                        &relay_block,
+                        Some(&source),
+                        false,
+                    );
+                });
+            }
+        }
+        WireMessage::BlockAck { .. } => {}
         WireMessage::Tx { tx } => {
             let (accepted, mempool_changed) = {
                 let mut local = chain.lock().expect("chain mutex poisoned");
@@ -6486,9 +7733,8 @@ fn process_client_message(
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let mut changed = false;
             if block.header.prev_block_hash == local.tip_hash() {
-                local.connect_block(block, settings)?;
-                save_chain(settings, &local)?;
-                report.blocks_connected += 1;
+                connect_block_persist_atomic(settings, &mut local, block)?;
+                report.blocks_connected = report.blocks_connected.saturating_add(1);
                 changed = true;
             } else {
                 let h = local.height();
@@ -6498,6 +7744,16 @@ fn process_client_message(
                 let _ = relay_chain_to_known_peers(settings, Some(addr));
             }
         }
+        WireMessage::SubmitBlock { request_id, block } => {
+            let mut local = load_chain_for_hf90_catchup(settings)?;
+            let accepted = block_acceptance_from_chain(settings, &mut local, block);
+            send_block_ack(stream, request_id, &accepted)?;
+            if accepted.changed {
+                report.blocks_connected = report.blocks_connected.saturating_add(1);
+                let _ = relay_chain_to_known_peers(settings, Some(addr));
+            }
+        }
+        WireMessage::BlockAck { .. } => {}
         WireMessage::Tx { tx } => {
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let before_len = local.mempool.len();
@@ -6603,7 +7859,12 @@ fn process_client_message(
     Ok(())
 }
 
-fn send_version(stream: &mut TcpStream, settings: &Settings, chain: &ChainState) -> Result<()> {
+fn send_version_with_role(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    chain: &ChainState,
+    role: &str,
+) -> Result<()> {
     send_wire(
         stream,
         &WireMessage::Version {
@@ -6617,15 +7878,20 @@ fn send_version(stream: &mut TcpStream, settings: &Settings, chain: &ChainState)
             genesis_hash: genesis_block(settings)?.block_hash().to_string(),
             listen_addr: effective_advertise_addr(settings),
             node_id: node_id(settings)?,
-            role: if settings.mining.enabled {
-                "miner".to_string()
-            } else {
-                "node".to_string()
-            },
+            role: role.to_string(),
             miner_address: runtime_miner_address(settings)
                 .unwrap_or_else(|| settings.mining.miner_address.clone()),
         },
     )
+}
+
+fn send_version(stream: &mut TcpStream, settings: &Settings, chain: &ChainState) -> Result<()> {
+    let role = if settings.mining.enabled {
+        "miner"
+    } else {
+        "node"
+    };
+    send_version_with_role(stream, settings, chain, role)
 }
 
 fn send_inv(stream: &mut TcpStream, chain: &ChainState) -> Result<()> {
@@ -8050,7 +9316,7 @@ fn finish_report(settings: &Settings, mut report: P2PSyncReport) -> Result<P2PSy
 }
 
 #[cfg(test)]
-mod hf124_tests {
+mod hf125_tests {
     use super::*;
 
     fn regtest_settings() -> Settings {
@@ -8108,4 +9374,174 @@ mod hf124_tests {
         assert_eq!(batch.len(), settings.pools.max_share_txs_per_block);
         assert!(batch.iter().all(is_pool_share_transaction));
     }
+
+    #[test]
+    fn hf125_relay_report_requires_an_explicit_acknowledgement() {
+        let mut report = BlockRelayReport::default();
+        assert!(!report.delivered());
+
+        update_block_relay_report(
+            &mut report,
+            BlockRelayPeerResult {
+                peer: "127.0.0.1:1".to_string(),
+                official: false,
+                transport: "legacy".to_string(),
+                status: "legacy_sent".to_string(),
+                ..BlockRelayPeerResult::default()
+            },
+        );
+        assert!(!report.delivered());
+
+        update_block_relay_report(
+            &mut report,
+            BlockRelayPeerResult {
+                peer: "127.0.0.1:2".to_string(),
+                official: false,
+                transport: "ack".to_string(),
+                status: "accepted".to_string(),
+                ..BlockRelayPeerResult::default()
+            },
+        );
+        assert!(report.delivered());
+        assert_eq!(report.acknowledged(), 1);
+
+        // Once an official delivery was attempted, a non-official ACK alone is
+        // not sufficient to clear the durable mainnet relay marker.
+        report.official_attempts = 1;
+        assert!(!report.delivered());
+
+        update_block_relay_report(
+            &mut report,
+            BlockRelayPeerResult {
+                peer: "127.0.0.1:3".to_string(),
+                official: true,
+                transport: "ack".to_string(),
+                status: "already_known".to_string(),
+                ..BlockRelayPeerResult::default()
+            },
+        );
+        assert!(report.delivered());
+        assert_eq!(report.acknowledged(), 2);
+        assert_eq!(report.official_acknowledgements, 1);
+    }
+
+    #[test]
+    fn hf125_submit_block_and_ack_wire_messages_roundtrip() {
+        let settings = regtest_settings();
+        let block = genesis_block(&settings).expect("regtest genesis");
+        let request_id = 0xA5A5_1234_9876_4321;
+
+        let submit = WireMessage::SubmitBlock {
+            request_id,
+            block: block.clone(),
+        };
+        let submit_raw = serde_json::to_vec(&submit).expect("serialize submit block");
+        let submit_parsed: WireMessage =
+            serde_json::from_slice(&submit_raw).expect("parse submit block");
+        match submit_parsed {
+            WireMessage::SubmitBlock {
+                request_id: parsed_id,
+                block: parsed_block,
+            } => {
+                assert_eq!(parsed_id, request_id);
+                assert_eq!(parsed_block.block_hash(), block.block_hash());
+            }
+            other => panic!("unexpected submit message: {other:?}"),
+        }
+
+        let ack = WireMessage::BlockAck {
+            request_id,
+            block_hash: block.block_hash().to_string(),
+            status: "accepted".to_string(),
+            height: 0,
+            tip_hash: block.block_hash().to_string(),
+            reason: String::new(),
+        };
+        let ack_raw = serde_json::to_vec(&ack).expect("serialize block ack");
+        let ack_parsed: WireMessage = serde_json::from_slice(&ack_raw).expect("parse block ack");
+        match ack_parsed {
+            WireMessage::BlockAck {
+                request_id: parsed_id,
+                block_hash,
+                status,
+                ..
+            } => {
+                assert_eq!(parsed_id, request_id);
+                assert_eq!(block_hash, block.block_hash().to_string());
+                assert_eq!(status, "accepted");
+            }
+            other => panic!("unexpected ack message: {other:?}"),
+        }
+    }
+
+
+    #[test]
+    fn hf126_same_height_competing_tip_classifier_is_exact() {
+        assert!(hf126_is_same_height_competing_tip(25_807, "local", 25_807, "network"));
+        assert!(!hf126_is_same_height_competing_tip(25_807, "local", 25_808, "network"));
+        assert!(!hf126_is_same_height_competing_tip(25_807, "local", 25_807, "local"));
+        assert!(!hf126_is_same_height_competing_tip(25_807, "local", 25_807, ""));
+    }
+
+    #[test]
+    fn hf126_equal_height_reanchor_evidence_requires_independent_sources() {
+        let mut evidence = Hf126EqualHeightTipEvidence {
+            height: 25_807,
+            tip_hash: "network".to_string(),
+            http_matches: 1,
+            official_tcp_matches: 0,
+            direct_matches: 0,
+        };
+        assert!(!evidence.confirmed());
+
+        evidence.official_tcp_matches = 1;
+        assert!(evidence.confirmed());
+
+        evidence.http_matches = 0;
+        evidence.official_tcp_matches = 2;
+        assert!(evidence.confirmed());
+
+        evidence.official_tcp_matches = 0;
+        evidence.direct_matches = 2;
+        assert!(!evidence.confirmed());
+
+        evidence.http_matches = 1;
+        assert!(evidence.confirmed());
+    }
+    #[test]
+    fn hf125_pending_block_relay_is_durable_and_network_scoped() {
+        let mut settings = regtest_settings();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "qub-hf125-pending-relay-{}-{nonce}",
+            std::process::id()
+        ));
+        settings.node.data_dir = data_dir.to_string_lossy().to_string();
+        let block = genesis_block(&settings).expect("regtest genesis");
+        let local = ChainState::from_blocks(vec![block.clone()], &settings)
+            .expect("genesis chain");
+
+        schedule_pending_block_relay(&settings, &block, 0)
+            .expect("write pending block relay");
+        let pending = load_pending_block_relay(&settings)
+            .expect("load pending relay")
+            .expect("pending relay exists");
+        assert_eq!(pending.network, settings.network.name);
+        assert_eq!(pending.block_hash, block.block_hash().to_string());
+        assert_eq!(pending.last_stale_parent_height, 0);
+        assert!(pending.last_stale_parent_tip.is_empty());
+        assert_eq!(pending.last_stale_parent_reports, 0);
+        assert_eq!(pending.last_official_stale_parent_reports, 0);
+        assert!(pending_block_relay_waiting(&settings, &local));
+
+        clear_pending_block_relay(&settings);
+        assert!(load_pending_block_relay(&settings)
+            .expect("load cleared relay")
+            .is_none());
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
 }

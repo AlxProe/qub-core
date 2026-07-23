@@ -6534,6 +6534,22 @@ pub fn load_or_init_chain_for_ui_fast(settings: &Settings) -> Result<ChainState>
     }
 }
 
+/// HF125/v1.8.2 transactional block persistence. Consensus validation and
+/// UTXO/mempool mutation happen on an isolated copy. The live caller state is
+/// replaced only after the Fast Chain Engine commit succeeds, so a disk error
+/// can never leave memory one block ahead of durable storage.
+pub fn connect_block_persist_atomic(
+    settings: &Settings,
+    chain: &mut ChainState,
+    block: Block,
+) -> Result<Hash256> {
+    let mut candidate = chain.clone();
+    let hash = candidate.connect_block(block, settings)?;
+    save_chain(settings, &candidate)?;
+    *chain = candidate;
+    Ok(hash)
+}
+
 pub fn save_chain(settings: &Settings, chain: &ChainState) -> Result<()> {
     let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
@@ -6549,6 +6565,30 @@ pub fn save_chain(settings: &Settings, chain: &ChainState) -> Result<()> {
         fast_storage::commit_chain(settings, &paths, chain)?;
     }
     fast_storage::publish_live_chain(settings, chain);
+    Ok(())
+}
+
+/// HF126/v1.8.2 explicit equal-work re-anchor. Ordinary persistence remains
+/// strictly monotonic; only a fully replay-validated mainnet sibling at the same
+/// height and cumulative work may use this path.
+pub fn save_chain_verified_equal_work_reanchor(
+    settings: &Settings,
+    chain: &ChainState,
+) -> Result<()> {
+    if settings.network.name != "mainnet" {
+        bail!("verified equal-work re-anchor is mainnet-only");
+    }
+    chain.validate_all(settings)?;
+    {
+        let _guard = storage_lock().lock().expect("storage mutex poisoned");
+        let paths = NodePaths::from_settings(settings);
+        paths.ensure_dirs()?;
+        if !paths.fast_storage_exists() {
+            bail!("verified equal-work re-anchor requires an initialized Fast Chain Engine");
+        }
+        fast_storage::commit_chain_verified_equal_work_reanchor(settings, &paths, chain)?;
+    }
+    fast_storage::publish_live_chain_verified_equal_work_reanchor(settings, chain)?;
     Ok(())
 }
 
@@ -6586,7 +6626,7 @@ fn write_wallet_file(paths: &NodePaths, wallet: &WalletFile) -> Result<()> {
     write_text_replace(&paths.wallet_file, &serde_json::to_string_pretty(wallet)?)
 }
 
-fn write_text_replace(path: &Path, body: &str) -> Result<()> {
+pub(crate) fn write_text_replace(path: &Path, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

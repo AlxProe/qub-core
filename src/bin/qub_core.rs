@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.1";
+const APP_VERSION: &str = "v1.8.2";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -2128,6 +2128,49 @@ impl QubCoreApp {
         self.miner.is_some() && self.total_hash_rate_hps() > 0.5
     }
 
+    fn same_height_network_tip_conflict(&self) -> bool {
+        self.snapshot.height > 0
+            && self.snapshot.known_network_height == self.snapshot.height
+            && !self.snapshot.best_hash.trim().is_empty()
+            && !self.snapshot.known_network_hash.trim().is_empty()
+            && self.snapshot.best_hash != self.snapshot.known_network_hash
+    }
+
+    fn mining_header_status(&self) -> (&'static str, egui::Color32) {
+        if self.miner.is_none() {
+            return ("IDLE", egui::Color32::GRAY);
+        }
+        if self.truly_mining_active() {
+            return ("MINING", egui::Color32::from_rgb(80, 205, 130));
+        }
+
+        let mut context = self.status_line.to_ascii_lowercase();
+        if let Some(error) = &self.last_error {
+            context.push(' ');
+            context.push_str(&error.to_ascii_lowercase());
+        }
+        let waiting = [
+            "waiting",
+            "paused",
+            "catch-up",
+            "catchup",
+            "syncing",
+            "green-light",
+            "acknowledgement",
+            "pending block",
+            "competing tip",
+            "re-anchor",
+        ]
+        .iter()
+        .any(|needle| context.contains(needle));
+
+        if waiting {
+            ("WAITING", egui::Color32::from_rgb(236, 190, 78))
+        } else {
+            ("PREPARING", egui::Color32::from_rgb(90, 170, 255))
+        }
+    }
+
     fn mining_mode_short(&self) -> &'static str {
         if self.miner.is_some() && !self.pool_mining_pool_id.trim().is_empty() { "P" } else { "S" }
     }
@@ -2970,7 +3013,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 if let Some(active_at_height) = snapshot.recent_blocks.iter().find(|block| block.height == card.height) {
                     if active_at_height.hash != card.hash {
                         self.last_error = Some(format!(
-                            "Local candidate #{} was rolled back by the active chain. This is a normal orphan/stale-block race; no reward was credited.",
+                            "Local candidate #{} was replaced by the active higher-work chain. This is a normal orphan/stale-block race; no reward was credited.",
                             card.height
                         ));
                         self.status_line = "Local candidate became stale; following the network-selected chain.".to_string();
@@ -3661,14 +3704,14 @@ del "%~f0"
                             self.block_history.push_front(card);
                             while self.block_history.len() > BLOCK_HISTORY_LIMIT { self.block_history.pop_back(); }
                             self.last_local_mined_at = Some(Instant::now());
-                            self.last_success = Some(format!("Your block #{height} was accepted locally and relayed. Waiting for active-chain confirmation. Reward candidate: {reward}."));
-                            self.status_line = "Your block was accepted locally and relayed. Waiting for confirmation...".to_string();
+                            self.last_success = Some(format!("Your block #{height} passed local consensus and durable storage. Network delivery is acknowledged or being retried automatically. Waiting for active-chain confirmation. Reward candidate: {reward}."));
+                            self.status_line = "Your block is valid locally; network delivery and confirmation are tracked separately...".to_string();
                             // mined.mp3 is intentionally played only when the solo block is confirmed on the active chain.
                         } else {
                             self.last_block_card = None;
                             self.last_local_mined_at = None;
-                            self.last_success = Some(format!("Pool block #{} was accepted locally and relayed. Rewards are split by confirmed pool shares; check Address Activity for your payout.", height));
-                            self.status_line = "Pool block accepted locally and relayed. Pool rewards stay pending-decision until active-chain confirmation.".to_string();
+                            self.last_success = Some(format!("Pool block #{} passed local consensus and durable storage. Network delivery is acknowledged or being retried automatically. Rewards are split only after active-chain confirmation; check Address Activity for your payout.", height));
+                            self.status_line = "Pool block is valid locally; network delivery is tracked separately. Pool rewards remain pending until active-chain confirmation.".to_string();
                             // HF106: no success sound at pool-candidate local acceptance. The pool/payout reward
                             // may still lose the peer race, so sounds are reserved for confirmed active-chain state.
                         }
@@ -7064,9 +7107,13 @@ impl QubCoreApp {
                     ui.small("Installer + auto-update ready build");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let running = self.miner.is_some();
-                    let status = if running { "MINING" } else { "IDLE" };
-                    ui.label(egui::RichText::new(status).size(16.0).strong());
+                    let (status, color) = self.mining_header_status();
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(16.0)
+                            .strong()
+                            .color(color),
+                    );
                     ui.add_space(12.0);
                     let button_text = update_button_caption(&self.update_dialog);
                     let update_response = if matches!(self.update_dialog.status, UpdateStatus::Ready) {
@@ -8853,8 +8900,26 @@ impl QubCoreApp {
         let p2p_value = if self.snapshot.p2p_enabled {
             format!("{} global live / {} direct / {} known / {}", self.snapshot.global_live_peers, self.snapshot.direct_reachable_peers, self.snapshot.known_peers, relay_label)
         } else { "disabled".to_string() };
+        let same_height_conflict = self.same_height_network_tip_conflict();
+        let known_tip = self.best_known_network_height();
+        let live_chain_heading = if same_height_conflict {
+            format!(
+                "Live chain data   |   {}   |   local #{} / network #{}",
+                self.snapshot.network, self.snapshot.height, self.snapshot.known_network_height
+            )
+        } else if known_tip > self.snapshot.height {
+            format!(
+                "Live chain data   |   {}   |   local #{} / network #{}",
+                self.snapshot.network, self.snapshot.height, known_tip
+            )
+        } else {
+            format!(
+                "Live chain data   |   {}   |   #{}",
+                self.snapshot.network, self.snapshot.height
+            )
+        };
 
-        egui::CollapsingHeader::new(format!("Live chain data   |   {}   |   #{}", self.snapshot.network, self.snapshot.height))
+        egui::CollapsingHeader::new(live_chain_heading)
             .id_salt("central_live_chain_data")
             .default_open(false)
             .show(ui, |ui| {
@@ -8874,8 +8939,8 @@ impl QubCoreApp {
                 ui.add_space(8.0);
                 egui::Grid::new("chain_grid").num_columns(2).spacing([28.0, 8.0]).show(ui, |ui| {
                     self.metric_info(ui, "network", "Network", &self.snapshot.network, "Current installed network channel. Mainnet and Testnet are separate apps.");
-                    self.metric_info(ui, "height", "Height", self.snapshot.height.to_string(), "Current local best block height after sync.");
-                    self.metric_info(ui, "best-block", "Best block", shorten_hash(&self.snapshot.best_hash), "Hash of the current local best block.");
+                    self.metric_info(ui, "height", "Local height", self.snapshot.height.to_string(), "Current locally validated best block height.");
+                    self.metric_info(ui, "best-block", "Local tip", shorten_hash(&self.snapshot.best_hash), "Hash of the current locally validated best block. A same-height network candidate is displayed separately until fork choice converges.");
                     self.metric_info(ui, "mempool-tx", "Mempool tx", self.snapshot.mempool_txs.to_string(), "Transactions known locally and waiting to be mined.");
                     self.metric_info(ui, "coinbase-maturity", "Coinbase maturity", format!("{} blocks", self.snapshot.coinbase_maturity), "Mining rewards become spendable after this many confirmations.");
                     self.metric_info(ui, "block-target", "Block target", format!("{} seconds", self.snapshot.target_spacing_secs), "The difficulty adjustment aims for this average block time.");
@@ -8950,7 +9015,23 @@ impl QubCoreApp {
             .show(ui, |ui| self.ui_peer_modes(ui));
         ui.add_space(10.0);
 
-        egui::CollapsingHeader::new(format!("Recent global blocks   |   latest #{}", self.snapshot.recent_blocks.first().map(|b| b.height).unwrap_or(0)))
+        let recent_blocks_heading = if same_height_conflict {
+            format!(
+                "Recent chain blocks   |   local #{} / network #{}",
+                self.snapshot.height, self.snapshot.known_network_height
+            )
+        } else if known_tip > self.snapshot.height {
+            format!(
+                "Recent chain blocks   |   local #{} / network #{}",
+                self.snapshot.height, known_tip
+            )
+        } else {
+            format!(
+                "Recent chain blocks   |   latest #{}",
+                self.snapshot.recent_blocks.first().map(|b| b.height).unwrap_or(0)
+            )
+        };
+        egui::CollapsingHeader::new(recent_blocks_heading)
             .id_salt("central_recent_global_blocks")
             .default_open(true)
             .show(ui, |ui| self.ui_recent_global_blocks(ui));
@@ -9190,26 +9271,50 @@ impl QubCoreApp {
 
 
     fn ui_recent_global_blocks(&mut self, ui: &mut egui::Ui) {
-        self.ui_icon_label(ui, "recent-global-blocks", "Recent global blocks");
+        self.ui_icon_label(ui, "recent-global-blocks", "Recent chain blocks");
         if self.snapshot_in_flight || HF105_CATCHUP_IN_FLIGHT.load(Ordering::SeqCst) {
-            self.ui_sync_progress_bar_rows(ui, "Refreshing recent global blocks", 2);
+            self.ui_sync_progress_bar_rows(ui, "Refreshing recent chain blocks", 2);
             ui.small("Recent blocks stay visible while QUB Core checks whether the official/network tip moved.");
         }
         if self.snapshot.recent_blocks.is_empty() {
-            ui.small("No global blocks loaded yet. Local disk state loads first; network catch-up runs detached.");
-        } else {
-            let known_tip = self.best_known_network_height()
-                .max(self.snapshot.known_network_height)
-                .max(self.snapshot.direct_network_height);
-            let local_latest = self.snapshot.recent_blocks.first().map(|b| b.height).unwrap_or(0);
-            if known_tip > local_latest {
-                ui.small(format!(
-                    "Network tip is #{}; local block list is still catching up from #{}. The first row below is the latest known network block and remains provisional until local validation catches up.",
-                    known_tip,
-                    local_latest
-                ));
-            }
-            egui::Grid::new("block_history_grid").num_columns(7).spacing([30.0, 6.0]).striped(true).show(ui, |ui| {
+            ui.small("No chain blocks loaded yet. Local disk state loads first; network catch-up runs detached.");
+            return;
+        }
+
+        let known_tip = self
+            .best_known_network_height()
+            .max(self.snapshot.known_network_height)
+            .max(self.snapshot.direct_network_height);
+        let local_latest = self
+            .snapshot
+            .recent_blocks
+            .first()
+            .map(|block| block.height)
+            .unwrap_or(0);
+        let same_height_conflict = self.same_height_network_tip_conflict();
+
+        if same_height_conflict {
+            ui.colored_label(
+                egui::Color32::from_rgb(236, 190, 78),
+                format!(
+                    "Equal-height competing tips at #{}: local {} / network {}. QUB Core displays both candidates separately while cumulative work or verified re-anchor resolves the branch.",
+                    self.snapshot.height,
+                    shorten_hash(&self.snapshot.best_hash),
+                    shorten_hash(&self.snapshot.known_network_hash),
+                ),
+            );
+        } else if known_tip > local_latest {
+            ui.small(format!(
+                "Network tip is #{}; the local validated block list is catching up from #{}. The network row below remains provisional until local consensus replay completes.",
+                known_tip, local_latest
+            ));
+        }
+
+        egui::Grid::new("block_history_grid")
+            .num_columns(7)
+            .spacing([30.0, 6.0])
+            .striped(true)
+            .show(ui, |ui| {
                 ui.label(egui::RichText::new("Block").weak());
                 ui.label(egui::RichText::new("Reward").weak());
                 ui.label(egui::RichText::new("Txs").weak());
@@ -9218,26 +9323,83 @@ impl QubCoreApp {
                 ui.label(egui::RichText::new("Hash").weak());
                 ui.label(egui::RichText::new("Explorer").weak());
                 ui.end_row();
-                if known_tip > local_latest {
-                    let latest_tip_help = "Latest known network block is provisional and has not been locally fetched/validated yet. Treat mined blocks as pending until 2+ confirmations; a competing tip can replace the newest row.";
-                    ui_recent_block_cell(ui, format!("pending #{}", known_tip), true, false, latest_tip_help);
-                    ui_recent_block_cell(ui, "pending local validation", true, false, latest_tip_help);
-                    ui_recent_block_cell(ui, "-", true, false, latest_tip_help);
-                    ui_recent_block_cell(ui, "catching up", true, false, latest_tip_help);
-                    ui_recent_block_cell(ui, "official/direct tip", true, false, latest_tip_help);
-                    let tip_hash = if self.snapshot.known_network_hash.trim().is_empty() { "-".to_string() } else { shorten_hash(&self.snapshot.known_network_hash) };
-                    ui_recent_block_cell(ui, tip_hash, true, true, latest_tip_help);
-                    if self.snapshot.known_network_hash.trim().is_empty() {
-                        self.ui_explorer_entity_button(ui, "block", &known_tip.to_string(), "Open known tip in QUB Explorer");
+
+                if known_tip > local_latest || same_height_conflict {
+                    let network_help = if same_height_conflict {
+                        "Independent network sources report a different block hash at the same height as the local validated tip. This is shown separately from local history; it is not inserted into local chain data until full validation/fork-choice succeeds."
                     } else {
-                        self.ui_explorer_entity_button(ui, "block", &self.snapshot.known_network_hash, "Open known tip in QUB Explorer");
+                        "Latest known network block is provisional and has not been locally fetched/validated yet. Treat mined blocks as pending until local consensus replay catches up."
+                    };
+                    let network_label = if same_height_conflict {
+                        format!("network #{}", known_tip)
+                    } else {
+                        format!("pending #{}", known_tip)
+                    };
+                    ui_recent_block_cell(ui, network_label, true, false, network_help);
+                    ui_recent_block_cell(
+                        ui,
+                        if same_height_conflict {
+                            "competing network candidate"
+                        } else {
+                            "pending local validation"
+                        },
+                        true,
+                        false,
+                        network_help,
+                    );
+                    ui_recent_block_cell(ui, "-", true, false, network_help);
+                    ui_recent_block_cell(
+                        ui,
+                        if same_height_conflict { "same height" } else { "catching up" },
+                        true,
+                        false,
+                        network_help,
+                    );
+                    ui_recent_block_cell(ui, "official/direct tip", true, false, network_help);
+                    let tip_hash = if self.snapshot.known_network_hash.trim().is_empty() {
+                        "-".to_string()
+                    } else {
+                        shorten_hash(&self.snapshot.known_network_hash)
+                    };
+                    ui_recent_block_cell(ui, tip_hash, true, true, network_help);
+                    if self.snapshot.known_network_hash.trim().is_empty() {
+                        self.ui_explorer_entity_button(
+                            ui,
+                            "block",
+                            &known_tip.to_string(),
+                            "Open known network height in QUB Explorer",
+                        );
+                    } else {
+                        self.ui_explorer_entity_button(
+                            ui,
+                            "block",
+                            &self.snapshot.known_network_hash,
+                            "Open known network candidate in QUB Explorer",
+                        );
                     }
                     ui.end_row();
+
                     if known_tip > local_latest.saturating_add(1) {
                         let missing = known_tip.saturating_sub(local_latest).saturating_sub(1);
-                        let gap_help = "QUB Core knows the official/direct tip is ahead and is fetching the missing intermediate blocks. Mining waits for the canonical chain view; this row is informational only.";
-                        ui_recent_block_cell(ui, format!("gap #{}..#{}", local_latest.saturating_add(1), known_tip.saturating_sub(1)), true, false, gap_help);
-                        ui_recent_block_cell(ui, format!("fetching {missing} block(s)"), true, false, gap_help);
+                        let gap_help = "QUB Core knows the network tip is ahead and is fetching the missing intermediate blocks. Mining waits for the higher-work chain view; this row is informational only.";
+                        ui_recent_block_cell(
+                            ui,
+                            format!(
+                                "gap #{}..#{}",
+                                local_latest.saturating_add(1),
+                                known_tip.saturating_sub(1)
+                            ),
+                            true,
+                            false,
+                            gap_help,
+                        );
+                        ui_recent_block_cell(
+                            ui,
+                            format!("fetching {missing} block(s)"),
+                            true,
+                            false,
+                            gap_help,
+                        );
                         ui_recent_block_cell(ui, "-", true, false, gap_help);
                         ui_recent_block_cell(ui, "syncing", true, false, gap_help);
                         ui_recent_block_cell(ui, "official/direct gap", true, false, gap_help);
@@ -9246,51 +9408,152 @@ impl QubCoreApp {
                         ui.end_row();
                     }
                 }
+
                 let mut previous_rendered_height: Option<u32> = None;
                 for (idx, card) in self.snapshot.recent_blocks.iter().enumerate() {
                     if let Some(prev_height) = previous_rendered_height {
                         if prev_height > card.height.saturating_add(1) {
                             let missing = prev_height.saturating_sub(card.height).saturating_sub(1);
-                            let gap_help = "There is a gap between visible block rows. QUB Core is fetching those intermediate blocks from the official/direct chain view before treating the list as complete.";
-                            ui_recent_block_cell(ui, format!("gap #{}..#{}", card.height.saturating_add(1), prev_height.saturating_sub(1)), true, false, gap_help);
-                            ui_recent_block_cell(ui, format!("fetching {missing} block(s)"), true, false, gap_help);
+                            let gap_help = "There is a gap between visible local block rows. QUB Core is fetching those intermediate blocks before treating the list as complete.";
+                            ui_recent_block_cell(
+                                ui,
+                                format!(
+                                    "gap #{}..#{}",
+                                    card.height.saturating_add(1),
+                                    prev_height.saturating_sub(1)
+                                ),
+                                true,
+                                false,
+                                gap_help,
+                            );
+                            ui_recent_block_cell(
+                                ui,
+                                format!("fetching {missing} block(s)"),
+                                true,
+                                false,
+                                gap_help,
+                            );
                             ui_recent_block_cell(ui, "-", true, false, gap_help);
                             ui_recent_block_cell(ui, "syncing", true, false, gap_help);
-                            ui_recent_block_cell(ui, "missing intermediate blocks", true, false, gap_help);
+                            ui_recent_block_cell(
+                                ui,
+                                "missing intermediate blocks",
+                                true,
+                                false,
+                                gap_help,
+                            );
                             ui_recent_block_cell(ui, "-", true, false, gap_help);
                             ui.label("-");
                             ui.end_row();
                         }
                     }
                     previous_rendered_height = Some(card.height);
+
                     let confirmations = if known_tip >= card.height {
                         known_tip.saturating_sub(card.height).saturating_add(1)
                     } else {
                         0
                     };
+                    let local_conflict_row = same_height_conflict
+                        && idx == 0
+                        && card.height == self.snapshot.height
+                        && card.hash == self.snapshot.best_hash;
                     let is_actual_latest_row = known_tip > 0 && card.height == known_tip;
                     let is_local_latest_without_network_tip = known_tip == 0 && idx == 0;
-                    let pending_finality = is_actual_latest_row || is_local_latest_without_network_tip;
-                    let finality_hover = if pending_finality {
+                    let pending_finality = local_conflict_row
+                        || is_actual_latest_row
+                        || is_local_latest_without_network_tip;
+                    let finality_hover = if local_conflict_row {
+                        format!(
+                            "Locally validated candidate at #{} ({}). A different network candidate ({}) is visible at the same height. Both are shown separately until fork choice converges.",
+                            card.height,
+                            shorten_hash(&card.hash),
+                            shorten_hash(&self.snapshot.known_network_hash),
+                        )
+                    } else if pending_finality {
                         if confirmations <= 1 {
                             "Latest known block: 1 confirmation. Treat it as pending until 2+ confirmations. If another valid block wins, this row can be replaced and a mined reward may disappear before finality.".to_string()
                         } else {
                             "Latest visible block. Confirmations are still being measured; QUB Core treats blocks as much safer at 2+ confirmations.".to_string()
                         }
                     } else {
-                        format!("{} confirmation(s). This block is past the latest-row pending-finality warning.", confirmations.max(1))
+                        format!(
+                            "{} confirmation(s). This block is past the latest-row pending-finality warning.",
+                            confirmations.max(1)
+                        )
                     };
-                    let block_label = if pending_finality { format!("pending #{}", card.height) } else { format!("#{}", card.height) };
+                    let block_label = if local_conflict_row {
+                        format!("local #{}", card.height)
+                    } else if pending_finality {
+                        format!("pending #{}", card.height)
+                    } else {
+                        format!("#{}", card.height)
+                    };
                     ui_recent_block_cell(ui, block_label, pending_finality, false, &finality_hover);
-                    ui_recent_block_cell(ui, card.reward.clone(), pending_finality, false, &finality_hover);
-                    ui_recent_block_cell(ui, card.txs.to_string(), pending_finality, false, &finality_hover);
-                    ui_recent_block_cell(ui, format_block_age(card), pending_finality, false, &finality_hover);
-                    ui_recent_block_miner_cell(ui, card, block_miner_label(card, &self.prefs.payout_address), pending_finality, &finality_hover);
-                    ui_recent_block_cell(ui, shorten_hash(&card.hash), pending_finality, true, &finality_hover);
-                    self.ui_explorer_entity_button(ui, "block", &card.hash, "Open block in QUB Explorer");
+                    ui_recent_block_cell(
+                        ui,
+                        card.reward.clone(),
+                        pending_finality,
+                        false,
+                        &finality_hover,
+                    );
+                    ui_recent_block_cell(
+                        ui,
+                        card.txs.to_string(),
+                        pending_finality,
+                        false,
+                        &finality_hover,
+                    );
+                    ui_recent_block_cell(
+                        ui,
+                        format_block_age(card),
+                        pending_finality,
+                        false,
+                        &finality_hover,
+                    );
+                    ui_recent_block_miner_cell(
+                        ui,
+                        card,
+                        block_miner_label(card, &self.prefs.payout_address),
+                        pending_finality,
+                        &finality_hover,
+                    );
+                    ui_recent_block_cell(
+                        ui,
+                        shorten_hash(&card.hash),
+                        pending_finality,
+                        true,
+                        &finality_hover,
+                    );
+                    self.ui_explorer_entity_button(
+                        ui,
+                        "block",
+                        &card.hash,
+                        "Open block in QUB Explorer",
+                    );
                     ui.end_row();
                 }
             });
+    }
+
+    fn status_history_category(status: &str) -> Option<&'static str> {
+        let lower = status.to_ascii_lowercase();
+        if lower.contains("catch-up pulse")
+            || lower.contains("heartbeat catch-up")
+            || lower.contains("startup/background chain refresh")
+            || lower.contains("catch-up writer active")
+            || lower.contains("snapshot is still completing")
+        {
+            Some("background-sync")
+        } else if lower.contains("mining is waiting")
+            || lower.contains("mining paused")
+            || lower.contains("awaiting explicit peer acknowledgement")
+            || lower.contains("competing tip")
+            || lower.contains("re-anchor")
+        {
+            Some("mining-wait")
+        } else {
+            None
         }
     }
 
@@ -9300,8 +9563,26 @@ impl QubCoreApp {
             return;
         }
         let elapsed = self.app_started.elapsed().as_secs();
-        self.status_history
-            .push_back(format!("[+{elapsed}s] {current}"));
+        let rendered = format!("[+{elapsed}s] {current}");
+
+        // HF126: background sync and waiting states update frequently. Keep one
+        // live history row per category instead of flooding the bottom panel with
+        // alternating heartbeat/pulse messages every few seconds.
+        if let Some(category) = Self::status_history_category(current) {
+            if let Some(existing) = self
+                .status_history
+                .iter_mut()
+                .rev()
+                .take(6)
+                .find(|line| Self::status_history_category(line) == Some(category))
+            {
+                *existing = rendered;
+                self.last_recorded_status = current.to_string();
+                return;
+            }
+        }
+
+        self.status_history.push_back(rendered);
         while self.status_history.len() > 12 {
             self.status_history.pop_front();
         }
@@ -10082,7 +10363,15 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
         .max_by(|a, b| a.0.cmp(&b.0));
 
     if let Some((official_h, official_hash)) = official_peer_tip.clone() {
-        if official_h > known_network_height && !official_hash.trim().is_empty() {
+        let official_hash = official_hash.trim().to_string();
+        if !official_hash.is_empty()
+            && (official_h > known_network_height
+                || (official_h == chain.height()
+                    && official_hash != chain.tip_hash().to_string()))
+        {
+            // HF126: preserve a same-height competing network hash instead of
+            // silently replacing it with the local tip. The GUI must show local
+            // and network candidates separately while fork choice converges.
             known_network_hash = official_hash.clone();
         }
         known_network_height = known_network_height.max(official_h);
@@ -10092,6 +10381,17 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
                 chain.height(),
                 official_h,
                 shorten_hash(&known_network_hash)
+            );
+        } else if official_h == chain.height()
+            && !official_hash.is_empty()
+            && official_hash != chain.tip_hash().to_string()
+            && stale_warning.trim().is_empty()
+        {
+            stale_warning = format!(
+                "Equal-height competing tips are visible at #{}: local {} / network {}. QUB Core keeps both views explicit while cumulative work or verified re-anchor resolves the branch.",
+                chain.height(),
+                shorten_hash(&chain.tip_hash().to_string()),
+                shorten_hash(&official_hash),
             );
         }
     }
@@ -11366,7 +11666,7 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    let _ = events.send(MinerEvent::Status(format!("Pool mining is waiting for the official green-light tip before hashing: {err:#}. Retrying...")));
+                    let _ = events.send(MinerEvent::Status(format!("Pool mining is waiting for canonical tip coordination before hashing: {err:#}. Retrying...")));
                     for _ in 0..20 {
                         if stop.load(Ordering::Relaxed) { break; }
                         thread::sleep(Duration::from_millis(100));
@@ -11597,20 +11897,26 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let reward_atoms = block.transactions.first().map(|tx| tx.outputs.iter().map(|out| out.value.atoms()).sum::<u64>()).unwrap_or(0);
             let txs = block.transactions.len();
             let relay_block = block.clone();
-            let hash = active.connect_block(block, &settings)?;
+            let hash = connect_block_persist_atomic(&settings, &mut active, block)?;
             let height = active.height();
-            save_chain(&settings, &active)?;
             if settings.p2p.enabled {
-                match p2p::broadcast_block(&settings, &relay_block) {
-                    Ok(sent) if sent > 0 => { let _ = events.send(MinerEvent::Status(format!("Pool block relayed to {sent} peer(s)."))); }
-                    Ok(_) => {}
-                    Err(err) => { let _ = events.send(MinerEvent::Status(format!("P2P relay warning: {err:#}"))); }
-                }
-            }
-            if settings.p2p.enabled {
-                if let Ok(report) = p2p::sync_until_converged(&settings, 2, 150) {
-                    if report.chains_adopted > 0 || report.blocks_connected > 0 {
-                        let _ = events.send(MinerEvent::Status(format!("Network selected tip #{}; pool block checked against canonical chain.", report.height)));
+                match p2p::broadcast_block_confirmed(&settings, &relay_block) {
+                    Ok(report) if report.delivered() => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Pool block delivery acknowledged: {}",
+                            report.summary()
+                        )));
+                    }
+                    Ok(report) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Pool block is valid and durable but awaits peer acknowledgement; automatic retry active: {}",
+                            report.summary()
+                        )));
+                    }
+                    Err(err) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Pool block delivery warning: {err:#}; automatic retry remains active"
+                        )));
                     }
                 }
             }
@@ -11650,7 +11956,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    let _ = events.send(MinerEvent::Status(format!("Mining is waiting for the official green-light tip before hashing: {err:#}. Retrying...")));
+                    let _ = events.send(MinerEvent::Status(format!("Mining is waiting for canonical tip coordination before hashing: {err:#}. Retrying...")));
                     for _ in 0..20 {
                         if stop.load(Ordering::Relaxed) { break; }
                         thread::sleep(Duration::from_millis(100));
@@ -11667,7 +11973,7 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    let _ = events.send(MinerEvent::Status(format!("Miner is refreshing the latest green-light candidate: {err:#}. Retrying...")));
+                    let _ = events.send(MinerEvent::Status(format!("Miner is refreshing the latest validated candidate: {err:#}. Retrying...")));
                     for _ in 0..30 {
                         if stop.load(Ordering::Relaxed) { break; }
                         thread::sleep(Duration::from_millis(100));
@@ -11838,18 +12144,26 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 .unwrap_or(0);
             let txs = block.transactions.len();
             let relay_block = block.clone();
-            let hash = chain.connect_block(block, &settings)?;
+            let hash = connect_block_persist_atomic(&settings, &mut chain, block)?;
             let height = chain.height();
-            save_chain(&settings, &chain)?;
             if settings.p2p.enabled {
-                match p2p::broadcast_block(&settings, &relay_block) {
-                    Ok(sent) if sent > 0 => { let _ = events.send(MinerEvent::Status(format!("Block relayed to {sent} peer(s)."))); }
-                    Ok(_) => {}
-                    Err(err) => { let _ = events.send(MinerEvent::Status(format!("P2P relay warning: {err:#}"))); }
-                }
-                if let Ok(report) = p2p::sync_until_converged(&settings, 2, 150) {
-                    if report.chains_adopted > 0 || report.blocks_connected > 0 {
-                        let _ = events.send(MinerEvent::Status(format!("Network selected tip #{}; local chain reconciled.", report.height)));
+                match p2p::broadcast_block_confirmed(&settings, &relay_block) {
+                    Ok(report) if report.delivered() => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Block delivery acknowledged: {}",
+                            report.summary()
+                        )));
+                    }
+                    Ok(report) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Block is valid and durable but awaits peer acknowledgement; automatic retry active: {}",
+                            report.summary()
+                        )));
+                    }
+                    Err(err) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Block delivery warning: {err:#}; automatic retry remains active"
+                        )));
                     }
                 }
             }

@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.8.1"
+version = "1.8.2"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.8.1 HF124 mining liveness, bounded pool-share templates and low-latency mempool infrastructure"
+description = "Qubit Coin v1.8.2 HF126 equal-height fork recovery, mineable PoW ties and clear local/network tip observability"
 readme = "README.md"
 
 [features]

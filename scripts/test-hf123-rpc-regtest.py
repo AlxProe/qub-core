@@ -69,7 +69,7 @@ def replace_toml_value(text: str, section: str, key: str, value: str) -> str:
     key_pattern = re.compile(rf"(?m)^\s*{re.escape(key)}\s*=.*$")
     replacement = f'{key} = {value}'
     if key_pattern.search(body):
-        body = key_pattern.sub(replacement, body, count=1)
+        body = key_pattern.sub(lambda _match: replacement, body, count=1)
     else:
         body = "\n" + replacement + body
     return text[: match.start(2)] + body + text[match.end(2) :]
@@ -180,7 +180,7 @@ def main() -> int:
         rpc_port = free_port()
 
         config = template.read_text(encoding="utf-8")
-        config = replace_toml_value(config, "node", "data_dir", json.dumps(str(data_dir)))
+        config = replace_toml_value(config, "node", "data_dir", json.dumps(str(data_dir).replace("\\", "/")))
         config = replace_toml_value(config, "p2p", "bind", json.dumps(f"127.0.0.1:{p2p_port}"))
         config = replace_toml_value(config, "p2p", "bootnodes", "[]")
         config = replace_toml_value(config, "rpc", "enabled", "true")
