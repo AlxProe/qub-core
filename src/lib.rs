@@ -6714,6 +6714,28 @@ pub struct PendingTxRecord {
     pub created_unix: u64,
     pub last_rebroadcast_unix: u64,
     pub confirmations_required: u32,
+    /// HF127/v1.8.3: durable, acknowledgement-based transaction delivery.
+    /// Defaults preserve compatibility with every HF117-HF126 outbox file.
+    #[serde(default)]
+    pub delivery_attempts: u64,
+    #[serde(default)]
+    pub last_delivery_attempt_unix: u64,
+    #[serde(default)]
+    pub next_delivery_retry_unix: u64,
+    #[serde(default)]
+    pub peer_ack_count: u64,
+    #[serde(default)]
+    pub official_seed_ack_count: u64,
+    #[serde(default)]
+    pub last_ack_status: String,
+    #[serde(default)]
+    pub last_ack_height: u32,
+    #[serde(default)]
+    pub last_ack_tip: String,
+    #[serde(default)]
+    pub last_rejection_reason: String,
+    #[serde(default)]
+    pub delivered_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6726,7 +6748,7 @@ pub struct PendingTxFile {
 impl PendingTxFile {
     pub fn new(network: &str) -> Self {
         Self {
-            version: 1,
+            version: 2,
             network: network.to_string(),
             txs: Vec::new(),
         }
@@ -6737,6 +6759,11 @@ impl PendingTxFile {
         }
         Ok(())
     }
+}
+
+fn pending_tx_file_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
 }
 
 pub fn load_pending_txs(settings: &Settings) -> Result<PendingTxFile> {
@@ -6768,33 +6795,67 @@ pub fn remember_pending_tx(
     tx: &Transaction,
     label: impl Into<String>,
 ) -> Result<()> {
+    let _pending_guard = pending_tx_file_lock()
+        .lock()
+        .expect("pending transaction mutex poisoned");
     // HF124/v1.8.1: pool shares are short-lived, zero-value work markers, not
     // wallet payments. Persisting them in the HF117 wallet outbox caused stale
     // shares to be recovered and rebroadcast long after their parent window.
     if is_pool_share_transaction(tx) {
         return Ok(());
     }
-    let mut pending =
-        load_pending_txs(settings).unwrap_or_else(|_| PendingTxFile::new(&settings.network.name));
+    // Fail closed on a corrupt or mismatched durable outbox. Silently
+    // replacing it with a new file would discard other pending payments.
+    let mut pending = load_pending_txs(settings)?;
     pending.ensure_network(settings)?;
     let txid = tx.txid();
-    pending.txs.retain(|rec| rec.txid != txid);
+    let label = label.into();
+    if let Some(record) = pending.txs.iter_mut().find(|record| record.txid == txid) {
+        // Idempotent resubmission must not erase acknowledgement history or
+        // exponential-backoff state. Refresh only the exact raw transaction and
+        // human-readable label, preserving the durable delivery record.
+        record.tx = tx.clone();
+        if !label.trim().is_empty() {
+            record.label = label;
+        }
+        pending.version = 2;
+        return save_pending_txs(settings, &pending);
+    }
+    // Remove only records that are already confirmed to their required depth.
+    // Never evict an older unconfirmed payment merely because the bounded
+    // outbox is full; losing its raw signed transaction would violate the HF127
+    // durability guarantee.
+    pending.txs.retain(|record| {
+        chain
+            .tx_confirmations(record.txid)
+            .map(|(_height, confirmations)| confirmations < record.confirmations_required.max(1))
+            .unwrap_or(true)
+    });
+    if pending.txs.len() >= HF117_PENDING_TX_MAX_RECORDS {
+        bail!(
+            "durable transaction outbox is full ({} records); wait for confirmations or inspect wallet-pending-txs.json before creating another transaction",
+            HF117_PENDING_TX_MAX_RECORDS
+        );
+    }
     pending.txs.push(PendingTxRecord {
         txid,
         tx: tx.clone(),
-        label: label.into(),
+        label,
         created_height: chain.height(),
         created_unix: unix_time_u32() as u64,
         last_rebroadcast_unix: 0,
         confirmations_required: HF117_PENDING_TX_CONFIRMATIONS,
+        delivery_attempts: 0,
+        last_delivery_attempt_unix: 0,
+        next_delivery_retry_unix: 0,
+        peer_ack_count: 0,
+        official_seed_ack_count: 0,
+        last_ack_status: String::new(),
+        last_ack_height: 0,
+        last_ack_tip: String::new(),
+        last_rejection_reason: String::new(),
+        delivered_unix: 0,
     });
-    if pending.txs.len() > HF117_PENDING_TX_MAX_RECORDS {
-        let excess = pending
-            .txs
-            .len()
-            .saturating_sub(HF117_PENDING_TX_MAX_RECORDS);
-        pending.txs.drain(0..excess);
-    }
     save_pending_txs(settings, &pending)
 }
 
@@ -6810,9 +6871,14 @@ pub fn reconcile_pending_txs(
     settings: &Settings,
     chain: &mut ChainState,
 ) -> Result<PendingTxReconcileReport> {
-    let mut pending =
-        load_pending_txs(settings).unwrap_or_else(|_| PendingTxFile::new(&settings.network.name));
+    let _pending_guard = pending_tx_file_lock()
+        .lock()
+        .expect("pending transaction mutex poisoned");
+    // The outbox is payment durability state. A parse/network mismatch must
+    // never be converted into an empty file and overwritten.
+    let mut pending = load_pending_txs(settings)?;
     pending.ensure_network(settings)?;
+    let original_serialized = serde_json::to_vec(&pending)?;
     let now = unix_time_u32() as u64;
     let mut report = PendingTxReconcileReport::default();
     let mut next = Vec::<PendingTxRecord>::new();
@@ -6862,11 +6928,14 @@ pub fn reconcile_pending_txs(
         }
     }
     pending = PendingTxFile {
-        version: 1,
+        version: 2,
         network: settings.network.name.clone(),
         txs: next,
     };
-    save_pending_txs(settings, &pending)?;
+    let changed = serde_json::to_vec(&pending)? != original_serialized;
+    if changed {
+        save_pending_txs(settings, &pending)?;
+    }
     Ok(report)
 }
 
@@ -6877,6 +6946,96 @@ pub fn pending_tx_raw(settings: &Settings, txid: Hash256) -> Result<Option<Trans
         .into_iter()
         .find(|rec| rec.txid == txid)
         .map(|rec| rec.tx))
+}
+
+
+/// HF127/v1.8.3 records an acknowledgement-based delivery attempt without
+/// coupling the wallet outbox format to the P2P report types.
+pub fn update_pending_tx_delivery(
+    settings: &Settings,
+    txid: Hash256,
+    attempts: usize,
+    peer_acknowledgements: usize,
+    official_seed_acknowledgements: usize,
+    status: &str,
+    height: u32,
+    tip_hash: &str,
+    rejection_reason: &str,
+    delivered: bool,
+    next_retry_unix: u64,
+) -> Result<bool> {
+    let _pending_guard = pending_tx_file_lock()
+        .lock()
+        .expect("pending transaction mutex poisoned");
+    let mut pending = load_pending_txs(settings)?;
+    let now = unix_time_u32() as u64;
+    let Some(record) = pending.txs.iter_mut().find(|record| record.txid == txid) else {
+        return Ok(false);
+    };
+    record.delivery_attempts = record.delivery_attempts.saturating_add(attempts as u64);
+    record.last_delivery_attempt_unix = now;
+    record.last_rebroadcast_unix = now;
+    record.next_delivery_retry_unix = next_retry_unix;
+    record.peer_ack_count = record
+        .peer_ack_count
+        .saturating_add(peer_acknowledgements as u64);
+    record.official_seed_ack_count = record
+        .official_seed_ack_count
+        .saturating_add(official_seed_acknowledgements as u64);
+    record.last_ack_status = status.to_string();
+    record.last_ack_height = height;
+    record.last_ack_tip = tip_hash.to_string();
+    record.last_rejection_reason = rejection_reason.to_string();
+    if delivered {
+        record.delivered_unix = now;
+    }
+    pending.version = 2;
+    save_pending_txs(settings, &pending)?;
+    Ok(true)
+}
+
+pub fn pending_tx_delivery_records(settings: &Settings) -> Result<Vec<PendingTxRecord>> {
+    Ok(load_pending_txs(settings)?.txs)
+}
+
+pub fn pending_tx_delivery_json(
+    settings: &Settings,
+    filter: Option<Hash256>,
+) -> Result<serde_json::Value> {
+    let pending = load_pending_txs(settings)?;
+    let rows = pending
+        .txs
+        .into_iter()
+        .filter(|record| filter.map(|txid| txid == record.txid).unwrap_or(true))
+        .map(|record| {
+            serde_json::json!({
+                "txid": record.txid.to_string(),
+                "label": record.label,
+                "created_height": record.created_height,
+                "created_unix": record.created_unix,
+                "confirmations_required": record.confirmations_required,
+                "delivery_attempts": record.delivery_attempts,
+                "last_delivery_attempt_unix": record.last_delivery_attempt_unix,
+                "next_delivery_retry_unix": record.next_delivery_retry_unix,
+                "peer_ack_count": record.peer_ack_count,
+                "official_seed_ack_count": record.official_seed_ack_count,
+                "last_ack_status": record.last_ack_status,
+                "last_ack_height": record.last_ack_height,
+                "last_ack_tip": record.last_ack_tip,
+                "last_rejection_reason": record.last_rejection_reason,
+                "delivered_unix": record.delivered_unix,
+                "network_delivered": record.delivered_unix > 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "ok": true,
+        "network": settings.network.name,
+        "hf127_reliable_transaction_delivery": true,
+        "delivery_rule": "one official ACK, or two distinct direct-peer ACKs, or one explicit ACK when no official destination is configured",
+        "count": rows.len(),
+        "transactions": rows,
+    }))
 }
 
 const JIN_SCRIPT_PREFIX: &[u8] = b"JIN1|";

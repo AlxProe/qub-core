@@ -1,131 +1,86 @@
-# QUB Core v1.8.2 HF126 — Equal-Height Fork Recovery
+# QUB Core v1.8.3 HF127 — Reliable Transactions & Low-Latency Mining
 
-HF126 / v1.8.2 is a mandatory, non-consensus liveness and observability release for equal-height competing tips. It includes the HF123 Fast Chain Engine, the HF124 mining-liveness engine and the HF125 acknowledged block-delivery protocol.
+HF127 / v1.8.3 is a mandatory, non-consensus reliability release built on the HF123 Fast Chain Engine, HF124 mining-liveness engine, HF125 acknowledged block delivery, and HF126 equal-height fork recovery.
 
-Protocol Epoch 2 remains unchanged:
+## Network identity
 
-- blocks below mainnet height **#24000** use block version **1**;
-- blocks at and above **#24000** require block version **2**;
-- DAA, block rewards, checkpoints, genesis, economics and QUB/JIN consensus rules are unchanged;
-- HF126 introduces no new activation height or block format.
+- No new activation height.
+- Protocol Epoch 2 remains active from mainnet block **#24000**.
+- Post-activation block version remains **2**.
+- P2P protocol number remains **2**.
+- Fast Chain Engine remains **QUB-FCE-1**.
+- Block, transaction, address, reward, DAA, checkpoint, pool, QUB and JIN consensus rules are unchanged.
 
-## Incident addressed
+## Reliable transaction delivery
 
-A locally mined block could be fully valid, durably committed and displayed as local `pending #N`, while independent network sources reported a different valid block at the same height. The previous mining green-light logic treated this normal proof-of-work tie as a permanent stop condition:
-
-```text
-local tip #N = A
-network tip #N = B
-same cumulative work
-→ mining paused indefinitely
-```
-
-That behavior prevented either branch from gaining the next unit of cumulative work. It also made the GUI show `MINING` while the real hashrate was zero, mixed local and network candidates into one “global” list and repeatedly replaced the bottom status history with alternating catch-up messages.
-
-HF126 restores normal cumulative-work liveness while retaining strict safeguards for a locally mined block that has never been acknowledged publicly.
-
-## HF126 fork-recovery model
-
-### Ordinary equal-height ties remain mineable
-
-A fully validated local branch and a different same-height network branch are an unresolved proof-of-work tie. HF126 does not treat the sibling hash alone as proof that the local parent is invalid.
-
-Mining may continue on the active validated local tip. The first branch to receive a valid next block becomes higher-work and wins through the existing chain-selection rules.
-
-Mining still stops immediately for:
+Ordinary wallet and protocol transactions now use explicit application-level delivery messages:
 
 ```text
-higher validated network height/work
-invalid local state
-wrong required block version
-changed canonical parent during a mining round
-explicit stop
+SubmitTx
+TxAck
 ```
 
-### Verified re-anchor for an unacknowledged local tip
-
-A local tip with an active `pending-block-relay.json` record receives stricter handling. QUB Core may replace an equal-work sibling only when all of the following hold:
+A transaction is considered delivered when QUB Core receives:
 
 ```text
-- mainnet;
-- local pending relay exactly matches the local tip;
-- independent official/direct observations agree on one exact competing hash;
-- the downloaded branch fully replays consensus and checkpoints;
-- height and cumulative work are equal;
-- the replacement uses the explicit verified Fast Chain Engine commit policy.
+one positive official-seed ACK
+or two positive ACKs from distinct direct peers
+or one explicit positive ACK in an isolated deployment with no official destination
 ```
 
-Ordinary Fast Chain Engine writes continue to reject equal-work, equal-height, different-tip overwrites.
+Successful socket writes are no longer presented as proof of peer acceptance. A positive ACK is returned only after the receiver has confirmed the transaction in canonical state or durably committed it to QUB-FCE-1. Raw transactions and delivery metadata remain durable in `wallet-pending-txs.json` until canonical confirmation depth is reached.
 
-### Winning-branch overlap delivery
+Seeds expose a bounded `tx-submit` reserve lane so transactions can still be accepted when normal inbound peer slots are full. Delivery retries run in an independent single-flight worker and do not depend on sender mining, GUI polling, Explorer availability, or manual relay.
 
-If a found block extends one side of an equal-height tie, a receiving seed may still be on the sibling tip. HF126 block delivery now handles that response on the same connection:
+## Transaction construction safety
 
-```text
-SubmitBlock
-→ stale_parent at the sibling height
-→ send bounded overlapping chain window
-→ receiver validates the common ancestor and higher-work suffix
-→ resubmit the exact found block
-→ accepted/already_known BlockAck
+Before signing, GUI and CLI transaction flows require validated current-chain evidence. Coin selection and signing do not proceed from a stale, incompatible or unacknowledged local branch.
+
+Operator commands:
+
+```bash
+qubd --config <config> tx-delivery-status [txid]
+qubd --config <config> relay-pending-txs
 ```
 
-This extends the HF125 ancestor-suffix repair to sibling-fork delivery.
+## Low-latency block and transaction propagation
 
-## GUI and operator improvements
+HF127 reduces the time advantage of a miner that has just found a block:
 
-HF126 makes the local and observed network state explicit:
+- latency-sensitive P2P sockets use `TCP_NODELAY`;
+- official/configured bootnodes are attempted before historical peerbook entries;
+- outbound dialing is detached, bounded and protected by per-peer exponential backoff;
+- ephemeral `block-submit` and `tx-submit` source ports are not persisted into the peerbook;
+- seeds begin outward diffusion after durable acceptance and before returning the producer ACK;
+- live block/transaction relay reuses the registered in-memory canonical state when available;
+- block/transaction delivery can complete without making official seeds a permanent liveness dependency.
 
-- the top mining indicator reports `MINING` only when measured hashrate is non-zero;
-- paused workers display `WAITING`, and startup/template work displays `PREPARING`;
-- Live Chain shows separate local and network heights/tips;
-- same-height local and network candidates appear as separate rows;
-- `Recent global blocks` is renamed to `Recent chain blocks`;
-- a local pending candidate is not presented as a confirmed global block;
-- repetitive background-sync and mining-wait messages are coalesced in the status history;
-- local stale candidates are described as replaced by the active higher-work chain.
+## Full-power mining controls
+
+QUB Core exposes the complete **1–100% CPU** and **0–100% GPU** ranges. CPU and GPU percentages are available through both sliders and exact numeric inputs.
+
+At **85% or above**, or when a manual worker/work-item override is used, QUB Core displays a red hardware-risk warning and requires a session-only mandatory confirmation before solo or pool mining can start.
+
+At 100% CPU power, QUB Core uses all logical processors with continuous duty. Explicit CPU worker and GPU work-item overrides remain available for advanced operators and are not constrained by a QUB-specific software ceiling; operating-system and device-driver limits still apply. If any requested CPU worker cannot be created, the round fails closed instead of silently running a partial nonce-lane plan. If no CPU/GPU worker starts, the GUI does not claim that mining is active.
+
+The reference RPC miner no longer imposes the previous 128-worker QUB limit and assigns disjoint nonce lanes to workers.
 
 ## Retained reliability layers
 
-HF126 keeps all previous fixes:
+HF127 retains:
 
-- HF123 QUB-FCE-1 Fast Chain Engine;
-- HF124 valid share-capped templates, stable mining rounds and bounded share processing;
-- HF125 `SubmitBlock` / `BlockAck`, durable pending delivery, seed reserve lane, atomic persistence and automatic retry;
-- authenticated RPC and `qub-rpc-miner`;
-- optimized read-only Explorer API and snapshot publisher.
+- HF123 append-only Fast Chain Engine and single canonical in-memory owner;
+- HF124 consensus-valid pool-share templates, stable mining rounds, batched persistence and fair relay;
+- HF125 explicit `SubmitBlock` / `BlockAck`, durable pending block retry and reserve submission lane;
+- HF126 mineable equal-height PoW ties, verified re-anchor path and sibling-branch overlap delivery;
+- Explorer API mempool optimization and the v0.7.1 same-origin Explorer stack.
 
-## Mandatory build and validation gates
+## Release documentation
 
-```bash
-cargo test --locked
-cargo build --locked --release --bin qubd
-cargo build --locked --release --bin qub-core
-cargo build --locked --release --bin qub-rpc-miner
-cargo test --locked hf124_ -- --nocapture
-cargo test --locked hf125_ -- --nocapture
-cargo test --locked hf126_ -- --nocapture
-```
+- `RELEASE_NOTES-v1.8.3-HF127.md`
+- `HF127-v183-RELIABILITY-REVIEW.md`
+- `HF127-v183-DEPLOY-RUNBOOK.md`
+- `README-FAST-CHAIN-ENGINE.md`
+- `README-RPC-MINER.md`
 
-End-to-end gates:
-
-```bash
-python3 scripts/test-hf123-fast-chain-regtest.py --qubd target/release/qubd
-python3 scripts/test-hf123-rpc-regtest.py --qubd target/release/qubd --miner target/release/qub-rpc-miner
-python3 scripts/test-hf125-block-relay-regtest.py --qubd target/release/qubd
-python3 scripts/test-hf126-equal-height-fork-regtest.py --qubd target/release/qubd
-```
-
-Windows PowerShell equivalents are included in `HF126-v182-DEPLOY-RUNBOOK.md`.
-
-## Documentation
-
-- `README-FAST-CHAIN-ENGINE.md` — Fast Chain Engine storage and recovery model.
-- `README-RPC-MINER.md` — headless RPC and reference miner.
-- `HF126-v182-RELIABILITY-REVIEW.md` — fork-choice, persistence and delivery review.
-- `HF126-v182-DEPLOY-RUNBOOK.md` — complete local, seed, Windows, repository and public rollout procedure.
-- `RELEASE_NOTES-v1.8.2-HF126.md` — release notes.
-
-## No-assets package
-
-Runtime images, audio and fonts are intentionally excluded. Copy the known-good `assets` directory from the deployed QUB Core tree before building the Windows distribution.
+Runtime image/audio/font assets are intentionally omitted from source-only packages. Copy known-good assets into `assets/` before building the Windows GUI distribution.

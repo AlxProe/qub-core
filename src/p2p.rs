@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.8.2/"; // HF126 equal-height fork recovery and mining liveness
+const USER_AGENT: &str = "/QUB Core:1.8.3/"; // HF127 reliable transaction delivery and unrestricted mining controls
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -73,6 +73,24 @@ const HF125_PRIORITY_INBOUND_RESERVE: usize = 16;
 const HF125_PRIORITY_MAX_MESSAGES: usize = 96;
 const HF125_PRIORITY_MAX_SUBMISSIONS: usize = 2;
 const HF125_PENDING_BLOCK_RELAY_VERSION: u32 = 1;
+// HF127/v1.8.3: transaction delivery receives the same explicit,
+// acknowledgement-based treatment as HF125 block delivery. These values are
+// transport policy only; they do not change transaction or block consensus.
+const HF127_TX_ACK_TIMEOUT_SECS: u64 = 20;
+const HF127_TX_RELAY_TOTAL_SECS: u64 = 30;
+const HF127_TX_RELAY_MAX_PEERS: usize = 16;
+const HF127_TX_RETRY_IDLE_SECS: u64 = 300;
+const HF127_TX_RETRY_MAX_PER_PASS: usize = 8;
+const HF127_PRIORITY_MAX_TX_SUBMISSIONS: usize = 2;
+const HF127_PRIORITY_HANDSHAKE_SECS: u64 = 3;
+const HF127_PRIORITY_SESSION_SECS: u64 = 30;
+const HF127_NORMAL_TX_SUBMIT_WINDOW_SECS: u64 = 10;
+const HF127_NORMAL_TX_SUBMITS_PER_WINDOW: usize = 16;
+const HF127_PEERBOOK_MAX: usize = 512;
+const HF127_OUTBOUND_DIALS_PER_TICK: usize = 4;
+const HF127_KNOWN_PEER_REFRESH_SECS: u64 = 15;
+const HF127_PEER_OBSERVATION_WRITE_SECS: u64 = 30;
+const HF127_STATUS_LOG_SECS: u64 = 15;
 
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -123,24 +141,42 @@ impl BlockRelayReport {
         self.accepted.saturating_add(self.already_known)
     }
 
+    fn distinct_positive_ack_peers(&self, official: Option<bool>) -> usize {
+        self.peer_results
+            .iter()
+            .filter(|result| {
+                official.map(|expected| result.official == expected).unwrap_or(true)
+                    && result.transport == "ack"
+                    && matches!(result.status.as_str(), "accepted" | "already_known")
+            })
+            .map(|result| normalize_peer_addr(&result.peer))
+            .filter(|peer| !peer.is_empty())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     pub fn delivered(&self) -> bool {
-        // Public networks always try the configured official seeds first. Do
-        // not clear the durable relay merely because an arbitrary peer accepted
-        // the block while every official delivery attempt timed out. Regtest and
-        // isolated deployments have no official attempts, so any explicit ACK is
-        // sufficient there.
-        if self.official_attempts > 0 {
-            self.official_acknowledgements > 0
-        } else {
-            self.acknowledged() > 0
+        // HF127/v1.8.3: official seeds remain the preferred low-latency proof,
+        // but they are not a liveness single point of failure. Delivery is
+        // proven by one positive official ACK, by a quorum of two distinct
+        // non-official ACK peers, or by one explicit ACK in isolated/regtest
+        // deployments where no official destination was attempted.
+        if self.official_acknowledgements > 0 {
+            return true;
         }
+        let direct = self.distinct_positive_ack_peers(Some(false));
+        if direct >= 2 {
+            return true;
+        }
+        self.official_attempts == 0 && self.distinct_positive_ack_peers(None) >= 1
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "acknowledged={} official_acknowledged={} accepted={} already_known={} stale_parent={} rejected={} legacy_sent={} timed_out={} attempts={} official_attempts={}",
+            "acknowledged={} official_acknowledged={} direct_ack_peers={} accepted={} already_known={} stale_parent={} rejected={} legacy_sent={} timed_out={} attempts={} official_attempts={}",
             self.acknowledged(),
             self.official_acknowledgements,
+            self.distinct_positive_ack_peers(Some(false)),
             self.accepted,
             self.already_known,
             self.stale_parent,
@@ -151,6 +187,102 @@ impl BlockRelayReport {
             self.official_attempts,
         )
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TxRelayPeerResult {
+    pub peer: String,
+    pub official: bool,
+    pub transport: String,
+    pub status: String,
+    pub height: u32,
+    pub tip_hash: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TxRelayReport {
+    pub txid: String,
+    pub attempts: usize,
+    pub official_attempts: usize,
+    pub connected: usize,
+    pub acknowledgements: usize,
+    pub official_acknowledgements: usize,
+    pub accepted: usize,
+    pub already_known: usize,
+    pub already_confirmed: usize,
+    pub rejected: usize,
+    pub legacy_sent: usize,
+    pub timed_out: usize,
+    pub pending_retry: bool,
+    pub peer_results: Vec<TxRelayPeerResult>,
+}
+
+impl TxRelayReport {
+    pub fn acknowledged(&self) -> usize {
+        self.accepted
+            .saturating_add(self.already_known)
+            .saturating_add(self.already_confirmed)
+    }
+
+    fn distinct_positive_ack_peers(&self, official: Option<bool>) -> usize {
+        self.peer_results
+            .iter()
+            .filter(|result| {
+                official.map(|expected| result.official == expected).unwrap_or(true)
+                    && result.transport == "ack"
+                    && matches!(
+                        result.status.as_str(),
+                        "accepted" | "already_known" | "already_confirmed"
+                    )
+            })
+            .map(|result| normalize_peer_addr(&result.peer))
+            .filter(|peer| !peer.is_empty())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    pub fn delivered(&self) -> bool {
+        // HF127/v1.8.3: prefer official acknowledgement without requiring a
+        // seed to be online forever. Two distinct direct peers are a durable
+        // network-escape quorum. In isolated/regtest deployments with no
+        // official attempts, one explicit positive ACK is sufficient.
+        if self.official_acknowledgements > 0 {
+            return true;
+        }
+        let direct = self.distinct_positive_ack_peers(Some(false));
+        if direct >= 2 {
+            return true;
+        }
+        self.official_attempts == 0 && self.distinct_positive_ack_peers(None) >= 1
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "acknowledged={} official_acknowledged={} direct_ack_peers={} accepted={} already_known={} already_confirmed={} rejected={} legacy_sent={} timed_out={} attempts={} official_attempts={}",
+            self.acknowledged(),
+            self.official_acknowledgements,
+            self.distinct_positive_ack_peers(Some(false)),
+            self.accepted,
+            self.already_known,
+            self.already_confirmed,
+            self.rejected,
+            self.legacy_sent,
+            self.timed_out,
+            self.attempts,
+            self.official_attempts,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TxAcceptance {
+    status: String,
+    txid: String,
+    height: u32,
+    tip_hash: String,
+    reason: String,
+    changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +337,11 @@ impl Drop for Hf125BlockRetryGuard {
 }
 
 fn hf125_block_relay_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn hf127_tx_acceptance_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -582,6 +719,18 @@ enum WireMessage {
     Tx {
         tx: Transaction,
     },
+    SubmitTx {
+        request_id: u64,
+        tx: Transaction,
+    },
+    TxAck {
+        request_id: u64,
+        txid: String,
+        status: String,
+        height: u32,
+        tip_hash: String,
+        reason: String,
+    },
     GetMempool,
     Mempool {
         txs: Vec<Transaction>,
@@ -608,6 +757,162 @@ enum WireMessage {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PeerBook {
     peers: Vec<String>,
+}
+
+#[derive(Debug)]
+struct Hf127OutboundDialEntry {
+    in_flight: bool,
+    failures: u32,
+    next_attempt: Instant,
+}
+
+fn hf127_outbound_backoff(failures: u32) -> Duration {
+    let exponent = failures.min(5);
+    Duration::from_secs(2u64.saturating_pow(exponent).min(60))
+}
+
+/// Start a best-effort detached propagation task without allowing an operating-
+/// system thread-allocation failure to panic the active peer/session worker.
+/// Durable acceptance/ACK semantics never depend on this helper succeeding;
+/// persistent peer heartbeats and retry workers remain the fallback.
+fn hf127_spawn_detached<F>(name: &str, task: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(err) = thread::Builder::new().name(name.to_string()).spawn(task) {
+        eprintln!("{name} worker allocation failed: {err}");
+    }
+}
+
+fn start_hf127_pending_tx_delivery_worker(
+    settings: Settings,
+    chain: Arc<Mutex<ChainState>>,
+    mempool_dirty: Arc<AtomicBool>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("qub-tx-delivery".to_string())
+        .spawn(move || {
+            let mut last_reconcile = Instant::now() - Duration::from_secs(30);
+            let mut last_outbox_error_log = Instant::now() - Duration::from_secs(60);
+            loop {
+                // Reconcile on a copy so wallet-file I/O and contextual
+                // transaction checks never hold the canonical chain mutex. If
+                // transactions are reaccepted, save_chain performs the same-tip
+                // mempool merge/publish after the lock has been released.
+                if last_reconcile.elapsed() >= Duration::from_secs(15) {
+                    last_reconcile = Instant::now();
+                    let snapshot = chain.lock().ok().map(|local| local.clone());
+                    if let Some(mut local) = snapshot {
+                        match reconcile_pending_txs(&settings, &mut local) {
+                            Ok(report) if report.reaccepted > 0 => {
+                                match save_chain(&settings, &local) {
+                                    Ok(()) => mempool_dirty.store(true, Ordering::Release),
+                                    Err(err) => eprintln!(
+                                        "HF127 pending transaction reconciliation persistence failed: {err:#}"
+                                    ),
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                if last_outbox_error_log.elapsed() >= Duration::from_secs(30) {
+                                    last_outbox_error_log = Instant::now();
+                                    eprintln!(
+                                        "HF127 durable transaction outbox reconciliation failed closed: {err:#}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let now = hf125_now_secs();
+                let records = match pending_tx_delivery_records(&settings) {
+                    Ok(records) => records,
+                    Err(err) => {
+                        if last_outbox_error_log.elapsed() >= Duration::from_secs(30) {
+                            last_outbox_error_log = Instant::now();
+                            eprintln!(
+                                "HF127 durable transaction outbox read failed closed: {err:#}"
+                            );
+                        }
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                for record in records
+                    .into_iter()
+                    .filter(|record| {
+                        !is_pool_share_transaction(&record.tx)
+                            && record.next_delivery_retry_unix <= now
+                    })
+                    .take(HF127_TX_RETRY_MAX_PER_PASS)
+                {
+                    let report = broadcast_tx_confirmed_internal(
+                        &settings,
+                        &record.tx,
+                        None,
+                        HF127_TX_RELAY_MAX_PEERS,
+                        850,
+                        true,
+                    );
+                    match report {
+                        Ok(report) => {
+                            if report.delivered() {
+                                eprintln!(
+                                    "HF127 transaction delivery acknowledged {}: {}",
+                                    record.txid,
+                                    report.summary()
+                                );
+                            } else if report.pending_retry {
+                                eprintln!(
+                                    "HF127 transaction delivery pending {}: {}",
+                                    record.txid,
+                                    report.summary()
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            let fallback = TxRelayReport {
+                                txid: record.txid.to_string(),
+                                attempts: 1,
+                                pending_retry: true,
+                                ..TxRelayReport::default()
+                            };
+                            let retry_at = hf125_now_secs().saturating_add(
+                                hf127_tx_retry_delay_secs(record.delivery_attempts, &fallback),
+                            );
+                            if let Err(update_err) = update_pending_tx_delivery(
+                                &settings,
+                                record.txid,
+                                1,
+                                0,
+                                0,
+                                "delivery_error",
+                                0,
+                                "",
+                                &err.to_string(),
+                                false,
+                                retry_at,
+                            ) {
+                                eprintln!(
+                                    "HF127 transaction delivery error {}: {err:#}; additionally failed to persist retry state: {update_err:#}",
+                                    record.txid
+                                );
+                            } else {
+                                eprintln!(
+                                    "HF127 transaction delivery error {}: {err:#}; retry scheduled",
+                                    record.txid
+                                );
+                            }
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+        })
+        .context("failed to start the durable transaction-delivery worker")?;
+    Ok(())
 }
 
 pub fn run_node(settings: Settings) -> Result<()> {
@@ -677,6 +982,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
         }
     };
     let inbound_count = Arc::new(AtomicUsize::new(0));
+    let outbound_count = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     if lan_discovery_enabled(&settings) {
@@ -690,7 +996,9 @@ pub fn run_node(settings: Settings) -> Result<()> {
         let accept_active = active.clone();
         let accept_inbound = inbound_count.clone();
         let accept_mempool_dirty = mempool_dirty.clone();
-        thread::spawn(move || loop {
+        thread::Builder::new()
+            .name("qub-p2p-accept".to_string())
+            .spawn(move || loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     // HF125/v1.8.2 reserves a small short-lived inbound lane
@@ -711,8 +1019,9 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     let a = accept_active.clone();
                     let inbound = accept_inbound.clone();
                     let dirty = accept_mempool_dirty.clone();
-                    thread::spawn(move || {
-                        let peer = addr.to_string();
+                    let peer = addr.to_string();
+                    let thread_name = format!("qub-p2p-in-{}", addr.ip());
+                    if let Err(err) = thread::Builder::new().name(thread_name).spawn(move || {
                         if let Err(err) = handle_peer(
                             stream,
                             peer.clone(),
@@ -729,7 +1038,10 @@ pub fn run_node(settings: Settings) -> Result<()> {
                             }
                         }
                         inbound.fetch_sub(1, Ordering::Relaxed);
-                    });
+                    }) {
+                        accept_inbound.fetch_sub(1, Ordering::Relaxed);
+                        eprintln!("p2p inbound worker allocation failed for {addr}: {err}");
+                    }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(100))
@@ -739,7 +1051,8 @@ pub fn run_node(settings: Settings) -> Result<()> {
                     thread::sleep(Duration::from_secs(1));
                 }
             }
-        });
+        })
+        .context("failed to start the P2P inbound accept worker")?;
         println!("QUB P2P node listening on {}", settings.p2p.bind);
     } else {
         println!(
@@ -763,36 +1076,93 @@ pub fn run_node(settings: Settings) -> Result<()> {
     let mut last_mempool_persist = Instant::now();
     let mut last_light_catchup = Instant::now() - Duration::from_secs(60);
     let mut last_block_relay_retry = Instant::now() - Duration::from_secs(30);
+    let dial_state = Arc::new(Mutex::new(HashMap::<String, Hf127OutboundDialEntry>::new()));
+    let mut known_peer_cache = known_peers(&settings).unwrap_or_default();
+    let mut last_known_peer_refresh = Instant::now();
+    let mut last_status_log = Instant::now() - Duration::from_secs(HF127_STATUS_LOG_SECS);
+    start_hf127_pending_tx_delivery_worker(
+        settings.clone(),
+        chain.clone(),
+        mempool_dirty.clone(),
+    )?;
 
     loop {
-        let known = {
-            let p = peers.lock().expect("peer mutex poisoned");
-            p.iter().cloned().collect::<Vec<_>>()
-        };
-        let mut spawned = 0usize;
+        // HF127/v1.8.3: peer dialing is detached and bounded. Failed/stale
+        // peerbook rows can no longer block mempool merge, transaction retry,
+        // block retry or tip heartbeat for N x connect-timeout seconds.
+        if last_known_peer_refresh.elapsed() >= Duration::from_secs(HF127_KNOWN_PEER_REFRESH_SECS)
+            || known_peer_cache.is_empty()
+        {
+            last_known_peer_refresh = Instant::now();
+            known_peer_cache = known_peers(&settings).unwrap_or_else(|_| {
+                peers
+                    .lock()
+                    .map(|p| p.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            });
+        }
+        let known = known_peer_cache.clone();
+        // Inbound sessions must not consume the outbound budget. A busy seed
+        // can have hundreds of inbound peers while still requiring persistent
+        // outbound connections to the other official seeds.
+        let current_outbound = outbound_count.load(Ordering::Acquire);
+        let available = settings
+            .p2p
+            .max_outbound_peers
+            .saturating_sub(current_outbound)
+            .min(HF127_OUTBOUND_DIALS_PER_TICK);
+        let mut scheduled = 0usize;
         for addr in known {
-            if spawned >= settings.p2p.max_outbound_peers {
+            if scheduled >= available {
                 break;
             }
             if should_skip_outbound(&settings, &addr) {
                 continue;
             }
-            let already_active = {
-                let a = active.lock().expect("active peer mutex poisoned");
-                a.contains(&addr)
-            };
+            let already_active = active
+                .lock()
+                .map(|active| active.contains(&addr))
+                .unwrap_or(false);
             if already_active {
                 continue;
             }
-            match connect_peer(&addr, Duration::from_secs(3)) {
-                Ok(stream) => {
-                    spawned += 1;
-                    let s = settings.clone();
-                    let c = chain.clone();
-                    let p = peers.clone();
-                    let a = active.clone();
-                    let dirty = mempool_dirty.clone();
-                    thread::spawn(move || {
+            let due = {
+                let mut state = dial_state.lock().expect("dial state mutex poisoned");
+                let entry = state.entry(addr.clone()).or_insert_with(|| Hf127OutboundDialEntry {
+                    in_flight: false,
+                    failures: 0,
+                    next_attempt: Instant::now(),
+                });
+                if entry.in_flight || Instant::now() < entry.next_attempt {
+                    false
+                } else {
+                    entry.in_flight = true;
+                    true
+                }
+            };
+            if !due {
+                continue;
+            }
+            scheduled = scheduled.saturating_add(1);
+            let s = settings.clone();
+            let c = chain.clone();
+            let p = peers.clone();
+            let a = active.clone();
+            let dirty = mempool_dirty.clone();
+            let dial = dial_state.clone();
+            let outbound = outbound_count.clone();
+            outbound.fetch_add(1, Ordering::AcqRel);
+            let dial_addr = addr.clone();
+            let dial_for_failure = dial_state.clone();
+            let outbound_for_failure = outbound_count.clone();
+            let spawn_result = thread::Builder::new()
+                .name("qub-p2p-outbound".to_string())
+                .spawn(move || {
+                let started = Instant::now();
+                let mut connected = false;
+                match connect_peer(&addr, Duration::from_millis(900)) {
+                    Ok(stream) => {
+                        connected = true;
                         if let Err(err) = handle_peer(
                             stream,
                             addr.clone(),
@@ -808,9 +1178,35 @@ pub fn run_node(settings: Settings) -> Result<()> {
                                 eprintln!("p2p outbound {addr} ended: {err:#}");
                             }
                         }
-                    });
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
+                if let Ok(mut state) = dial.lock() {
+                    if let Some(entry) = state.get_mut(&addr) {
+                        entry.in_flight = false;
+                        if connected && started.elapsed() >= Duration::from_secs(5) {
+                            entry.failures = 0;
+                            entry.next_attempt = Instant::now() + Duration::from_secs(2);
+                        } else {
+                            entry.failures = entry.failures.saturating_add(1);
+                            entry.next_attempt =
+                                Instant::now() + hf127_outbound_backoff(entry.failures);
+                        }
+                    }
+                }
+                outbound.fetch_sub(1, Ordering::AcqRel);
+            });
+            if let Err(err) = spawn_result {
+                outbound_for_failure.fetch_sub(1, Ordering::AcqRel);
+                if let Ok(mut state) = dial_for_failure.lock() {
+                    if let Some(entry) = state.get_mut(&dial_addr) {
+                        entry.in_flight = false;
+                        entry.failures = entry.failures.saturating_add(1);
+                        entry.next_attempt =
+                            Instant::now() + hf127_outbound_backoff(entry.failures);
+                    }
+                }
+                eprintln!("p2p outbound worker allocation failed for {dial_addr}: {err}");
             }
         }
 
@@ -868,12 +1264,7 @@ pub fn run_node(settings: Settings) -> Result<()> {
 
         let mempool_for_periodic = if last_mempool_relay.elapsed() >= Duration::from_secs(6) {
             last_mempool_relay = Instant::now();
-            let mut local = chain.lock().expect("chain mutex poisoned");
-            if let Ok(report) = reconcile_pending_txs(&settings, &mut local) {
-                if report.reaccepted > 0 {
-                    mempool_dirty.store(true, Ordering::Relaxed);
-                }
-            }
+            let local = chain.lock().expect("chain mutex poisoned");
             hf124_fair_mempool_relay_batch(&settings, &local.mempool, 96)
         } else {
             Vec::new()
@@ -943,24 +1334,30 @@ pub fn run_node(settings: Settings) -> Result<()> {
             if !HF125_BLOCK_RETRY_RUNNING.swap(true, Ordering::AcqRel) {
                 let relay_settings = settings.clone();
                 let relay_chain = chain.clone();
-                thread::spawn(move || {
-                    let _reset = Hf125BlockRetryGuard;
-                    if let Ok(Some(report)) =
-                        retry_pending_block_relay(&relay_settings, &relay_chain)
-                    {
-                        if report.delivered() {
-                            eprintln!(
-                                "HF125 pending block delivery acknowledged: {}",
-                                report.summary()
-                            );
-                        } else if report.pending_retry {
-                            eprintln!(
-                                "HF125 pending block delivery retry: {}",
-                                report.summary()
-                            );
+                if let Err(err) = thread::Builder::new()
+                    .name("qub-block-retry".to_string())
+                    .spawn(move || {
+                        let _reset = Hf125BlockRetryGuard;
+                        if let Ok(Some(report)) =
+                            retry_pending_block_relay(&relay_settings, &relay_chain)
+                        {
+                            if report.delivered() {
+                                eprintln!(
+                                    "HF125 pending block delivery acknowledged: {}",
+                                    report.summary()
+                                );
+                            } else if report.pending_retry {
+                                eprintln!(
+                                    "HF125 pending block delivery retry: {}",
+                                    report.summary()
+                                );
+                            }
                         }
-                    }
-                });
+                    })
+                {
+                    HF125_BLOCK_RETRY_RUNNING.store(false, Ordering::Release);
+                    eprintln!("pending block retry worker allocation failed: {err}");
+                }
             }
         }
 
@@ -971,23 +1368,35 @@ pub fn run_node(settings: Settings) -> Result<()> {
             last_light_catchup = Instant::now();
             if !HF125_AUTO_CATCHUP_RUNNING.swap(true, Ordering::AcqRel) {
                 let catchup_settings = settings.clone();
-                thread::spawn(move || {
-                    let _reset = Hf125AutoCatchupGuard;
-                    let _ = hf90_auto_catchup(&catchup_settings, 120_000);
-                });
+                if let Err(err) = thread::Builder::new()
+                    .name("qub-auto-catchup".to_string())
+                    .spawn(move || {
+                        let _reset = Hf125AutoCatchupGuard;
+                        let _ = hf90_auto_catchup(&catchup_settings, 120_000);
+                    })
+                {
+                    HF125_AUTO_CATCHUP_RUNNING.store(false, Ordering::Release);
+                    eprintln!("auto-catchup worker allocation failed: {err}");
+                }
             }
         }
 
-        let local = chain.lock().expect("chain mutex poisoned");
-        println!(
-            "p2p status height={} tip={} mempool={} peers={} active={}",
-            local.height(),
-            local.tip_hash(),
-            local.mempool.len(),
-            peers.lock().expect("peer mutex poisoned").len(),
-            active.lock().expect("active peer mutex poisoned").len()
-        );
-        drop(local);
+        if last_status_log.elapsed() >= Duration::from_secs(HF127_STATUS_LOG_SECS) {
+            last_status_log = Instant::now();
+            // Snapshot each mutex independently. Diagnostic logging must never
+            // introduce a chain -> peer -> active lock ordering that can oppose
+            // connection workers and stall the coordinator.
+            let (height, tip, mempool_len) = {
+                let local = chain.lock().expect("chain mutex poisoned");
+                (local.height(), local.tip_hash(), local.mempool.len())
+            };
+            let peer_count = peers.lock().expect("peer mutex poisoned").len();
+            let active_count = active.lock().expect("active peer mutex poisoned").len();
+            println!(
+                "p2p status height={} tip={} mempool={} peers={} active={}",
+                height, tip, mempool_len, peer_count, active_count
+            );
+        }
         let sleep_secs = settings.p2p.connect_interval_secs.max(1).min(3);
         thread::sleep(Duration::from_secs(sleep_secs));
     }
@@ -5593,11 +6002,132 @@ fn force_official_tip_if_ahead(
     Ok(false)
 }
 
-/// HF54/v1.5.2 hard template gate. This runs immediately before building a
-/// mining candidate and again immediately before submitting a found block.
-/// It prevents GUI/CLI miners from extending a local branch when direct peers
-/// are already ahead or disagree at the candidate parent height. Registry-only
-/// high-tip telemetry is deliberately ignored here.
+/// HF127/v1.8.3 transaction construction guard. Transactions are branch-
+/// sensitive because their inputs may differ across competing tips. Unlike
+/// mining, an equal-height sibling is not safe for signing: require an exact
+/// current-tip acknowledgement from an official source or a two-peer direct
+/// quorum, and run the bounded repair ladder only when the quick view disagrees.
+pub fn hf127_transaction_parent_guard(
+    settings: &Settings,
+    repair_timeout_ms: u64,
+) -> Result<P2PSyncReport> {
+    let mut report = P2PSyncReport::default();
+    if !settings.p2p.enabled
+        || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan")
+    {
+        return finish_report(settings, report);
+    }
+
+    let inspect = |local: &ChainState, report: &mut P2PSyncReport| -> (bool, bool, Vec<String>) {
+        let local_height = local.height();
+        let local_tip = local.tip_hash().to_string();
+        let mut exact = false;
+        let mut needs_repair = false;
+        let mut conflicts = Vec::<String>::new();
+
+        if let Ok((contacted, height, tip)) = best_official_peer_tip(settings, 900) {
+            report.peers_contacted = report.peers_contacted.max(contacted);
+            report.best_peer_height = report.best_peer_height.max(height);
+            if contacted > 0 {
+                if height > local_height {
+                    needs_repair = true;
+                    conflicts.push(format!(
+                        "official TCP tip #{} is ahead of local #{}",
+                        height, local_height
+                    ));
+                } else if height == local_height && !tip.trim().is_empty() {
+                    if tip == local_tip {
+                        exact = true;
+                    } else {
+                        needs_repair = true;
+                        conflicts.push(format!(
+                            "official TCP reports sibling {} at #{}",
+                            tip, height
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Ok(Some((height, tip))) = official_http_tip(settings, 1_800) {
+            report.peers_contacted = report.peers_contacted.max(1);
+            report.best_peer_height = report.best_peer_height.max(height);
+            if height > local_height {
+                needs_repair = true;
+                conflicts.push(format!(
+                    "official HTTP tip #{} is ahead of local #{}",
+                    height, local_height
+                ));
+            } else if height == local_height && !tip.trim().is_empty() {
+                if tip == local_tip {
+                    exact = true;
+                } else {
+                    needs_repair = true;
+                    conflicts.push(format!(
+                        "official HTTP reports sibling {} at #{}",
+                        tip, height
+                    ));
+                }
+            }
+        }
+
+        if !needs_repair
+            && !exact
+            && hf115_direct_parent_ack_quorum(
+                settings,
+                local_height,
+                &local_tip,
+                12,
+                650,
+            )
+        {
+            exact = true;
+        }
+
+        (exact, needs_repair, conflicts)
+    };
+
+    let mut local = load_chain_for_hf90_catchup(settings)?;
+    validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+    let (exact, needs_repair, first_conflicts) = inspect(&local, &mut report);
+    if exact && !needs_repair {
+        mark_fresh_tip_trusted(settings, &local);
+        return finish_report(settings, report);
+    }
+
+    let repaired = hf90_auto_catchup(settings, repair_timeout_ms.max(60_000))?;
+    merge_sync_reports(&mut report, repaired);
+    local = load_chain_for_hf90_catchup(settings)?;
+    validate_chain_consensus_checkpoints(settings, &local.blocks)?;
+    let (exact_after, needs_repair_after, second_conflicts) = inspect(&local, &mut report);
+    if exact_after && !needs_repair_after {
+        mark_fresh_tip_trusted(settings, &local);
+        return finish_report(settings, report);
+    }
+
+    let detail = first_conflicts
+        .into_iter()
+        .chain(second_conflicts)
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "transaction creation paused: local tip #{} {} is not exactly acknowledged by the current official/direct network view{}",
+        local.height(),
+        local.tip_hash(),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({detail})")
+        }
+    )
+}
+
+/// HF54/v1.5.2 hard mining template gate. It runs immediately before
+/// building a candidate and again before submitting a found block. It fails
+/// closed on a genuinely higher validated tip, while HF126 keeps ordinary
+/// equal-height PoW sibling ties mineable. Registry-only telemetry is not used
+/// as a fork-choice input.
 pub fn mining_parent_guard(
     settings: &Settings,
     parent_height: u32,
@@ -6723,8 +7253,13 @@ fn broadcast_block_confirmed_internal(
         .lock()
         .map_err(|_| anyhow::anyhow!("HF125 block-relay mutex poisoned"))?;
     let block_hash = block.block_hash().to_string();
-    let chain = load_committed_chain(settings, false)
-        .or_else(|_| load_chain_for_hf90_catchup(settings))?;
+    let chain = if let Some(live) = live_chain_snapshot(settings) {
+        live
+    } else if let Ok(committed) = load_committed_chain(settings, false) {
+        committed
+    } else {
+        load_chain_for_hf90_catchup(settings)?
+    };
     let height = chain
         .blocks
         .iter()
@@ -6767,12 +7302,27 @@ fn broadcast_block_confirmed_internal(
     let (sender, receiver) = mpsc::channel();
     for addr in peers {
         let sender = sender.clone();
+        let error_sender = sender.clone();
         let settings = settings.clone();
         let block = block.clone();
         let chain = chain.clone();
-        thread::spawn(move || {
-            let _ = sender.send(submit_block_to_peer(&settings, &addr, &block, &chain));
-        });
+        let peer = addr.clone();
+        let official = is_official_block_relay_peer(&settings, &addr);
+        if let Err(err) = thread::Builder::new()
+            .name("qub-block-submit".to_string())
+            .spawn(move || {
+                let _ = sender.send(submit_block_to_peer(&settings, &addr, &block, &chain));
+            })
+        {
+            let _ = error_sender.send(BlockRelayPeerResult {
+                peer,
+                official,
+                transport: "spawn_error".to_string(),
+                status: "transport_error".to_string(),
+                reason: format!("could not allocate block-submit worker: {err}"),
+                ..BlockRelayPeerResult::default()
+            });
+        }
     }
     drop(sender);
 
@@ -6780,14 +7330,21 @@ fn broadcast_block_confirmed_internal(
     while report.peer_results.len() < report.attempts && Instant::now() < deadline {
         let wait = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(wait.min(Duration::from_millis(500))) {
-            Ok(result) => update_block_relay_report(&mut report, result),
+            Ok(result) => {
+                update_block_relay_report(&mut report, result);
+                if report.delivered() {
+                    break;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    report.timed_out = report
-        .timed_out
-        .saturating_add(report.attempts.saturating_sub(report.peer_results.len()));
+    if !report.delivered() {
+        report.timed_out = report
+            .timed_out
+            .saturating_add(report.attempts.saturating_sub(report.peer_results.len()));
+    }
 
     if report.delivered() {
         clear_pending_block_relay(settings);
@@ -6883,7 +7440,7 @@ pub fn block_relay_status(settings: &Settings) -> Result<serde_json::Value> {
             "official_competing_tip_reports": pending.last_official_stale_parent_reports,
             "hf125_reliable_block_delivery": true,
             "hf126_equal_height_recovery": true,
-            "delivery_rule": "official seed acknowledgement when official delivery is attempted; otherwise any explicit accepted/already-known peer acknowledgement",
+            "delivery_rule": "one official ACK, or two distinct direct-peer ACKs, or one explicit ACK when no official destination is configured",
         }),
         None => serde_json::json!({
             "ok": true,
@@ -6893,7 +7450,7 @@ pub fn block_relay_status(settings: &Settings) -> Result<serde_json::Value> {
             "local_tip": local.tip_hash().to_string(),
             "hf125_reliable_block_delivery": true,
             "hf126_equal_height_recovery": true,
-            "delivery_rule": "official seed acknowledgement when official delivery is attempted; otherwise any explicit accepted/already-known peer acknowledgement",
+            "delivery_rule": "one official ACK, or two distinct direct-peer ACKs, or one explicit ACK when no official destination is configured",
         }),
     })
 }
@@ -6913,6 +7470,38 @@ pub fn relay_pending_block_now(settings: &Settings) -> Result<Option<BlockRelayR
         return Ok(None);
     }
     broadcast_block_confirmed_internal(settings, &pending.block, None, true).map(Some)
+}
+
+
+pub fn tx_delivery_status(
+    settings: &Settings,
+    txid: Option<Hash256>,
+) -> Result<serde_json::Value> {
+    pending_tx_delivery_json(settings, txid)
+}
+
+pub fn relay_pending_txs_now(settings: &Settings) -> Result<Vec<TxRelayReport>> {
+    let now = hf125_now_secs();
+    let mut reports = Vec::new();
+    for record in pending_tx_delivery_records(settings)?
+        .into_iter()
+        .filter(|record| !is_pool_share_transaction(&record.tx))
+        .take(HF127_TX_RETRY_MAX_PER_PASS.max(1))
+    {
+        let report = broadcast_tx_confirmed_internal(
+            settings,
+            &record.tx,
+            None,
+            HF127_TX_RELAY_MAX_PEERS,
+            850,
+            true,
+        )?;
+        reports.push(report);
+        if hf125_now_secs().saturating_sub(now) >= HF127_TX_RELAY_TOTAL_SECS {
+            break;
+        }
+    }
+    Ok(reports)
 }
 
 fn retry_pending_block_relay(
@@ -6997,18 +7586,814 @@ fn relay_chain_to_known_peers(settings: &Settings, source_peer: Option<&str>) ->
     Ok(sent)
 }
 
+fn tx_acceptance_from_chain(
+    settings: &Settings,
+    local: &mut ChainState,
+    tx: Transaction,
+) -> TxAcceptance {
+    let txid_hash = tx.txid();
+    let txid = txid_hash.to_string();
+    if let Some((height, _confirmations)) = local.tx_confirmations(txid_hash) {
+        return TxAcceptance {
+            status: "already_confirmed".to_string(),
+            txid,
+            height,
+            tip_hash: local.tip_hash().to_string(),
+            reason: String::new(),
+            changed: false,
+        };
+    }
+    if local.tx_in_mempool(txid_hash) {
+        return TxAcceptance {
+            status: "already_known".to_string(),
+            txid,
+            height: local.height(),
+            tip_hash: local.tip_hash().to_string(),
+            reason: String::new(),
+            changed: false,
+        };
+    }
+    if is_pool_share_transaction(&tx) {
+        return TxAcceptance {
+            status: "rejected".to_string(),
+            txid,
+            height: local.height(),
+            tip_hash: local.tip_hash().to_string(),
+            reason: "pool shares use the bounded mempool relay path, not tx-submit".to_string(),
+            changed: false,
+        };
+    }
+
+    // HF127 acknowledgement means durable acceptance, not merely a mutation of
+    // a process-local mempool. Validate on a copy, commit QUB-FCE-1, and only
+    // then replace the caller state and return accepted.
+    let mut candidate = local.clone();
+    match candidate.accept_transaction_to_mempool(tx, settings) {
+        Ok(_) => match save_chain(settings, &candidate) {
+            Ok(()) => {
+                *local = candidate;
+                TxAcceptance {
+                    status: "accepted".to_string(),
+                    txid,
+                    height: local.height(),
+                    tip_hash: local.tip_hash().to_string(),
+                    reason: String::new(),
+                    changed: true,
+                }
+            }
+            Err(err) => TxAcceptance {
+                status: "rejected".to_string(),
+                txid,
+                height: local.height(),
+                tip_hash: local.tip_hash().to_string(),
+                reason: format!("durable mempool commit failed: {err:#}"),
+                changed: false,
+            },
+        },
+        Err(err) => TxAcceptance {
+            status: "rejected".to_string(),
+            txid,
+            height: local.height(),
+            tip_hash: local.tip_hash().to_string(),
+            reason: err.to_string(),
+            changed: false,
+        },
+    }
+}
+
+fn hf127_chain_mempool_digest(chain: &ChainState) -> Hash256 {
+    let mut txids = chain.mempool.iter().map(Transaction::txid).collect::<Vec<_>>();
+    txids.sort();
+    let mut raw = Vec::with_capacity(txids.len().saturating_mul(32));
+    for txid in txids {
+        raw.extend_from_slice(txid.as_bytes());
+    }
+    Hash256::double_sha256(&raw)
+}
+
+fn hf127_committed_state_matches(settings: &Settings, chain: &ChainState) -> bool {
+    fast_storage_identity(settings)
+        .ok()
+        .flatten()
+        .map(|identity| {
+            identity.committed_height == chain.height()
+                && identity.tip_hash == chain.tip_hash()
+                && identity.mempool_digest == hf127_chain_mempool_digest(chain)
+        })
+        .unwrap_or(false)
+}
+
+fn accept_submitted_tx_live(
+    settings: &Settings,
+    chain: &Arc<Mutex<ChainState>>,
+    _mempool_dirty: &Arc<AtomicBool>,
+    tx: Transaction,
+) -> TxAcceptance {
+    // Serialize durable transaction admission, but never hold the canonical
+    // chain mutex during Fast Chain Engine disk I/O. Blocks retain priority and
+    // can be accepted while an ordinary transaction state snapshot is written.
+    let _accept_guard = match hf127_tx_acceptance_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return TxAcceptance {
+                status: "rejected".to_string(),
+                txid: tx.txid().to_string(),
+                height: 0,
+                tip_hash: String::new(),
+                reason: "transaction acceptance mutex poisoned".to_string(),
+                changed: false,
+            };
+        }
+    };
+
+    let txid_hash = tx.txid();
+    let txid = txid_hash.to_string();
+    for _attempt in 0..2 {
+        let base = match chain.lock() {
+            Ok(local) => local.clone(),
+            Err(_) => {
+                return TxAcceptance {
+                    status: "rejected".to_string(),
+                    txid,
+                    height: 0,
+                    tip_hash: String::new(),
+                    reason: "canonical chain mutex poisoned".to_string(),
+                    changed: false,
+                };
+            }
+        };
+
+        if let Some((height, _confirmations)) = base.tx_confirmations(txid_hash) {
+            return TxAcceptance {
+                status: "already_confirmed".to_string(),
+                txid,
+                height,
+                tip_hash: base.tip_hash().to_string(),
+                reason: String::new(),
+                changed: false,
+            };
+        }
+        if base.tx_in_mempool(txid_hash) {
+            // An explicit positive ACK must prove that the transaction is not
+            // merely present in a process-local dirty mempool. If the committed
+            // Fast Chain identity already matches this exact state, no write is
+            // needed. Otherwise persist the existing mempool snapshot before
+            // returning already_known.
+            if hf127_committed_state_matches(settings, &base) {
+                return TxAcceptance {
+                    status: "already_known".to_string(),
+                    txid,
+                    height: base.height(),
+                    tip_hash: base.tip_hash().to_string(),
+                    reason: String::new(),
+                    changed: false,
+                };
+            }
+
+            match save_chain(settings, &base) {
+                Ok(()) => {
+                    let current = match chain.lock() {
+                        Ok(local) => local.clone(),
+                        Err(_) => base.clone(),
+                    };
+                    if let Some((height, _confirmations)) =
+                        current.tx_confirmations(txid_hash)
+                    {
+                        return TxAcceptance {
+                            status: "already_confirmed".to_string(),
+                            txid,
+                            height,
+                            tip_hash: current.tip_hash().to_string(),
+                            reason: String::new(),
+                            changed: false,
+                        };
+                    }
+                    if current.tx_in_mempool(txid_hash)
+                        && hf127_committed_state_matches(settings, &current)
+                    {
+                        return TxAcceptance {
+                            status: "already_known".to_string(),
+                            txid,
+                            height: current.height(),
+                            tip_hash: current.tip_hash().to_string(),
+                            reason: String::new(),
+                            changed: false,
+                        };
+                    }
+                    // A block or competing mempool commit moved the live owner
+                    // while the snapshot was written. Retry once against it.
+                }
+                Err(err) => {
+                    let moved = chain
+                        .lock()
+                        .map(|current| {
+                            current.height() != base.height()
+                                || current.tip_hash() != base.tip_hash()
+                        })
+                        .unwrap_or(false);
+                    if !moved {
+                        return TxAcceptance {
+                            status: "rejected".to_string(),
+                            txid,
+                            height: base.height(),
+                            tip_hash: base.tip_hash().to_string(),
+                            reason: format!(
+                                "durable existing-mempool commit failed: {err:#}"
+                            ),
+                            changed: false,
+                        };
+                    }
+                }
+            }
+            continue;
+        }
+        if is_pool_share_transaction(&tx) {
+            return TxAcceptance {
+                status: "rejected".to_string(),
+                txid,
+                height: base.height(),
+                tip_hash: base.tip_hash().to_string(),
+                reason: "pool shares use the bounded mempool relay path, not tx-submit"
+                    .to_string(),
+                changed: false,
+            };
+        }
+
+        let mut candidate = base.clone();
+        if let Err(err) = candidate.accept_transaction_to_mempool(tx.clone(), settings) {
+            return TxAcceptance {
+                status: "rejected".to_string(),
+                txid,
+                height: base.height(),
+                tip_hash: base.tip_hash().to_string(),
+                reason: err.to_string(),
+                changed: false,
+            };
+        }
+
+        match save_chain(settings, &candidate) {
+            Ok(()) => {
+                // save_chain publishes/merges the candidate into the registered
+                // live owner. Confirm that the live view now knows the exact tx
+                // before acknowledging durable acceptance.
+                let current = match chain.lock() {
+                    Ok(local) => local.clone(),
+                    Err(_) => candidate,
+                };
+                if let Some((height, _confirmations)) = current.tx_confirmations(txid_hash) {
+                    return TxAcceptance {
+                        status: "already_confirmed".to_string(),
+                        txid,
+                        height,
+                        tip_hash: current.tip_hash().to_string(),
+                        reason: String::new(),
+                        changed: true,
+                    };
+                }
+                if current.tx_in_mempool(txid_hash) {
+                    return TxAcceptance {
+                        status: "accepted".to_string(),
+                        txid,
+                        height: current.height(),
+                        tip_hash: current.tip_hash().to_string(),
+                        reason: String::new(),
+                        changed: true,
+                    };
+                }
+                // The canonical tip changed during the commit. Retry exactly
+                // once against the new live state before returning a rejection.
+            }
+            Err(err) => {
+                let moved = chain
+                    .lock()
+                    .map(|current| {
+                        current.height() != base.height()
+                            || current.tip_hash() != base.tip_hash()
+                    })
+                    .unwrap_or(false);
+                if !moved {
+                    return TxAcceptance {
+                        status: "rejected".to_string(),
+                        txid,
+                        height: base.height(),
+                        tip_hash: base.tip_hash().to_string(),
+                        reason: format!("durable mempool commit failed: {err:#}"),
+                        changed: false,
+                    };
+                }
+            }
+        }
+    }
+
+    let current = chain.lock().ok();
+    TxAcceptance {
+        status: "rejected".to_string(),
+        txid,
+        height: current.as_ref().map(|chain| chain.height()).unwrap_or(0),
+        tip_hash: current
+            .as_ref()
+            .map(|chain| chain.tip_hash().to_string())
+            .unwrap_or_default(),
+        reason: "canonical tip changed during transaction admission; retry delivery on the current tip"
+            .to_string(),
+        changed: false,
+    }
+}
+
+fn send_tx_ack(
+    stream: &mut TcpStream,
+    request_id: u64,
+    accepted: &TxAcceptance,
+) -> Result<()> {
+    send_wire(
+        stream,
+        &WireMessage::TxAck {
+            request_id,
+            txid: accepted.txid.clone(),
+            status: accepted.status.clone(),
+            height: accepted.height,
+            tip_hash: accepted.tip_hash.clone(),
+            reason: accepted.reason.clone(),
+        },
+    )
+}
+
+fn is_official_tx_relay_peer(settings: &Settings, addr: &str) -> bool {
+    is_official_block_relay_peer(settings, addr)
+}
+
+fn legacy_send_tx_to_peer(
+    settings: &Settings,
+    addr: &str,
+    tx: &Transaction,
+    chain: &ChainState,
+    timeout: Duration,
+    prior_reason: &str,
+) -> TxRelayPeerResult {
+    let mut result = TxRelayPeerResult {
+        peer: addr.to_string(),
+        official: is_official_tx_relay_peer(settings, addr),
+        transport: "legacy".to_string(),
+        ..TxRelayPeerResult::default()
+    };
+    let attempt = (|| -> Result<()> {
+        let mut stream = connect_peer(addr, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        send_version(&mut stream, settings, chain)?;
+        send_wire(&mut stream, &WireMessage::Tx { tx: tx.clone() })?;
+        Ok(())
+    })();
+    match attempt {
+        Ok(()) => {
+            result.status = "legacy_sent".to_string();
+            result.height = chain.height();
+            result.tip_hash = chain.tip_hash().to_string();
+            result.reason = prior_reason.to_string();
+        }
+        Err(err) => {
+            result.status = "transport_error".to_string();
+            result.reason = if prior_reason.is_empty() {
+                err.to_string()
+            } else {
+                format!("{prior_reason}; legacy fallback: {err:#}")
+            };
+        }
+    }
+    result
+}
+
+fn respond_during_tx_submit(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    chain: &ChainState,
+    message: WireMessage,
+) -> Result<bool> {
+    match message {
+        WireMessage::Version { .. }
+        | WireMessage::Inv { .. }
+        | WireMessage::Headers { .. }
+        | WireMessage::Chain { .. }
+        | WireMessage::Mempool { .. }
+        | WireMessage::Addr { .. }
+        | WireMessage::PeerList { .. }
+        | WireMessage::Pong { .. }
+        | WireMessage::BlockAck { .. }
+        | WireMessage::TxAck { .. } => Ok(true),
+        other => respond_during_block_submit(stream, settings, chain, other),
+    }
+}
+
+fn submit_tx_to_peer(
+    settings: &Settings,
+    addr: &str,
+    tx: &Transaction,
+    chain: &ChainState,
+    timeout: Duration,
+) -> TxRelayPeerResult {
+    let official = is_official_tx_relay_peer(settings, addr);
+    let request_id = rand::thread_rng().next_u64();
+    let expected_txid = tx.txid().to_string();
+    let attempt = (|| -> Result<TxRelayPeerResult> {
+        let mut stream = connect_peer(addr, timeout)?;
+        stream.set_read_timeout(Some(Duration::from_secs(HF127_TX_ACK_TIMEOUT_SECS)))?;
+        stream.set_write_timeout(Some(timeout.max(Duration::from_secs(2))))?;
+        send_version_with_role(&mut stream, settings, chain, "tx-submit")?;
+        send_wire(
+            &mut stream,
+            &WireMessage::SubmitTx {
+                request_id,
+                tx: tx.clone(),
+            },
+        )?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let deadline = Instant::now() + Duration::from_secs(HF127_TX_ACK_TIMEOUT_SECS);
+        while Instant::now() < deadline {
+            match read_wire(&mut reader, settings.p2p.max_message_bytes) {
+                Ok(WireMessage::TxAck {
+                    request_id: ack_id,
+                    txid,
+                    status,
+                    height,
+                    tip_hash,
+                    reason,
+                }) if ack_id == request_id => {
+                    if txid != expected_txid {
+                        return Ok(TxRelayPeerResult {
+                            peer: addr.to_string(),
+                            official,
+                            transport: "ack".to_string(),
+                            status: "rejected".to_string(),
+                            height,
+                            tip_hash,
+                            reason: format!(
+                                "transaction acknowledgement id mismatch: {txid}; {reason}"
+                            ),
+                        });
+                    }
+                    return Ok(TxRelayPeerResult {
+                        peer: addr.to_string(),
+                        official,
+                        transport: "ack".to_string(),
+                        status,
+                        height,
+                        tip_hash,
+                        reason,
+                    });
+                }
+                Ok(WireMessage::Reject { reason }) => {
+                    bail!("peer rejected tx-submit session: {reason}");
+                }
+                Ok(message) => {
+                    let _ = respond_during_tx_submit(
+                        &mut stream,
+                        settings,
+                        chain,
+                        message,
+                    )?;
+                }
+                Err(err) if is_timeout(&err) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        bail!("transaction acknowledgement timeout")
+    })();
+
+    match attempt {
+        Ok(result) => result,
+        Err(err) => legacy_send_tx_to_peer(
+            settings,
+            addr,
+            tx,
+            chain,
+            timeout,
+            &err.to_string(),
+        ),
+    }
+}
+
+fn update_tx_relay_report(report: &mut TxRelayReport, result: TxRelayPeerResult) {
+    if result.status != "transport_error" {
+        report.connected = report.connected.saturating_add(1);
+    }
+    let acknowledged = matches!(
+        result.status.as_str(),
+        "accepted" | "already_known" | "already_confirmed"
+    );
+    if acknowledged {
+        report.acknowledgements = report.acknowledgements.saturating_add(1);
+        if result.official {
+            report.official_acknowledgements =
+                report.official_acknowledgements.saturating_add(1);
+        }
+    }
+    match result.status.as_str() {
+        "accepted" => report.accepted = report.accepted.saturating_add(1),
+        "already_known" => report.already_known = report.already_known.saturating_add(1),
+        "already_confirmed" => {
+            report.already_confirmed = report.already_confirmed.saturating_add(1)
+        }
+        "rejected" => report.rejected = report.rejected.saturating_add(1),
+        "legacy_sent" => report.legacy_sent = report.legacy_sent.saturating_add(1),
+        _ => {}
+    }
+    report.peer_results.push(result);
+}
+
+fn hf127_tx_retry_delay_secs(previous_attempts: u64, report: &TxRelayReport) -> u64 {
+    if report.delivered() {
+        return HF127_TX_RETRY_IDLE_SECS;
+    }
+    let width = report.attempts.max(1) as u64;
+    let rounds = previous_attempts.saturating_div(width).min(8) as u32;
+    2u64
+        .saturating_pow(rounds)
+        .clamp(2, HF127_TX_RETRY_IDLE_SECS)
+}
+
+fn persist_tx_delivery_report(
+    settings: &Settings,
+    txid: Hash256,
+    previous_attempts: u64,
+    fallback_height: u32,
+    fallback_tip: &str,
+    report: &TxRelayReport,
+) -> Result<()> {
+    let best = report
+        .peer_results
+        .iter()
+        .find(|result| {
+            result.official
+                && matches!(
+                    result.status.as_str(),
+                    "accepted" | "already_known" | "already_confirmed"
+                )
+        })
+        .or_else(|| {
+            report.peer_results.iter().find(|result| {
+                matches!(
+                    result.status.as_str(),
+                    "accepted" | "already_known" | "already_confirmed"
+                )
+            })
+        })
+        .or_else(|| {
+            report
+                .peer_results
+                .iter()
+                .find(|result| result.official && result.status == "rejected")
+        })
+        .or_else(|| {
+            report
+                .peer_results
+                .iter()
+                .find(|result| result.status == "rejected")
+        });
+    let status = best
+        .map(|result| result.status.as_str())
+        .unwrap_or("pending_retry");
+    let height = best.map(|result| result.height).unwrap_or(fallback_height);
+    let tip_hash = best
+        .map(|result| result.tip_hash.as_str())
+        .unwrap_or(fallback_tip);
+    let reason = report
+        .peer_results
+        .iter()
+        .filter(|result| !result.reason.trim().is_empty())
+        .map(|result| format!("{}: {}", result.peer, result.reason))
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let retry_at = hf125_now_secs().saturating_add(hf127_tx_retry_delay_secs(
+        previous_attempts,
+        report,
+    ));
+    let updated = update_pending_tx_delivery(
+        settings,
+        txid,
+        report.attempts,
+        report.acknowledgements,
+        report.official_acknowledgements,
+        status,
+        height,
+        tip_hash,
+        &reason,
+        report.delivered(),
+        retry_at,
+    )?;
+    if !updated {
+        bail!(
+            "durable transaction delivery record disappeared before report persistence: {}",
+            txid
+        );
+    }
+    Ok(())
+}
+
+fn broadcast_tx_confirmed_internal(
+    settings: &Settings,
+    tx: &Transaction,
+    source_peer: Option<&str>,
+    max_peers: usize,
+    timeout_ms: u64,
+    track_pending: bool,
+) -> Result<TxRelayReport> {
+    let txid_hash = tx.txid();
+    let txid = txid_hash.to_string();
+    let previous_delivery_attempts = if track_pending {
+        let records = pending_tx_delivery_records(settings)?;
+        records
+            .into_iter()
+            .find(|record| record.txid == txid_hash)
+            .map(|record| record.delivery_attempts)
+            .with_context(|| {
+                format!(
+                    "durable transaction delivery record missing before relay: {}",
+                    txid_hash
+                )
+            })?
+    } else {
+        0
+    };
+    if !settings.p2p.enabled || is_pool_share_transaction(tx) {
+        let mut report = TxRelayReport {
+            txid,
+            ..TxRelayReport::default()
+        };
+        report.pending_retry = track_pending && !is_pool_share_transaction(tx);
+        if track_pending && !is_pool_share_transaction(tx) {
+            persist_tx_delivery_report(
+                settings,
+                txid_hash,
+                previous_delivery_attempts,
+                0,
+                "",
+                &report,
+            )?;
+        }
+        return Ok(report);
+    }
+    if let Err(err) = hf106_jin_sale_standardness_policy(tx, settings) {
+        let mut report = TxRelayReport {
+            txid,
+            rejected: 1,
+            ..TxRelayReport::default()
+        };
+        report.peer_results.push(TxRelayPeerResult {
+            status: "rejected".to_string(),
+            reason: err.to_string(),
+            ..TxRelayPeerResult::default()
+        });
+        report.pending_retry = track_pending;
+        if track_pending {
+            persist_tx_delivery_report(
+                settings,
+                txid_hash,
+                previous_delivery_attempts,
+                0,
+                "",
+                &report,
+            )?;
+        }
+        return Ok(report);
+    }
+
+    let chain = if let Some(live) = live_chain_snapshot(settings) {
+        live
+    } else {
+        load_chain_for_hf90_catchup(settings)?
+    };
+    let source = source_peer.map(normalize_peer_addr).unwrap_or_default();
+    let peers = prioritized_outbound_peers(
+        settings,
+        max_peers.max(1).min(HF127_TX_RELAY_MAX_PEERS),
+    )?
+    .into_iter()
+    .filter(|addr| source.is_empty() || normalize_peer_addr(addr) != source)
+    .collect::<Vec<_>>();
+    let official_attempts = peers
+        .iter()
+        .filter(|addr| is_official_tx_relay_peer(settings, addr))
+        .count();
+    let mut report = TxRelayReport {
+        txid: txid.clone(),
+        attempts: peers.len(),
+        official_attempts,
+        ..TxRelayReport::default()
+    };
+    if peers.is_empty() {
+        report.pending_retry = track_pending;
+        if track_pending {
+            persist_tx_delivery_report(
+                settings,
+                txid_hash,
+                previous_delivery_attempts,
+                chain.height(),
+                &chain.tip_hash().to_string(),
+                &report,
+            )?;
+        }
+        return Ok(report);
+    }
+
+    let per_peer = Duration::from_millis(timeout_ms.max(300).min(3_000));
+    let (sender, receiver) = mpsc::channel();
+    for addr in peers {
+        let sender = sender.clone();
+        let error_sender = sender.clone();
+        let settings = settings.clone();
+        let tx = tx.clone();
+        let chain = chain.clone();
+        let peer = addr.clone();
+        let official = is_official_tx_relay_peer(&settings, &addr);
+        if let Err(err) = thread::Builder::new()
+            .name("qub-tx-submit".to_string())
+            .spawn(move || {
+                let _ = sender.send(submit_tx_to_peer(
+                    &settings,
+                    &addr,
+                    &tx,
+                    &chain,
+                    per_peer,
+                ));
+            })
+        {
+            let _ = error_sender.send(TxRelayPeerResult {
+                peer,
+                official,
+                transport: "spawn_error".to_string(),
+                status: "transport_error".to_string(),
+                reason: format!("could not allocate tx-submit worker: {err}"),
+                ..TxRelayPeerResult::default()
+            });
+        }
+    }
+    drop(sender);
+
+    let deadline = Instant::now() + Duration::from_secs(HF127_TX_RELAY_TOTAL_SECS);
+    while report.peer_results.len() < report.attempts && Instant::now() < deadline {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(wait.min(Duration::from_millis(250))) {
+            Ok(result) => {
+                update_tx_relay_report(&mut report, result);
+                // An official acceptance is conclusive. When there are no
+                // official destinations at all, one explicit peer acceptance is
+                // sufficient. Do not keep the GUI waiting for unrelated peer
+                // timeouts after delivery is already proven.
+                if report.delivered() {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !report.delivered() {
+        report.timed_out = report
+            .timed_out
+            .saturating_add(report.attempts.saturating_sub(report.peer_results.len()));
+    }
+    report.pending_retry = track_pending && !report.delivered();
+
+    if track_pending {
+        persist_tx_delivery_report(
+            settings,
+            txid_hash,
+            previous_delivery_attempts,
+            chain.height(),
+            &chain.tip_hash().to_string(),
+            &report,
+        )?;
+    }
+
+    Ok(report)
+}
+
+pub fn broadcast_tx_confirmed(settings: &Settings, tx: &Transaction) -> Result<TxRelayReport> {
+    broadcast_tx_confirmed_internal(
+        settings,
+        tx,
+        None,
+        HF127_TX_RELAY_MAX_PEERS,
+        850,
+        true,
+    )
+}
+
 pub fn broadcast_tx(settings: &Settings, tx: &Transaction) -> Result<usize> {
     if !settings.p2p.enabled {
         return Ok(0);
     }
-    broadcast(settings, WireMessage::Tx { tx: tx.clone() })
+    if is_pool_share_transaction(tx) {
+        return broadcast(settings, WireMessage::Tx { tx: tx.clone() });
+    }
+    Ok(broadcast_tx_confirmed(settings, tx)?.acknowledged())
 }
 
-/// HF114/v1.7.2: exact, bounded transaction relay for GUI-created high-value
-/// actions. HF113 repeatedly rebroadcasted the whole mempool after JIN buys; on
-/// weak links that could tie up relay sockets and make mining look like block
-/// time slowed after a buy attempt. This path relays only the requested tx to a
-/// small official-first peer set with short per-peer timeouts.
+/// Exact, acknowledgement-based transaction relay. The legacy WireMessage::Tx
+/// fallback remains available for older peers, but a socket write is no longer
+/// reported to the GUI as confirmed network delivery.
 pub fn broadcast_tx_limited(
     settings: &Settings,
     tx: &Transaction,
@@ -7018,27 +8403,37 @@ pub fn broadcast_tx_limited(
     if !settings.p2p.enabled {
         return Ok(0);
     }
-    if hf106_jin_sale_standardness_policy(tx, settings).is_err() {
-        return Ok(0);
-    }
-    let chain = load_chain_for_hf90_catchup(settings)?;
-    let per_peer = Duration::from_millis(timeout_ms.max(150).min(2_000));
-    let mut sent = 0usize;
-    for addr in prioritized_outbound_peers(settings, max_peers.max(1).min(32))? {
-        if should_skip_outbound(settings, &addr) {
-            continue;
+    if is_pool_share_transaction(tx) {
+        if hf106_jin_sale_standardness_policy(tx, settings).is_err() {
+            return Ok(0);
         }
-        let Ok(mut stream) = connect_peer(&addr, per_peer) else {
-            continue;
-        };
-        let _ = stream.set_read_timeout(Some(per_peer));
-        let _ = stream.set_write_timeout(Some(per_peer));
-        let _ = send_version(&mut stream, settings, &chain);
-        if send_wire(&mut stream, &WireMessage::Tx { tx: tx.clone() }).is_ok() {
-            sent = sent.saturating_add(1);
+        let chain = load_chain_for_hf90_catchup(settings)?;
+        let per_peer = Duration::from_millis(timeout_ms.max(150).min(2_000));
+        let mut sent = 0usize;
+        for addr in prioritized_outbound_peers(settings, max_peers.max(1).min(8))? {
+            if should_skip_outbound(settings, &addr) {
+                continue;
+            }
+            let Ok(mut stream) = connect_peer(&addr, per_peer) else {
+                continue;
+            };
+            let _ = stream.set_write_timeout(Some(per_peer));
+            let _ = send_version(&mut stream, settings, &chain);
+            if send_wire(&mut stream, &WireMessage::Tx { tx: tx.clone() }).is_ok() {
+                sent = sent.saturating_add(1);
+            }
         }
+        return Ok(sent);
     }
-    Ok(sent)
+    Ok(broadcast_tx_confirmed_internal(
+        settings,
+        tx,
+        None,
+        max_peers,
+        timeout_ms,
+        true,
+    )?
+    .acknowledged())
 }
 
 pub fn rebroadcast_txid_limited(
@@ -7127,6 +8522,46 @@ fn broadcast(settings: &Settings, message: WireMessage) -> Result<usize> {
     Ok(sent)
 }
 
+fn hf127_push_missing_suffix(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    local: &ChainState,
+    session: &PeerSession,
+) -> Result<bool> {
+    if session.tip_hash.trim().is_empty() || session.height >= local.height() {
+        return Ok(false);
+    }
+    let Some(parent) = local.blocks.get(session.height as usize) else {
+        return Ok(false);
+    };
+    if parent.block_hash().to_string() != session.tip_hash {
+        return Ok(false);
+    }
+    let from_height = session.height.saturating_add(1);
+    if local.height().saturating_sub(session.height) == 1 {
+        if let Some(block) = local.blocks.last().cloned() {
+            send_wire(stream, &WireMessage::Block { block })?;
+            return Ok(true);
+        }
+    }
+    send_chain(stream, settings, local, from_height)?;
+    Ok(true)
+}
+
+fn hf127_announce_live_tip(
+    stream: &mut TcpStream,
+    settings: &Settings,
+    local: &ChainState,
+    session: &PeerSession,
+    allow_direct_block: bool,
+) -> Result<()> {
+    send_version(stream, settings, local)?;
+    if allow_direct_block {
+        let _ = hf127_push_missing_suffix(stream, settings, local, session)?;
+    }
+    send_inv(stream, local)
+}
+
 fn handle_peer(
     mut stream: TcpStream,
     peer_addr: String,
@@ -7138,7 +8573,10 @@ fn handle_peer(
     active: Arc<Mutex<HashSet<String>>>,
     mempool_dirty: Arc<AtomicBool>,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    // HF127/v1.8.3: disable Nagle on latency-sensitive peer sessions and
+    // use one-second read ticks so a newly accepted tip is announced promptly.
+    let _ = stream.set_nodelay(true);
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let peer_key = normalize_peer_addr(&peer_addr);
     {
@@ -7167,11 +8605,20 @@ fn handle_peer(
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut peer_errors = 0u32;
         let mut last_inv = Instant::now();
+        let mut last_announced_height = local_chain.height();
+        let mut last_announced_tip = local_chain.tip_hash();
         let mut session = PeerSession::default();
-        let priority_deadline = Instant::now() + Duration::from_secs(30);
+        let priority_handshake_deadline =
+            Instant::now() + Duration::from_secs(HF127_PRIORITY_HANDSHAKE_SECS);
+        let priority_deadline =
+            Instant::now() + Duration::from_secs(HF127_PRIORITY_SESSION_SECS);
         let mut priority_verified = !priority_only;
+        let mut priority_role = String::new();
         let mut priority_messages = 0usize;
-        let mut priority_submissions = 0usize;
+        let mut priority_block_submissions = 0usize;
+        let mut priority_tx_submissions = 0usize;
+        let mut normal_tx_submit_window_started = Instant::now();
+        let mut normal_tx_submissions = 0usize;
 
         loop {
             match read_wire(&mut reader, settings.p2p.max_message_bytes) {
@@ -7191,14 +8638,17 @@ fn handle_peer(
 
                         if !priority_verified {
                             match &message {
-                                WireMessage::Version { role, .. } if role == "block-submit" => {
+                                WireMessage::Version { role, .. }
+                                    if role == "block-submit" || role == "tx-submit" =>
+                                {
                                     priority_verified = true;
+                                    priority_role = role.clone();
                                 }
                                 _ => {
                                     let _ = send_wire(
                                         &mut stream,
                                         &WireMessage::Reject {
-                                            reason: "priority inbound slot requires block-submit Version as the first message"
+                                            reason: "priority inbound slot requires block-submit or tx-submit Version as the first message"
                                                 .to_string(),
                                         },
                                     );
@@ -7207,9 +8657,56 @@ fn handle_peer(
                             }
                         }
 
+                        let priority_message_allowed = match priority_role.as_str() {
+                            "block-submit" => matches!(
+                                &message,
+                                WireMessage::Version { .. }
+                                    | WireMessage::SubmitBlock { .. }
+                                    | WireMessage::Block { .. }
+                                    | WireMessage::Inv { .. }
+                                    | WireMessage::Headers { .. }
+                                    | WireMessage::Chain { .. }
+                                    | WireMessage::GetHeaders { .. }
+                                    | WireMessage::GetChain { .. }
+                                    | WireMessage::Ping { .. }
+                                    | WireMessage::Pong { .. }
+                            ),
+                            "tx-submit" => matches!(
+                                &message,
+                                WireMessage::Version { .. }
+                                    | WireMessage::SubmitTx { .. }
+                                    | WireMessage::Ping { .. }
+                                    | WireMessage::Pong { .. }
+                            ),
+                            _ => false,
+                        };
+                        if !priority_message_allowed {
+                            let _ = send_wire(
+                                &mut stream,
+                                &WireMessage::Reject {
+                                    reason: format!(
+                                        "priority {} session received a disallowed message",
+                                        priority_role
+                                    ),
+                                },
+                            );
+                            break;
+                        }
+
                         if matches!(&message, WireMessage::SubmitBlock { .. }) {
-                            priority_submissions = priority_submissions.saturating_add(1);
-                            if priority_submissions > HF125_PRIORITY_MAX_SUBMISSIONS {
+                            if priority_role != "block-submit" {
+                                let _ = send_wire(
+                                    &mut stream,
+                                    &WireMessage::Reject {
+                                        reason: "tx-submit reserve session cannot submit blocks"
+                                            .to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                            priority_block_submissions =
+                                priority_block_submissions.saturating_add(1);
+                            if priority_block_submissions > HF125_PRIORITY_MAX_SUBMISSIONS {
                                 let _ = send_wire(
                                     &mut stream,
                                     &WireMessage::Reject {
@@ -7219,6 +8716,53 @@ fn handle_peer(
                                 );
                                 break;
                             }
+                        }
+
+                        if matches!(&message, WireMessage::SubmitTx { .. }) {
+                            if priority_role != "tx-submit" {
+                                let _ = send_wire(
+                                    &mut stream,
+                                    &WireMessage::Reject {
+                                        reason: "block-submit reserve session cannot submit transactions"
+                                            .to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                            priority_tx_submissions = priority_tx_submissions.saturating_add(1);
+                            if priority_tx_submissions > HF127_PRIORITY_MAX_TX_SUBMISSIONS {
+                                let _ = send_wire(
+                                    &mut stream,
+                                    &WireMessage::Reject {
+                                        reason: "priority tx-submit session exceeded its submission budget"
+                                            .to_string(),
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                    } else if matches!(&message, WireMessage::SubmitTx { .. }) {
+                        // SubmitTx performs durable validation/persistence and is
+                        // intentionally more expensive than the legacy batched
+                        // mempool path. Bound it per persistent session so a
+                        // single authenticated network peer cannot force an
+                        // unbounded stream of Fast Chain Engine commits.
+                        if normal_tx_submit_window_started.elapsed()
+                            >= Duration::from_secs(HF127_NORMAL_TX_SUBMIT_WINDOW_SECS)
+                        {
+                            normal_tx_submit_window_started = Instant::now();
+                            normal_tx_submissions = 0;
+                        }
+                        normal_tx_submissions = normal_tx_submissions.saturating_add(1);
+                        if normal_tx_submissions > HF127_NORMAL_TX_SUBMITS_PER_WINDOW {
+                            let _ = send_wire(
+                                &mut stream,
+                                &WireMessage::Reject {
+                                    reason: "tx-submit session rate limit exceeded; retry after the current delivery window"
+                                        .to_string(),
+                                },
+                            );
+                            continue;
                         }
                     }
                     if let Err(err) = process_peer_message(
@@ -7230,6 +8774,7 @@ fn handle_peer(
                         &peers,
                         &mempool_dirty,
                         &mut session,
+                        outbound,
                     ) {
                         peer_errors = peer_errors.saturating_add(1);
                         let _ = send_wire(
@@ -7242,31 +8787,54 @@ fn handle_peer(
                             bail!("peer exceeded invalid-message score");
                         }
                     }
-                    // HF125/v1.8.2: heartbeat scheduling is wall-clock based,
-                    // not timeout based. A continuous pool-share stream used to
-                    // prevent read timeouts forever and therefore suppress tip
-                    // announcements on otherwise healthy persistent sessions.
-                    if last_inv.elapsed() >= Duration::from_secs(4) {
-                        let local = chain.lock().expect("chain mutex poisoned").clone();
-                        send_version(&mut stream, &settings, &local)?;
-                        send_inv(&mut stream, &local)?;
+                    // HF127/v1.8.3: a changed canonical tip is announced on the
+                    // next one-second coordination tick even under continuous
+                    // traffic. The four-second heartbeat remains as a fallback.
+                    let local = chain.lock().expect("chain mutex poisoned").clone();
+                    let tip_changed = local.height() != last_announced_height
+                        || local.tip_hash() != last_announced_tip;
+                    if tip_changed || last_inv.elapsed() >= Duration::from_secs(4) {
+                        hf127_announce_live_tip(
+                            &mut stream,
+                            &settings,
+                            &local,
+                            &session,
+                            !priority_only,
+                        )?;
+                        last_announced_height = local.height();
+                        last_announced_tip = local.tip_hash();
                         last_inv = Instant::now();
                     }
                 }
                 Err(err) if is_timeout(&err) => {
-                    if priority_only && Instant::now() >= priority_deadline {
+                    if priority_only
+                        && ((!priority_verified
+                            && Instant::now() >= priority_handshake_deadline)
+                            || Instant::now() >= priority_deadline)
+                    {
                         break;
                     }
-                    if last_inv.elapsed() >= Duration::from_secs(4) {
-                        let local = chain.lock().expect("chain mutex poisoned").clone();
-                        // Heartbeat identity/status too, not just inv. This keeps the seed
-                        // registry fresh for NAT/firewalled miners that keep one long-lived
-                        // outbound connection and therefore do not re-send Version often.
-                        send_version(&mut stream, &settings, &local)?;
-                        send_inv(&mut stream, &local)?;
-                        send_wire(&mut stream, &WireMessage::GetAddr)?;
-                        send_wire(&mut stream, &WireMessage::GetPeerList)?;
-                        send_wire(&mut stream, &WireMessage::GetMempool)?;
+                    let local = chain.lock().expect("chain mutex poisoned").clone();
+                    let tip_changed = local.height() != last_announced_height
+                        || local.tip_hash() != last_announced_tip;
+                    if tip_changed || last_inv.elapsed() >= Duration::from_secs(4) {
+                        // Heartbeat identity/status too, not just inv. Priority
+                        // delivery sessions remain narrow and never request peer
+                        // discovery or a full mempool.
+                        hf127_announce_live_tip(
+                            &mut stream,
+                            &settings,
+                            &local,
+                            &session,
+                            !priority_only,
+                        )?;
+                        if !priority_only {
+                            send_wire(&mut stream, &WireMessage::GetAddr)?;
+                            send_wire(&mut stream, &WireMessage::GetPeerList)?;
+                            send_wire(&mut stream, &WireMessage::GetMempool)?;
+                        }
+                        last_announced_height = local.height();
+                        last_announced_tip = local.tip_hash();
                         last_inv = Instant::now();
                     }
                 }
@@ -7284,6 +8852,10 @@ fn handle_peer(
     result
 }
 
+fn hf127_is_submit_role(role: &str) -> bool {
+    matches!(role.trim(), "block-submit" | "tx-submit")
+}
+
 fn process_peer_message(
     settings: &Settings,
     peer_addr: &str,
@@ -7293,6 +8865,7 @@ fn process_peer_message(
     peers: &Arc<Mutex<HashSet<String>>>,
     mempool_dirty: &Arc<AtomicBool>,
     session: &mut PeerSession,
+    outbound_session: bool,
 ) -> Result<()> {
     match message {
         WireMessage::Version {
@@ -7320,33 +8893,41 @@ fn process_peer_message(
             session.listen_addr = listen_addr.clone();
             session.role = role.clone();
             session.miner_address = miner_address.clone();
-            record_peer_observation(
-                settings,
-                peer_addr,
-                &node_id,
-                &listen_addr,
-                height,
-                &tip_hash,
-                &user_agent,
-                &role,
-                &miner_address,
-            )?;
-            // Persist both the advertised listen address and the actually observed TCP
-            // address. If the DNS seed is down, nodes can still redial recently seen
-            // peers from the local peerbook instead of depending on the seed forever.
-            add_peer(settings, peers, peer_addr)?;
-            if !listen_addr.trim().is_empty() {
-                add_peer(settings, peers, &listen_addr)?;
+            // Short-lived block/transaction submit sessions use ephemeral
+            // source ports. Never persist those observed endpoints into the
+            // peerbook; doing so polluted future dial rounds with unreachable
+            // addresses and delayed both block and transaction propagation.
+            if !hf127_is_submit_role(&role) {
+                record_peer_observation(
+                    settings,
+                    peer_addr,
+                    &node_id,
+                    &listen_addr,
+                    height,
+                    &tip_hash,
+                    &user_agent,
+                    &role,
+                    &miner_address,
+                )?;
+                // The observed remote TCP endpoint is dialable only for an
+                // outbound session. On inbound sessions it is normally an
+                // ephemeral source port and must not poison future dial rounds.
+                if outbound_session {
+                    add_peer(settings, peers, peer_addr)?;
+                }
+                if !listen_addr.trim().is_empty() {
+                    add_peer(settings, peers, &listen_addr)?;
+                }
             }
-            let local = chain.lock().expect("chain mutex poisoned");
-            let local_height = local.height();
-            let local_tip = local.tip_hash().to_string();
-            drop(local);
+            let local_snapshot = chain.lock().expect("chain mutex poisoned").clone();
+            let local_height = local_snapshot.height();
+            let local_tip = local_snapshot.tip_hash().to_string();
             if height > local_height || (height == local_height && tip_hash != local_tip) {
-                let local_snapshot = chain.lock().expect("chain mutex poisoned").clone();
                 send_adaptive_chain_requests(stream, &local_snapshot, height, &tip_hash)?;
+            } else if height < local_height {
+                let _ = hf127_push_missing_suffix(stream, settings, &local_snapshot, session)?;
             }
-            send_inv(stream, &chain.lock().expect("chain mutex poisoned"))?;
+            send_inv(stream, &local_snapshot)?;
         }
         WireMessage::Inv {
             height, tip_hash, ..
@@ -7446,7 +9027,7 @@ fn process_peer_message(
             if changed {
                 let relay_settings = settings.clone();
                 let source = peer_addr.to_string();
-                thread::spawn(move || {
+                hf127_spawn_detached("qub-chain-diffusion", move || {
                     let _ = relay_chain_to_known_peers(&relay_settings, Some(&source));
                 });
             }
@@ -7469,7 +9050,7 @@ fn process_peer_message(
             if accepted.changed {
                 let relay_settings = settings.clone();
                 let source = peer_addr.to_string();
-                thread::spawn(move || {
+                hf127_spawn_detached("qub-block-diffusion", move || {
                     let _ = broadcast_block_confirmed_internal(
                         &relay_settings,
                         &relay_block,
@@ -7482,11 +9063,13 @@ fn process_peer_message(
         WireMessage::SubmitBlock { request_id, block } => {
             let relay_block = block.clone();
             let accepted = accept_submitted_block_live(settings, chain, mempool_dirty, block);
-            send_block_ack(stream, request_id, &accepted)?;
             if accepted.changed {
+                // Start outward diffusion before acknowledging the producer.
+                // The durable commit already succeeded; spawning first removes
+                // the producer-only propagation head start without delaying ACK.
                 let relay_settings = settings.clone();
                 let source = peer_addr.to_string();
-                thread::spawn(move || {
+                hf127_spawn_detached("qub-block-diffusion", move || {
                     let _ = broadcast_block_confirmed_internal(
                         &relay_settings,
                         &relay_block,
@@ -7495,8 +9078,29 @@ fn process_peer_message(
                     );
                 });
             }
+            send_block_ack(stream, request_id, &accepted)?;
         }
         WireMessage::BlockAck { .. } => {}
+        WireMessage::SubmitTx { request_id, tx } => {
+            let relay_tx = tx.clone();
+            let accepted = accept_submitted_tx_live(settings, chain, mempool_dirty, tx);
+            if accepted.changed {
+                let relay_settings = settings.clone();
+                let source = peer_addr.to_string();
+                hf127_spawn_detached("qub-tx-diffusion", move || {
+                    let _ = broadcast_tx_confirmed_internal(
+                        &relay_settings,
+                        &relay_tx,
+                        Some(&source),
+                        8,
+                        850,
+                        false,
+                    );
+                });
+            }
+            send_tx_ack(stream, request_id, &accepted)?;
+        }
+        WireMessage::TxAck { .. } => {}
         WireMessage::Tx { tx } => {
             let (accepted, mempool_changed) = {
                 let mut local = chain.lock().expect("chain mutex poisoned");
@@ -7513,7 +9117,19 @@ fn process_peer_message(
                 mempool_dirty.store(true, Ordering::Release);
             }
             if accepted && !is_pool_share_transaction(&tx) {
-                let _ = relay_tx_to_known_peers(settings, &tx, Some(peer_addr));
+                let relay_settings = settings.clone();
+                let relay_tx = tx.clone();
+                let source = peer_addr.to_string();
+                hf127_spawn_detached("qub-tx-diffusion", move || {
+                    let _ = broadcast_tx_confirmed_internal(
+                        &relay_settings,
+                        &relay_tx,
+                        Some(&source),
+                        8,
+                        850,
+                        false,
+                    );
+                });
             }
             // Inbound pool shares are propagated by the six-second fair batch
             // heartbeat. Deferring their fanout prevents legacy peers that send
@@ -7608,7 +9224,7 @@ fn process_peer_message(
 }
 
 fn refresh_session_observation(settings: &Settings, peer_addr: &str, session: &PeerSession) {
-    if session.node_id.trim().is_empty() {
+    if session.node_id.trim().is_empty() || hf127_is_submit_role(&session.role) {
         return;
     }
     let _ = record_peer_observation(
@@ -7650,17 +9266,19 @@ fn process_client_message(
                 bail!("unsupported protocol {protocol}");
             }
             validate_remote_network(settings, &network, &magic, &genesis_hash)?;
-            record_peer_observation(
-                settings,
-                addr,
-                &node_id,
-                &listen_addr,
-                height,
-                &tip_hash,
-                &user_agent,
-                &role,
-                &miner_address,
-            )?;
+            if !hf127_is_submit_role(&role) {
+                record_peer_observation(
+                    settings,
+                    addr,
+                    &node_id,
+                    &listen_addr,
+                    height,
+                    &tip_hash,
+                    &user_agent,
+                    &role,
+                    &miner_address,
+                )?;
+            }
             report.best_peer_height = report.best_peer_height.max(height);
             let local = load_chain_for_hf90_catchup(settings)?;
             if height > local.height()
@@ -7745,15 +9363,48 @@ fn process_client_message(
             }
         }
         WireMessage::SubmitBlock { request_id, block } => {
+            let relay_block = block.clone();
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let accepted = block_acceptance_from_chain(settings, &mut local, block);
-            send_block_ack(stream, request_id, &accepted)?;
             if accepted.changed {
                 report.blocks_connected = report.blocks_connected.saturating_add(1);
-                let _ = relay_chain_to_known_peers(settings, Some(addr));
+                let relay_settings = settings.clone();
+                let source = addr.to_string();
+                hf127_spawn_detached("qub-block-chain-diffusion", move || {
+                    let _ = broadcast_block_confirmed_internal(
+                        &relay_settings,
+                        &relay_block,
+                        Some(&source),
+                        false,
+                    );
+                    let _ = relay_chain_to_known_peers(&relay_settings, Some(&source));
+                });
             }
+            send_block_ack(stream, request_id, &accepted)?;
         }
         WireMessage::BlockAck { .. } => {}
+        WireMessage::SubmitTx { request_id, tx } => {
+            let relay_tx = tx.clone();
+            let mut local = load_chain_for_hf90_catchup(settings)?;
+            let accepted = tx_acceptance_from_chain(settings, &mut local, tx);
+            if accepted.changed {
+                report.txs_accepted = report.txs_accepted.saturating_add(1);
+                let relay_settings = settings.clone();
+                let source = addr.to_string();
+                hf127_spawn_detached("qub-tx-diffusion", move || {
+                    let _ = broadcast_tx_confirmed_internal(
+                        &relay_settings,
+                        &relay_tx,
+                        Some(&source),
+                        8,
+                        850,
+                        false,
+                    );
+                });
+            }
+            send_tx_ack(stream, request_id, &accepted)?;
+        }
+        WireMessage::TxAck { .. } => {}
         WireMessage::Tx { tx } => {
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let before_len = local.mempool.len();
@@ -7769,7 +9420,19 @@ fn process_client_message(
             if accepted {
                 report.txs_accepted += 1;
                 if !is_pool_share_transaction(&tx) {
-                    let _ = relay_tx_to_known_peers(settings, &tx, Some(addr));
+                    let relay_settings = settings.clone();
+                    let relay_tx = tx.clone();
+                    let source = addr.to_string();
+                    hf127_spawn_detached("qub-tx-diffusion", move || {
+                        let _ = broadcast_tx_confirmed_internal(
+                            &relay_settings,
+                            &relay_tx,
+                            Some(&source),
+                            8,
+                            850,
+                            false,
+                        );
+                    });
                 }
             }
         }
@@ -8024,7 +9687,10 @@ fn connect_peer(addr: &str, timeout: Duration) -> Result<TcpStream> {
         .with_context(|| format!("bad peer address {addr}"))?
     {
         match TcpStream::connect_timeout(&socket, timeout) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(err) => last_err = Some(err),
         }
     }
@@ -8108,9 +9774,9 @@ fn known_peers(settings: &Settings) -> Result<Vec<String>> {
         if is_public_socket_addr_text(&peer.listen_addr) {
             push_unique(peer.listen_addr.clone());
         }
-        if is_public_socket_addr_text(&peer.observed_addr) {
-            push_unique(peer.observed_addr.clone());
-        }
+        // observed_addr remains telemetry. For inbound sessions it is usually
+        // an ephemeral source port, so dialing it creates avoidable 900 ms
+        // failures and delays real bootnode/peer propagation.
     }
 
     // 3) Finally, persistent peerbook fallback. This gives the network a path
@@ -8129,10 +9795,24 @@ fn add_peer(settings: &Settings, peers: &Arc<Mutex<HashSet<String>>>, addr: &str
     if is_self_or_empty_addr(settings, &normalized) {
         return Ok(());
     }
-    {
+    // Never hold the active peer-set mutex during filesystem I/O. A slow disk
+    // or antivirus scan must not stall connection handling or tip diffusion.
+    let snapshot = {
         let mut p = peers.lock().expect("peer mutex poisoned");
-        p.insert(normalized);
-        save_peer_set(settings, &p)?;
+        if p.contains(&normalized) {
+            None
+        } else if p.len() >= HF127_PEERBOOK_MAX {
+            // Runtime peer discovery is bounded too; otherwise a remote peer
+            // can advertise endless unique endpoints and force repeated clones
+            // and disk writes even though the persisted peerbook is capped.
+            None
+        } else {
+            p.insert(normalized);
+            Some(p.clone())
+        }
+    };
+    if let Some(snapshot) = snapshot {
+        save_peer_set(settings, &snapshot)?;
     }
     Ok(())
 }
@@ -8147,31 +9827,110 @@ fn load_peer_set(settings: &Settings) -> Result<HashSet<String>> {
         return Ok(HashSet::new());
     }
     let book: PeerBook = serde_json::from_str(&raw).unwrap_or_default();
-    Ok(book
-        .peers
+
+    // HF127/v1.8.3: enforce the peerbook bound at read time too. A historical
+    // oversized/corruptly duplicated peer file must not allocate an unbounded
+    // runtime set or delay startup before the next successful save can compact
+    // it. Official/configured bootstrap peers are retained first.
+    let mut ordered = Vec::<String>::with_capacity(HF127_PEERBOOK_MAX);
+    let append_unique = |ordered: &mut Vec<String>, addr: String| {
+        let normalized = normalize_peer_addr(&addr);
+        if !normalized.is_empty()
+            && !is_self_or_empty_addr(settings, &normalized)
+            && !ordered.iter().any(|peer| peer == &normalized)
+            && ordered.len() < HF127_PEERBOOK_MAX
+        {
+            ordered.push(normalized);
+        }
+    };
+
+    for peer in official_snapshot_peers(settings)
         .into_iter()
-        .map(|p| normalize_peer_addr(&p))
-        .filter(|p| !is_self_or_empty_addr(settings, p))
-        .collect())
+        .chain(release_bootnodes(settings))
+    {
+        append_unique(&mut ordered, peer);
+        if ordered.len() >= HF127_PEERBOOK_MAX {
+            break;
+        }
+    }
+
+    for peer in book.peers {
+        append_unique(&mut ordered, peer);
+        if ordered.len() >= HF127_PEERBOOK_MAX {
+            break;
+        }
+    }
+
+    Ok(ordered.into_iter().collect())
+}
+
+fn hf127_peerbook_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn save_peer_set(settings: &Settings, peers: &HashSet<String>) -> Result<()> {
+    let _guard = hf127_peerbook_write_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("peerbook write mutex poisoned"))?;
     let path = peerbook_path(settings);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut list = peers
+
+    // HF127/v1.8.3: the peerbook is a fallback, not an unbounded historical
+    // archive. Keep official bootstrap peers first and cap the remaining rows so
+    // stale addresses cannot dominate startup/dial scheduling forever.
+    // Multiple inbound/outbound sessions can learn peers concurrently. Merge
+    // the latest on-disk set with the caller snapshot while holding the writer
+    // lock so an older snapshot can never overwrite a peer learned moments
+    // earlier by another session.
+    let mut combined = peers.clone();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(existing) = serde_json::from_str::<PeerBook>(&raw) {
+            combined.extend(existing.peers.into_iter().map(|peer| normalize_peer_addr(&peer)));
+        }
+    }
+
+    let mut list = Vec::<String>::new();
+    let append_unique = |list: &mut Vec<String>, addr: String| {
+        let normalized = normalize_peer_addr(&addr);
+        if !normalized.is_empty()
+            && !is_self_or_empty_addr(settings, &normalized)
+            && !list.iter().any(|peer| peer == &normalized)
+        {
+            list.push(normalized);
+        }
+    };
+
+    for peer in official_snapshot_peers(settings)
+        .into_iter()
+        .chain(release_bootnodes(settings))
+    {
+        append_unique(&mut list, peer);
+        if list.len() >= HF127_PEERBOOK_MAX {
+            break;
+        }
+    }
+
+    let mut remainder = combined
         .iter()
-        .map(|p| normalize_peer_addr(p))
-        .filter(|p| !is_self_or_empty_addr(settings, p))
+        .map(|peer| normalize_peer_addr(peer))
+        .filter(|peer| !is_self_or_empty_addr(settings, peer))
         .collect::<Vec<_>>();
-    list.sort();
-    list.dedup();
-    std::fs::write(
-        path,
-        serde_json::to_string_pretty(&PeerBook { peers: list })?,
-    )?;
-    Ok(())
+    remainder.sort();
+    remainder.dedup();
+    for peer in remainder {
+        if list.len() >= HF127_PEERBOOK_MAX {
+            break;
+        }
+        append_unique(&mut list, peer);
+    }
+
+    crate::write_text_replace(
+        &path,
+        &serde_json::to_string_pretty(&PeerBook { peers: list })?,
+    )
 }
 
 fn peerbook_path(settings: &Settings) -> PathBuf {
@@ -8265,11 +10024,18 @@ fn save_peer_registry(settings: &Settings, registry: &PeerRegistry) -> Result<()
     let mut registry = registry.clone();
     registry.peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     registry.peers.dedup_by(|a, b| a.node_id == b.node_id);
-    std::fs::write(path, serde_json::to_string_pretty(&registry)?)?;
-    Ok(())
+    crate::write_text_replace(&path, &serde_json::to_string_pretty(&registry)?)
+}
+
+fn hf127_peer_registry_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn merge_peer_registry(settings: &Settings, incoming: Vec<P2PObservedPeer>) -> Result<()> {
+    let _guard = hf127_peer_registry_write_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("peer registry write mutex poisoned"))?;
     let mut registry = load_peer_registry(settings)?;
     for peer in incoming.into_iter().take(256) {
         if peer.node_id.trim().is_empty() {
@@ -8299,19 +10065,43 @@ fn record_peer_observation(
     if remote_node_id == self_id {
         return Ok(());
     }
+    let _guard = hf127_peer_registry_write_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("peer registry write mutex poisoned"))?;
     let mut registry = load_peer_registry(settings)?;
+    let now = unix_time_u32() as u64;
+    let observed_addr = normalize_peer_addr(observed_addr);
+    let listen_addr = normalize_peer_addr(listen_addr);
+    if let Some(existing) = registry
+        .peers
+        .iter()
+        .find(|peer| peer.node_id == remote_node_id)
+    {
+        let materially_changed = existing.observed_addr != observed_addr
+            || existing.listen_addr != listen_addr
+            || existing.height != height
+            || existing.tip_hash != tip_hash
+            || existing.user_agent != user_agent
+            || existing.role != role
+            || existing.miner_address != miner_address;
+        if !materially_changed
+            && now.saturating_sub(existing.last_seen_unix) < HF127_PEER_OBSERVATION_WRITE_SECS
+        {
+            return Ok(());
+        }
+    }
     upsert_observed_peer(
         &mut registry,
         P2PObservedPeer {
             node_id: remote_node_id.to_string(),
-            observed_addr: normalize_peer_addr(observed_addr),
-            listen_addr: normalize_peer_addr(listen_addr),
+            observed_addr,
+            listen_addr,
             height,
             tip_hash: tip_hash.to_string(),
             user_agent: user_agent.to_string(),
             role: role.to_string(),
             miner_address: miner_address.to_string(),
-            last_seen_unix: unix_time_u32() as u64,
+            last_seen_unix: now,
         },
     );
     prune_peer_registry(&mut registry);
@@ -8359,7 +10149,7 @@ fn start_lan_discovery(
     peers: Arc<Mutex<HashSet<String>>>,
     chain: Arc<Mutex<ChainState>>,
 ) {
-    thread::spawn(move || {
+    hf127_spawn_detached("qub-lan-discovery", move || {
         if let Err(err) = lan_discovery_loop(settings, peers, chain) {
             eprintln!("lan discovery stopped: {err:#}");
         }
@@ -9405,13 +11195,28 @@ mod hf125_tests {
         assert!(report.delivered());
         assert_eq!(report.acknowledged(), 1);
 
-        // Once an official delivery was attempted, a non-official ACK alone is
-        // not sufficient to clear the durable mainnet relay marker.
+        // Once official delivery was attempted, one direct ACK alone is not
+        // sufficient, but two distinct direct peers are a liveness quorum.
         report.official_attempts = 1;
         assert!(!report.delivered());
-
         update_block_relay_report(
             &mut report,
+            BlockRelayPeerResult {
+                peer: "127.0.0.1:4".to_string(),
+                official: false,
+                transport: "ack".to_string(),
+                status: "already_known".to_string(),
+                ..BlockRelayPeerResult::default()
+            },
+        );
+        assert!(report.delivered());
+
+        let mut official = BlockRelayReport {
+            official_attempts: 1,
+            ..BlockRelayReport::default()
+        };
+        update_block_relay_report(
+            &mut official,
             BlockRelayPeerResult {
                 peer: "127.0.0.1:3".to_string(),
                 official: true,
@@ -9420,9 +11225,9 @@ mod hf125_tests {
                 ..BlockRelayPeerResult::default()
             },
         );
-        assert!(report.delivered());
-        assert_eq!(report.acknowledged(), 2);
-        assert_eq!(report.official_acknowledgements, 1);
+        assert!(official.delivered());
+        assert_eq!(official.acknowledged(), 1);
+        assert_eq!(official.official_acknowledgements, 1);
     }
 
     #[test]
@@ -9508,6 +11313,168 @@ mod hf125_tests {
         evidence.http_matches = 1;
         assert!(evidence.confirmed());
     }
+    #[test]
+    fn hf127_submit_tx_and_ack_wire_messages_roundtrip() {
+        let tx = dummy_tx(1, 77);
+        let request_id = 0x1270_0000_0000_0001;
+        let submit = WireMessage::SubmitTx {
+            request_id,
+            tx: tx.clone(),
+        };
+        let raw = serde_json::to_vec(&submit).expect("serialize SubmitTx");
+        match serde_json::from_slice::<WireMessage>(&raw).expect("parse SubmitTx") {
+            WireMessage::SubmitTx {
+                request_id: parsed,
+                tx: parsed_tx,
+            } => {
+                assert_eq!(parsed, request_id);
+                assert_eq!(parsed_tx.txid(), tx.txid());
+            }
+            other => panic!("unexpected submit message: {other:?}"),
+        }
+
+        let ack = WireMessage::TxAck {
+            request_id,
+            txid: tx.txid().to_string(),
+            status: "accepted".to_string(),
+            height: 5,
+            tip_hash: "tip".to_string(),
+            reason: String::new(),
+        };
+        let raw = serde_json::to_vec(&ack).expect("serialize TxAck");
+        match serde_json::from_slice::<WireMessage>(&raw).expect("parse TxAck") {
+            WireMessage::TxAck {
+                request_id: parsed,
+                txid,
+                status,
+                ..
+            } => {
+                assert_eq!(parsed, request_id);
+                assert_eq!(txid, tx.txid().to_string());
+                assert_eq!(status, "accepted");
+            }
+            other => panic!("unexpected ack message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hf127_transaction_delivery_prefers_official_or_two_peer_acknowledgements() {
+        let mut report = TxRelayReport {
+            official_attempts: 1,
+            ..TxRelayReport::default()
+        };
+        update_tx_relay_report(
+            &mut report,
+            TxRelayPeerResult {
+                peer: "peer-a".to_string(),
+                transport: "ack".to_string(),
+                status: "accepted".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        assert!(!report.delivered());
+
+        // Repeating the same peer does not satisfy the independent-peer quorum.
+        update_tx_relay_report(
+            &mut report,
+            TxRelayPeerResult {
+                peer: "peer-a".to_string(),
+                transport: "ack".to_string(),
+                status: "already_known".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        assert!(!report.delivered());
+
+        update_tx_relay_report(
+            &mut report,
+            TxRelayPeerResult {
+                peer: "peer-b".to_string(),
+                transport: "ack".to_string(),
+                status: "already_known".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        assert!(report.delivered());
+
+        let mut official = TxRelayReport {
+            official_attempts: 1,
+            ..TxRelayReport::default()
+        };
+        update_tx_relay_report(
+            &mut official,
+            TxRelayPeerResult {
+                peer: "seed".to_string(),
+                official: true,
+                transport: "ack".to_string(),
+                status: "accepted".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        assert!(official.delivered());
+
+        let mut rejected = TxRelayReport {
+            official_attempts: 1,
+            ..TxRelayReport::default()
+        };
+        update_tx_relay_report(
+            &mut rejected,
+            TxRelayPeerResult {
+                peer: "seed".to_string(),
+                official: true,
+                transport: "ack".to_string(),
+                status: "rejected".to_string(),
+                reason: "contextual rejection".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        for peer in ["peer-a", "peer-b"] {
+            update_tx_relay_report(
+                &mut rejected,
+                TxRelayPeerResult {
+                    peer: peer.to_string(),
+                    transport: "ack".to_string(),
+                    status: "accepted".to_string(),
+                    ..TxRelayPeerResult::default()
+                },
+            );
+        }
+        assert!(rejected.delivered());
+    }
+
+    #[test]
+    fn hf127_short_lived_submit_roles_are_not_peerbook_candidates() {
+        assert!(hf127_is_submit_role("block-submit"));
+        assert!(hf127_is_submit_role("tx-submit"));
+        assert!(!hf127_is_submit_role("node"));
+        assert!(!hf127_is_submit_role("miner"));
+    }
+
+    #[test]
+    fn hf127_transaction_retry_backoff_is_bounded() {
+        let report = TxRelayReport {
+            attempts: 4,
+            ..TxRelayReport::default()
+        };
+        assert_eq!(hf127_tx_retry_delay_secs(0, &report), 2);
+        assert!(hf127_tx_retry_delay_secs(64, &report) <= HF127_TX_RETRY_IDLE_SECS);
+
+        let mut delivered = TxRelayReport::default();
+        update_tx_relay_report(
+            &mut delivered,
+            TxRelayPeerResult {
+                peer: "peer-a".to_string(),
+                transport: "ack".to_string(),
+                status: "accepted".to_string(),
+                ..TxRelayPeerResult::default()
+            },
+        );
+        assert_eq!(
+            hf127_tx_retry_delay_secs(0, &delivered),
+            HF127_TX_RETRY_IDLE_SECS
+        );
+    }
+
     #[test]
     fn hf125_pending_block_relay_is_durable_and_network_scoped() {
         let mut settings = regtest_settings();

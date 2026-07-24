@@ -1,4 +1,4 @@
-# QUB HF123 RPC and Reference Miner
+# QUB RPC and Reference Miner (HF127 / v1.8.3)
 
 ## Production model
 
@@ -139,6 +139,26 @@ Existing on-chain pool:
 ```
 
 The worker is a CPU protocol reference and smoke tool. It is not intended to compete with ASIC/GPU infrastructure.
+
+## HF127 full-range worker policy
+
+HF127 removes the previous QUB-specific CPU worker-count ceiling from `qub-rpc-miner`. `--workers` is the requested thread count; actual creation remains subject to operating-system resources. Each worker receives a disjoint nonce lane, so additional workers do not intentionally rescan the same nonce sequence.
+
+The template-batch limit remains **128** because it is an RPC protocol/server resource bound, not a mining-power cap. When `--workers` is greater than `--batch`, multiple disjoint worker lanes share each tracked template. A warning is printed when the requested worker count exceeds detected logical CPU parallelism.
+
+Examples:
+
+```bash
+# Full automatic host CPU count chosen by the operator.
+/opt/qub/bin/qub-rpc-miner \
+  --rpc http://127.0.0.1:17445 \
+  --token-file /opt/qub/headless/config/rpc.token \
+  --address qub1... \
+  --workers 64 \
+  --batch 128
+```
+
+Monitor temperature, cooling, power delivery and system stability. The reference miner fails the round if any requested worker cannot be created; it never silently continues with a partial nonce-lane plan. Reduce `--workers` or inspect operating-system thread limits before retrying.
 
 ## Bitaxe/AxeOS boundary
 

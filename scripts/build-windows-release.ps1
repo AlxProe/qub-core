@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.8.2'
+$Version = '1.8.3'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
@@ -27,12 +27,12 @@ if (($env:RUSTFLAGS -as [string]) -notmatch 'crt-static') {
 }
 
 if (-not $SkipTests) {
-    cargo test
+    cargo test --locked
 }
 
-cargo build --release --bin qub-core --target x86_64-pc-windows-msvc
-cargo build --release --bin qubd --target x86_64-pc-windows-msvc
-cargo build --release --bin qub-rpc-miner --target x86_64-pc-windows-msvc
+cargo build --locked --release --bin qub-core --target x86_64-pc-windows-msvc
+cargo build --locked --release --bin qubd --target x86_64-pc-windows-msvc
+cargo build --locked --release --bin qub-rpc-miner --target x86_64-pc-windows-msvc
 
 function Find-SignTool {
     $candidates = @(
@@ -80,6 +80,9 @@ foreach ($Doc in @(
     'RELEASE_NOTES-v1.8.2-HF126.md',
     'HF126-v182-RELIABILITY-REVIEW.md',
     'HF126-v182-DEPLOY-RUNBOOK.md',
+    'RELEASE_NOTES-v1.8.3-HF127.md',
+    'HF127-v183-RELIABILITY-REVIEW.md',
+    'HF127-v183-DEPLOY-RUNBOOK.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',

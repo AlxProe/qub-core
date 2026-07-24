@@ -10,8 +10,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const APP_VERSION: &str = "v1.8.1";
-const MAX_WORKERS: usize = 128;
+const APP_VERSION: &str = "v1.8.3";
+const MAX_TEMPLATE_BATCH: usize = 128;
 const DEFAULT_REFRESH_SECS: u64 = 20;
 
 #[derive(Debug, Clone)]
@@ -84,6 +84,12 @@ fn run() -> Result<()> {
     println!(
         "Reference CPU worker. Stock Bitcoin Stratum/AxeOS devices require a separate QUB adapter."
     );
+    if options.workers > thread::available_parallelism().map(|value| value.get()).unwrap_or(1) {
+        eprintln!(
+            "WARNING: requested {} CPU workers exceeds detected logical parallelism. QUB Core applies no software worker cap; monitor temperature, power delivery and system stability.",
+            options.workers
+        );
+    }
 
     let status = rpc_json(
         &endpoint,
@@ -143,17 +149,54 @@ fn run() -> Result<()> {
         let hashes = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = mpsc::channel::<FoundNonce>();
         let round_started = Instant::now();
-        let mut handles = Vec::with_capacity(templates.len());
+        let mut handles = Vec::new();
+        let mut worker_start_error = None::<String>;
+        let template_count = templates.len();
 
-        for template in templates {
+        for worker_id in 0..options.workers {
+            let template_index = worker_id % template_count;
+            let lane_index = worker_id / template_count;
+            let lane_count = options
+                .workers
+                .saturating_add(template_count.saturating_sub(1).saturating_sub(template_index))
+                / template_count;
+            let template = templates[template_index].clone();
             let worker_stop = Arc::clone(&stop);
             let worker_hashes = Arc::clone(&hashes);
             let worker_sender = sender.clone();
-            handles.push(thread::spawn(move || {
-                mine_template(template, worker_stop, worker_hashes, worker_sender)
-            }));
+            match thread::Builder::new()
+                .name(format!("qub-rpc-cpu-{worker_id}"))
+                .spawn(move || {
+                    mine_template(
+                        template,
+                        lane_index,
+                        lane_count,
+                        worker_stop,
+                        worker_hashes,
+                        worker_sender,
+                    )
+                })
+            {
+                Ok(handle) => handles.push(handle),
+                Err(err) => {
+                    worker_start_error = Some(format!(
+                        "could not start requested CPU worker {worker_id}: {err}; refusing a partial nonce-lane plan"
+                    ));
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
+            }
         }
         drop(sender);
+        if let Some(error) = worker_start_error {
+            for handle in handles {
+                let _ = handle.join();
+            }
+            bail!("{error}; reduce --workers or inspect operating-system thread limits");
+        }
+        if handles.is_empty() {
+            bail!("operating system refused every requested CPU worker thread");
+        }
 
         let refresh_deadline = Instant::now() + Duration::from_secs(options.refresh_secs);
         let mut found = None;
@@ -248,19 +291,19 @@ fn parse_options() -> Result<Options> {
         bail!("provide exactly one of --address or --pool-id");
     }
 
-    let workers = parse_usize(
+    let workers = parse_usize_unbounded(
         take_value(&mut args, "--workers").as_deref().unwrap_or("1"),
         "workers",
         1,
-        MAX_WORKERS,
     )?;
+    let batch_default = workers.min(MAX_TEMPLATE_BATCH).to_string();
     let batch = parse_usize(
         take_value(&mut args, "--batch")
             .as_deref()
-            .unwrap_or(&workers.to_string()),
+            .unwrap_or(&batch_default),
         "batch",
         1,
-        MAX_WORKERS,
+        MAX_TEMPLATE_BATCH,
     )?;
     let refresh_secs = parse_u64(
         take_value(&mut args, "--refresh-secs")
@@ -296,7 +339,7 @@ fn print_help() {
     println!(
         "QUB RPC Miner {APP_VERSION}\n\n\
 Usage:\n  qub-rpc-miner --rpc http://127.0.0.1:17445 --token-file <path> --address <qub-address> [options]\n  qub-rpc-miner --rpc http://127.0.0.1:17445 --token-file <path> --pool-id <pool-id> [options]\n\n\
-Options:\n  --rpc <url>             HTTP RPC endpoint (default http://127.0.0.1:17445)\n  --token <token>         RPC token (visible in process list; token-file is preferred)\n  --token-file <path>     Read RPC token from a local file\n  --address <address>     Solo payout address\n  --pool-id <hex>         Existing on-chain QUB pool ID\n  --workers <1..128>      Number of independent CPU work jobs\n  --batch <1..128>        Maximum templates requested per round\n  --refresh-secs <2..300> Refresh work after this interval (default 20)\n  --once                  Run a single round / submit at most one candidate\n  --max-rounds <n>        Stop after n rounds\n\n\
+Options:\n  --rpc <url>             HTTP RPC endpoint (default http://127.0.0.1:17445)\n  --token <token>         RPC token (visible in process list; token-file is preferred)\n  --token-file <path>     Read RPC token from a local file\n  --address <address>     Solo payout address\n  --pool-id <hex>         Existing on-chain QUB pool ID\n  --workers <n>           Requested CPU worker threads; no QUB Core software ceiling\n  --batch <1..128>        QUB RPC template-batch size (protocol/server limit, not a CPU cap)\n  --refresh-secs <2..300> Refresh work after this interval (default 20)\n  --once                  Run a single round / submit at most one candidate\n  --max-rounds <n>        Stop after n rounds\n\n\
 Environment:\n  QUB_RPC_URL\n  QUB_RPC_TOKEN\n"
     );
 }
@@ -317,6 +360,16 @@ fn take_switch(args: &mut Vec<String>, name: &str) -> bool {
     } else {
         false
     }
+}
+
+fn parse_usize_unbounded(input: &str, name: &str, min: usize) -> Result<usize> {
+    let value = input
+        .parse::<usize>()
+        .with_context(|| format!("invalid --{name}"))?;
+    if value < min {
+        bail!("--{name} must be at least {min}");
+    }
+    Ok(value)
 }
 
 fn parse_usize(input: &str, name: &str, min: usize, max: usize) -> Result<usize> {
@@ -517,6 +570,8 @@ fn parse_template(value: &Value) -> Result<MiningTemplate> {
 
 fn mine_template(
     template: MiningTemplate,
+    lane_index: usize,
+    lane_count: usize,
     stop: Arc<AtomicBool>,
     total_hashes: Arc<AtomicU64>,
     sender: mpsc::Sender<FoundNonce>,
@@ -525,15 +580,18 @@ fn mine_template(
     header[..76].copy_from_slice(&template.header_prefix);
     let mut pending_hashes = 0u64;
     let mut worker_total = 0u64;
-    let mut nonce = 0u32;
+    let mut nonce = lane_index as u64;
+    let stride = lane_count.max(1) as u64;
+    let nonce_limit = u32::MAX as u64;
 
-    loop {
+    while nonce <= nonce_limit {
         if stop.load(Ordering::Acquire)
             || unix_time_secs().saturating_add(1) >= template.expires_at_unix
         {
             break;
         }
-        header[76..80].copy_from_slice(&nonce.to_le_bytes());
+        let nonce_u32 = nonce as u32;
+        header[76..80].copy_from_slice(&nonce_u32.to_le_bytes());
         let digest = double_sha256(&header);
         pending_hashes = pending_hashes.saturating_add(1);
         worker_total = worker_total.saturating_add(1);
@@ -542,7 +600,7 @@ fn mine_template(
             let _ = sender.send(FoundNonce {
                 job_id: template.job_id,
                 height: template.height,
-                nonce,
+                nonce: nonce_u32,
                 hash_hex: hex::encode(digest),
                 hashes: worker_total,
             });
@@ -553,10 +611,10 @@ fn mine_template(
             total_hashes.fetch_add(pending_hashes, Ordering::AcqRel);
             pending_hashes = 0;
         }
-        if nonce == u32::MAX {
+        let Some(next) = nonce.checked_add(stride) else {
             break;
-        }
-        nonce = nonce.wrapping_add(1);
+        };
+        nonce = next;
     }
     total_hashes.fetch_add(pending_hashes, Ordering::AcqRel);
 }
@@ -627,6 +685,12 @@ mod tests {
         let mut harder = [0u8; 32];
         harder[31] = 0;
         assert!(!hash_meets_target(digest, harder));
+    }
+
+    #[test]
+    fn unbounded_worker_parser_has_no_software_ceiling() {
+        assert_eq!(parse_usize_unbounded("4097", "workers", 1).unwrap(), 4097);
+        assert!(parse_usize_unbounded("0", "workers", 1).is_err());
     }
 
     #[test]

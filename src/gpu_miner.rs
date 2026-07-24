@@ -45,7 +45,7 @@ const CL_DEVICE_GLOBAL_MEM_SIZE: ClUInt = 0x101F;
 const CL_PROGRAM_BUILD_LOG: ClUInt = 0x1183;
 pub const GPU_DEVICE_ALL: &str = "All";
 pub const GPU_DEVICE_ALL_DETECTED: &str = "AllDetected";
-const MAX_GPU_WORK_ITEMS: usize = 2_097_152;
+const AUTO_MAX_GPU_WORK_ITEMS: usize = 2_097_152;
 const HF76_FAST_WORK_ITEMS: usize = 524_288;
 const MIN_GPU_WORK_ITEMS: usize = 4_096;
 const GPU_WORKGROUP_ALIGN: usize = 256;
@@ -62,7 +62,7 @@ pub fn recommended_work_items(gpu_percent: u8) -> usize {
     // batch made some laptop OpenCL drivers throttle hard, even on RTX GPUs.
     let min = MIN_GPU_WORK_ITEMS;
     let fast = HF76_FAST_WORK_ITEMS;
-    let max = MAX_GPU_WORK_ITEMS;
+    let max = AUTO_MAX_GPU_WORK_ITEMS;
     let work = if pct <= 50 {
         fast.saturating_mul(pct).saturating_div(50)
     } else {
@@ -72,11 +72,22 @@ pub fn recommended_work_items(gpu_percent: u8) -> usize {
     align_work_items(work.max(min).min(max))
 }
 
-pub fn initial_work_items(gpu_percent: u8) -> usize {
-    recommended_work_items(gpu_percent).min(HF76_FAST_WORK_ITEMS).max(MIN_GPU_WORK_ITEMS)
+pub fn initial_work_items(gpu_percent: u8, work_items_override: usize) -> usize {
+    if work_items_override > 0 {
+        return align_work_items(work_items_override.max(1));
+    }
+    recommended_work_items(gpu_percent)
+        .min(HF76_FAST_WORK_ITEMS)
+        .max(MIN_GPU_WORK_ITEMS)
 }
 
-pub fn tuning_work_item_candidates(gpu_percent: u8) -> Vec<usize> {
+pub fn tuning_work_item_candidates(
+    gpu_percent: u8,
+    work_items_override: usize,
+) -> Vec<usize> {
+    if work_items_override > 0 {
+        return vec![align_work_items(work_items_override.max(1))];
+    }
     let pct = gpu_percent.clamp(1, 100) as usize;
     let mut candidates = vec![
         HF76_FAST_WORK_ITEMS,
@@ -86,13 +97,13 @@ pub fn tuning_work_item_candidates(gpu_percent: u8) -> Vec<usize> {
     ];
     if pct >= 90 {
         candidates.push(HF76_FAST_WORK_ITEMS.saturating_mul(3));
-        candidates.push(MAX_GPU_WORK_ITEMS);
+        candidates.push(AUTO_MAX_GPU_WORK_ITEMS);
     }
     let requested = recommended_work_items(gpu_percent);
     candidates.push(requested);
     let mut out = Vec::new();
     for candidate in candidates {
-        let aligned = align_work_items(candidate.max(MIN_GPU_WORK_ITEMS).min(MAX_GPU_WORK_ITEMS));
+        let aligned = align_work_items(candidate.max(MIN_GPU_WORK_ITEMS).min(AUTO_MAX_GPU_WORK_ITEMS));
         if aligned >= MIN_GPU_WORK_ITEMS && !out.contains(&aligned) {
             out.push(aligned);
         }
@@ -103,7 +114,7 @@ pub fn tuning_work_item_candidates(gpu_percent: u8) -> Vec<usize> {
 pub fn align_work_items(work_items: usize) -> usize {
     if work_items < GPU_WORKGROUP_ALIGN { return work_items.max(1); }
     let aligned = work_items / GPU_WORKGROUP_ALIGN * GPU_WORKGROUP_ALIGN;
-    aligned.max(GPU_WORKGROUP_ALIGN).min(MAX_GPU_WORK_ITEMS)
+    aligned.max(GPU_WORKGROUP_ALIGN)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -231,7 +242,10 @@ impl OpenClGpuMiner {
             return Ok(GpuScanResult { nonce: None, hashes: 0 });
         }
         let remaining = (u32::MAX as u64 + 1).saturating_sub(start_nonce);
-        let work_items = align_work_items(work_items.max(1).min(MAX_GPU_WORK_ITEMS).min(remaining as usize).max(1));
+        // HF127/v1.8.3: an explicit GUI override is not constrained by the
+        // automatic tuning ceiling. The only hard bound is the remaining u32
+        // nonce range accepted by the block header.
+        let work_items = align_work_items(work_items.max(1).min(remaining as usize).max(1));
         if work_items == 0 {
             return Ok(GpuScanResult { nonce: None, hashes: 0 });
         }
@@ -677,3 +691,22 @@ __kernel void scan_qub_fullsha(__global const uint *midstate,
   }
 }
 "#;
+
+
+#[cfg(test)]
+mod hf127_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_work_item_override_is_not_auto_capped() {
+        let requested = AUTO_MAX_GPU_WORK_ITEMS.saturating_mul(8);
+        assert_eq!(initial_work_items(100, requested), align_work_items(requested));
+        assert_eq!(tuning_work_item_candidates(100, requested), vec![align_work_items(requested)]);
+    }
+
+    #[test]
+    fn work_item_alignment_does_not_apply_a_hidden_ceiling() {
+        let requested = AUTO_MAX_GPU_WORK_ITEMS.saturating_mul(16) + 123;
+        assert!(align_work_items(requested) > AUTO_MAX_GPU_WORK_ITEMS);
+    }
+}

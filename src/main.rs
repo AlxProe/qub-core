@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anyhow::{bail, Context, Result};
 use qubd::*;
 use std::collections::HashMap;
@@ -52,6 +54,8 @@ fn run() -> Result<()> {
         "relay-mempool" => cmd_relay_mempool(&settings),
         "block-relay-status" => cmd_block_relay_status(&settings),
         "relay-pending-block" => cmd_relay_pending_block(&settings),
+        "tx-delivery-status" => cmd_tx_delivery_status(&settings, args.get(1).map(String::as_str)),
+        "relay-pending-txs" => cmd_relay_pending_txs(&settings),
         "send" => cmd_send(&settings, args.get(1).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(2).context("usage: send <address-or-name.qub> <amount> [fee]")?, args.get(3).map(String::as_str).unwrap_or("0.00001")),
         "send-jin" => cmd_send_jin(&settings, args.get(1).context("usage: send-jin <address-or-name.qub> <amount_jin> [fee] [fee_asset=JIN|QUB]")?, args.get(2).context("usage: send-jin <address-or-name.qub> <amount_jin> [fee] [fee_asset=JIN|QUB]")?, args.get(3).map(String::as_str).unwrap_or("0.001"), args.get(4).map(String::as_str).unwrap_or("JIN")),
         "send-multi" => cmd_send_multi(&settings, args.get(1).context("usage: send-multi <asset=QUB|JIN> <entries addr:amount,...> [fee] [fee_asset=JIN|QUB]")?, args.get(2).context("usage: send-multi <asset=QUB|JIN> <entries addr:amount,...> [fee] [fee_asset=JIN|QUB]")?, args.get(3).map(String::as_str).unwrap_or("0.00001"), args.get(4).map(String::as_str).unwrap_or("QUB")),
@@ -125,6 +129,41 @@ fn cmd_relay_pending_block(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn cmd_tx_delivery_status(settings: &Settings, txid: Option<&str>) -> Result<()> {
+    let txid = txid.map(Hash256::from_hex).transpose()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&p2p::tx_delivery_status(settings, txid)?)?
+    );
+    Ok(())
+}
+
+fn cmd_relay_pending_txs(settings: &Settings) -> Result<()> {
+    let reports = p2p::relay_pending_txs_now(settings)?;
+    let attempted = reports.len();
+    let delivered = reports.iter().filter(|report| report.delivered()).count();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "network": settings.network.name,
+            "attempted": attempted,
+            "delivered": delivered,
+            "reports": reports,
+            "hf127_reliable_transaction_delivery": true,
+        }))?
+    );
+    Ok(())
+}
+
+fn hf127_cli_pre_tx_gate(settings: &Settings) -> Result<()> {
+    if settings.p2p.enabled {
+        p2p::hf127_transaction_parent_guard(settings, 60_000)
+            .context("transaction parent/synchronization guard failed")?;
+    }
+    Ok(())
+}
+
 fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<serde_json::Value> {
     let paths = NodePaths::from_settings(settings);
     let now = SystemTime::now()
@@ -146,6 +185,10 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
             "hf125_fork_safe_publication": true,
             "hf126_equal_height_recovery": true,
             "hf126_equal_height_ties_mineable": true,
+            "hf127_reliable_transaction_delivery": true,
+            "hf127_tx_submit_reserve_lane": true,
+            "hf127_low_latency_propagation": true,
+            "hf127_full_power_mining_controls": true,
             "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
             "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
             "hf121_status_fast": true,
@@ -227,6 +270,10 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "hf125_fork_safe_publication": true,
         "hf126_equal_height_recovery": true,
         "hf126_equal_height_ties_mineable": true,
+        "hf127_reliable_transaction_delivery": true,
+        "hf127_tx_submit_reserve_lane": true,
+        "hf127_low_latency_propagation": true,
+        "hf127_full_power_mining_controls": true,
         "generated_at_unix": now,
         "status_generated_at_unix": status.generated_at_unix,
         "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
@@ -419,13 +466,7 @@ fn cmd_jin_sale_list(settings: &Settings) -> Result<()> {
 }
 
 fn cmd_buy_jin(settings: &Settings, listing_id_s: &str, amount: &str, fee: &str) -> Result<()> {
-    // HF74/v1.5.8 compile fix: use the tiered canonical sync helper that exists
-    // in p2p.rs. `sync_chain_once` was an old helper name and breaks the CLI build.
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-buy-jin sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let listing_id = listing_id_s.trim().parse::<u32>()?;
@@ -438,7 +479,7 @@ fn cmd_buy_jin(settings: &Settings, listing_id_s: &str, amount: &str, fee: &str)
         Amount::from_str(fee.trim())?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-buy-jin");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-buy-jin")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -446,6 +487,7 @@ fn cmd_buy_jin(settings: &Settings, listing_id_s: &str, amount: &str, fee: &str)
             "txid": txid.to_string(),
             "listing_id": listing_id,
             "amount_jin": format_jin_amount(units),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -486,6 +528,7 @@ fn cmd_qub_jin_infusion(settings: &Settings) -> Result<()> {
 }
 
 fn cmd_infuse_jin_qub(settings: &Settings, amount: &str, fee: &str) -> Result<()> {
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let units = parse_jin_amount(amount.trim())?;
@@ -497,13 +540,14 @@ fn cmd_infuse_jin_qub(settings: &Settings, amount: &str, fee: &str) -> Result<()
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-infuse-jin-qub");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-infuse-jin-qub")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "txid": txid.to_string(),
             "amount_jin": format_jin_amount(units),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -517,6 +561,7 @@ fn cmd_melt_qub_jin(
     fee: &str,
     min_jin: Option<&str>,
 ) -> Result<()> {
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let qub_amount = Amount::from_str(amount.trim())?;
@@ -533,7 +578,7 @@ fn cmd_melt_qub_jin(
         min_units,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-melt-qub-jin");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-melt-qub-jin")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -542,6 +587,7 @@ fn cmd_melt_qub_jin(
             "melt_qub": qub_amount.to_string(),
             "expected_jin": format_jin_amount(expected),
             "min_jin": format_jin_amount(min_units),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -580,11 +626,28 @@ fn cmd_relay_mempool(settings: &Settings) -> Result<()> {
         }
     }
     let txs = chain.mempool.len();
-    let peers_total = p2p::rebroadcast_local_mempool(settings, 512)?;
+    // HF127/v1.8.3: ordinary wallet/protocol transactions use explicit
+    // acknowledgement-based delivery. Keep one legacy fair-batch fanout for
+    // pool shares and older peers, but report it as socket-write compatibility
+    // traffic rather than peer acceptance.
+    let reliable_reports = p2p::relay_pending_txs_now(settings)?;
+    let reliable_attempted = reliable_reports.len();
+    let reliable_delivered = reliable_reports
+        .iter()
+        .filter(|report| report.delivered())
+        .count();
+    let acknowledged = reliable_reports
+        .iter()
+        .map(|report| report.acknowledged())
+        .sum::<usize>();
+    let legacy_batch_writes = p2p::rebroadcast_local_mempool(settings, 512)?;
     println!("mempooltx: {txs}");
-    println!("relayed_tx_peer_deliveries: {peers_total}");
-    if txs > 0 && peers_total == 0 {
-        eprintln!("WARNING: no peers accepted outbound relay; check peers/connectivity or keep this node mining.");
+    println!("reliable_pending_attempted: {reliable_attempted}");
+    println!("reliable_pending_delivered: {reliable_delivered}");
+    println!("acknowledged_by_peers: {acknowledged}");
+    println!("legacy_batch_tx_peer_writes: {legacy_batch_writes}");
+    if txs > 0 && reliable_delivered == 0 && legacy_batch_writes == 0 {
+        eprintln!("WARNING: no acknowledgement or compatibility relay write succeeded; the durable HF127 delivery worker will keep retrying ordinary transactions.");
     }
     Ok(())
 }
@@ -593,29 +656,39 @@ fn hf117_remember_and_relay_cli_tx(
     settings: &Settings,
     chain: &ChainState,
     tx: &Transaction,
-    txid: Hash256,
+    _txid: Hash256,
     label: &str,
-) -> usize {
-    // HF117/v1.7.8: CLI sends use the same raw-tx outbox and exact bounded
-    // relay as the GUI. If a tx is mined into a stale block and later becomes
-    // NotFound, wallet-pending-txs.json still has the raw transaction for
-    // deterministic reaccept/rebroadcast once the inputs are valid again.
-    let _ = remember_pending_tx(settings, chain, tx, label);
-    let mut relayed = p2p::broadcast_tx_limited(settings, tx, 24, 850).unwrap_or(0);
-    for _ in 0..2 {
-        relayed = relayed
-            .saturating_add(p2p::rebroadcast_txid_limited(settings, &txid, 24, 850).unwrap_or(0));
-        thread::sleep(std::time::Duration::from_millis(120));
+) -> Result<usize> {
+    // HF127/v1.8.3: remember the exact raw transaction before any network
+    // attempt, then report only explicit accepted/already-known/confirmed
+    // acknowledgements. Legacy socket writes remain compatibility attempts but
+    // are never presented as confirmed network delivery.
+    if is_pool_share_transaction(tx) {
+        return Ok(p2p::broadcast_tx_limited(settings, tx, 8, 850).unwrap_or(0));
     }
-    relayed
-}
-fn cmd_send(settings: &Settings, to: &str, amount: &str, fee: &str) -> Result<()> {
-    // Make sure coin selection is based on the current active chain before signing.
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-send sync warning: {err:#}");
+    // Do not claim reliable delivery unless the exact raw transaction is first
+    // durable in the wallet outbox. A corrupt/unwritable outbox is a hard error,
+    // not a warning that may silently strand the payment after process exit.
+    remember_pending_tx(settings, chain, tx, label)
+        .context("could not persist the reliable transaction outbox")?;
+    match p2p::broadcast_tx_confirmed(settings, tx) {
+        Ok(report) => {
+            if report.delivered() {
+                eprintln!("HF127 transaction delivery acknowledged: {}", report.summary());
+            } else {
+                eprintln!("HF127 transaction delivery pending automatic retry: {}", report.summary());
+            }
+            Ok(report.acknowledged())
+        }
+        Err(err) => {
+            eprintln!("HF127 transaction delivery attempt failed; durable retry remains active: {err:#}");
+            Ok(0)
         }
     }
+}
+
+fn cmd_send(settings: &Settings, to: &str, amount: &str, fee: &str) -> Result<()> {
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let to = resolve_address_or_qns(settings, &chain, to)?;
@@ -627,18 +700,14 @@ fn cmd_send(settings: &Settings, to: &str, amount: &str, fee: &str) -> Result<()
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-send-qub");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-send-qub")?;
     save_chain(settings, &chain)?;
     println!("txid: {txid}");
     println!("local_mempooltx: {}", chain.mempool.len());
+    println!("acknowledged_by_peers: {relayed}");
     println!("relayed_to_peers: {relayed}");
     if relayed == 0 {
-        eprintln!("WARNING: transaction is only in this local mempool/outbox until a peer is reachable or this node mines a block.");
-    }
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 6_000) {
-            eprintln!("p2p post-send sync warning: {err:#}");
-        }
+        eprintln!("WARNING: no explicit peer acknowledgement yet; the durable HF127 delivery worker will retry automatically.");
     }
     Ok(())
 }
@@ -649,11 +718,7 @@ fn cmd_send_jin(
     fee: &str,
     fee_asset: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-send sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let to = resolve_address_or_qns(settings, &chain, to)?;
@@ -674,13 +739,14 @@ fn cmd_send_jin(
         &fee_asset,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-send-jin");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-send-jin")?;
     save_chain(settings, &chain)?;
     println!("txid: {txid}");
     println!("asset: JIN");
     println!("amount_jin: {}", format_jin_amount(amount_units));
     println!("fee_asset: {fee_asset}");
     println!("local_mempooltx: {}", chain.mempool.len());
+    println!("acknowledged_by_peers: {relayed}");
     println!("relayed_to_peers: {relayed}");
     Ok(())
 }
@@ -725,11 +791,7 @@ fn cmd_send_multi(
     fee: &str,
     fee_asset: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-multi-send sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let asset = asset.trim().to_ascii_uppercase();
@@ -771,7 +833,7 @@ fn cmd_send_multi(
     } else {
         "cli-multi-send-qub"
     };
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, label);
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, label)?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -779,6 +841,7 @@ fn cmd_send_multi(
             "txid": txid.to_string(),
             "asset": asset,
             "entries": parsed.len(),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -799,11 +862,7 @@ fn cmd_blast_create(
     code_opt: Option<&str>,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-blast sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let code = code_opt
@@ -821,7 +880,7 @@ fn cmd_blast_create(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-blast-create-qub");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-blast-create-qub")?;
     save_chain(settings, &chain)?;
     let claim_code = make_blast_code_payload(txid, 0, &code)?;
     println!(
@@ -837,6 +896,7 @@ fn cmd_blast_create(
             "per_claim_qub": per_claim,
             "max_claims": max_claims,
             "warning": "Blast code is private until first on-chain claim. For public campaigns, generate separate one-time codes; a single public code can be copied after first claim.",
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -845,11 +905,7 @@ fn cmd_blast_create(
 }
 
 fn cmd_blast_claim(settings: &Settings, claim_code: &str, claimant: Option<&str>) -> Result<()> {
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-blast-claim sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let claimant = match claimant {
@@ -864,13 +920,14 @@ fn cmd_blast_claim(settings: &Settings, claim_code: &str, claimant: Option<&str>
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-blast-claim-qub");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-blast-claim-qub")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "txid": txid.to_string(),
             "asset": "QUB",
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len()
         }))?
@@ -925,9 +982,7 @@ fn cmd_library_create(
     body: &str,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let price_atoms = library_post_price_atoms(settings, title, category, body)?;
@@ -941,12 +996,12 @@ fn cmd_library_create(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-create");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-create")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "post_id": txid.to_string(), "protocol_fee_to_miner_atoms": price_atoms, "protocol_fee_to_miner_qub": Amount::from_atoms(price_atoms)?.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
+            &serde_json::json!({"txid": txid.to_string(), "post_id": txid.to_string(), "protocol_fee_to_miner_atoms": price_atoms, "protocol_fee_to_miner_qub": Amount::from_atoms(price_atoms)?.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
         )?
     );
     Ok(())
@@ -959,9 +1014,7 @@ fn cmd_library_comment(
     parent: Option<&str>,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let parent = parent.and_then(|p| {
@@ -981,12 +1034,12 @@ fn cmd_library_comment(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-comment");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-comment")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "comment_id": txid.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
+            &serde_json::json!({"txid": txid.to_string(), "comment_id": txid.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
         )?
     );
     Ok(())
@@ -999,9 +1052,7 @@ fn cmd_library_vote(
     vote: &str,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let vote = vote.trim().eq_ignore_ascii_case("up") || vote.trim() == "+";
@@ -1015,12 +1066,12 @@ fn cmd_library_vote(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-action");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-action")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
+            &serde_json::json!({"txid": txid.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
         )?
     );
     Ok(())
@@ -1035,9 +1086,7 @@ fn cmd_library_edit(
     body: &str,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let tx = wallet.create_library_edit_transaction(
@@ -1051,21 +1100,19 @@ fn cmd_library_edit(
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-edit");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-edit")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
+            &serde_json::json!({"txid": txid.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
         )?
     );
     Ok(())
 }
 
 fn cmd_library_delete(settings: &Settings, kind: &str, target_id: &str, fee: &str) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let tx = wallet.create_library_delete_transaction(
@@ -1077,12 +1124,12 @@ fn cmd_library_delete(settings: &Settings, kind: &str, target_id: &str, fee: &st
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-delete");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-library-delete")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len(), "note": "Library delete is a consensus tombstone; historical chain bytes remain immutable."})
+            &serde_json::json!({"txid": txid.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len(), "note": "Library delete is a consensus tombstone; historical chain bytes remain immutable."})
         )?
     );
     Ok(())
@@ -1095,11 +1142,7 @@ fn cmd_convert_jin_token(
     fee: &str,
     fee_asset: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        if let Err(err) = p2p::hf82_auto_catchup(settings, 8_000) {
-            eprintln!("p2p pre-conversion sync warning: {err:#}");
-        }
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let fee_asset = fee_asset.trim().to_ascii_uppercase();
@@ -1120,7 +1163,7 @@ fn cmd_convert_jin_token(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-convert-jin-token");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-convert-jin-token")?;
     save_chain(settings, &chain)?;
     println!("txid: {txid}");
     println!("type: JIN Coin -> JIN Token conversion");
@@ -1128,6 +1171,7 @@ fn cmd_convert_jin_token(
     println!("amount_jin: {}", format_jin_amount(amount_units));
     println!("fee_asset: {fee_asset}");
     println!("local_mempooltx: {}", chain.mempool.len());
+    println!("acknowledged_by_peers: {relayed}");
     println!("relayed_to_peers: {relayed}");
     Ok(())
 }
@@ -1198,9 +1242,7 @@ fn cmd_qns_register(
     target_address: Option<&str>,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let target = match target_address {
@@ -1222,12 +1264,12 @@ fn cmd_qns_register(
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-qns-register");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-qns-register")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
         serde_json::to_string_pretty(
-            &serde_json::json!({"txid": txid.to_string(), "name": normalized, "target_address": target.to_string(), "price_qub": Amount::from_atoms(price)?.to_string(), "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
+            &serde_json::json!({"txid": txid.to_string(), "name": normalized, "target_address": target.to_string(), "price_qub": Amount::from_atoms(price)?.to_string(), "acknowledged_by_peers": relayed, "relayed_to_peers": relayed, "local_mempooltx": chain.mempool.len()})
         )?
     );
     Ok(())
@@ -1301,9 +1343,7 @@ fn cmd_pool_create(
     manager_address: Option<&str>,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let commission_bps = commission_bps_s.parse::<u16>()?;
@@ -1333,7 +1373,7 @@ fn cmd_pool_create(
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-create");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-create")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -1348,6 +1388,7 @@ fn cmd_pool_create(
             "price_qub": Amount::from_atoms(price)?.to_string(),
             "protocol_atoms": pool_protocol_share_atoms(price),
             "miner_split_atoms": pool_miner_share_atoms(price),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len(),
         }))?
@@ -1361,9 +1402,7 @@ fn cmd_pool_top_up(
     extra_slots_s: &str,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let pool_id = Hash256::from_hex(pool_id_s)?;
@@ -1377,7 +1416,7 @@ fn cmd_pool_top_up(
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-top-up");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-top-up")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -1389,6 +1428,7 @@ fn cmd_pool_top_up(
             "price_qub": Amount::from_atoms(price)?.to_string(),
             "protocol_atoms": pool_protocol_share_atoms(price),
             "miner_split_atoms": pool_miner_share_atoms(price),
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len(),
         }))?
@@ -1402,9 +1442,7 @@ fn cmd_pool_set_commission(
     new_bps_s: &str,
     fee: &str,
 ) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let pool_id = Hash256::from_hex(pool_id_s)?;
@@ -1418,7 +1456,7 @@ fn cmd_pool_set_commission(
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let relayed =
-        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-set-commission");
+        hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-set-commission")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -1426,6 +1464,7 @@ fn cmd_pool_set_commission(
             "txid": txid.to_string(),
             "pool_id": pool_id.to_string(),
             "new_commission_bps": new_bps,
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len(),
         }))?
@@ -1434,9 +1473,7 @@ fn cmd_pool_set_commission(
 }
 
 fn cmd_pool_rename(settings: &Settings, pool_id_s: &str, new_name: &str, fee: &str) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let pool_id = Hash256::from_hex(pool_id_s)?;
@@ -1453,7 +1490,7 @@ fn cmd_pool_rename(settings: &Settings, pool_id_s: &str, new_name: &str, fee: &s
         Amount::from_str(fee)?,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-rename");
+    let relayed = hf117_remember_and_relay_cli_tx(settings, &chain, &tx, txid, "cli-pool-rename")?;
     save_chain(settings, &chain)?;
     println!(
         "{}",
@@ -1461,6 +1498,7 @@ fn cmd_pool_rename(settings: &Settings, pool_id_s: &str, new_name: &str, fee: &s
             "txid": txid.to_string(),
             "pool_id": pool_id.to_string(),
             "new_name": normalized,
+            "acknowledged_by_peers": relayed,
             "relayed_to_peers": relayed,
             "local_mempooltx": chain.mempool.len(),
         }))?
@@ -1547,15 +1585,13 @@ fn create_local_pool_share(
         nonce,
     )?;
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
-    let _ = hf117_remember_and_relay_cli_tx(settings, chain, &tx, txid, "cli-pool-share");
+    let _ = hf117_remember_and_relay_cli_tx(settings, chain, &tx, txid, "cli-pool-share")?;
     save_chain(settings, chain)?;
     Ok((txid, nonce))
 }
 
 fn cmd_pool_join(settings: &Settings, pool_id_s: &str, miner_address: Option<&str>) -> Result<()> {
-    if settings.p2p.enabled {
-        let _ = p2p::hf82_auto_catchup(settings, 8_000);
-    }
+    hf127_cli_pre_tx_gate(settings)?;
     let mut chain = load_or_init_chain(settings)?;
     let wallet = load_or_init_wallet(settings)?;
     let pool_id = Hash256::from_hex(pool_id_s)?;
@@ -2624,7 +2660,7 @@ fn explorer_route(
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.2",
+            "version": "1.8.3",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -3449,5 +3485,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.2\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.3\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

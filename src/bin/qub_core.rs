@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.2";
+const APP_VERSION: &str = "v1.8.3";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -75,6 +75,7 @@ const UPDATE_CHECK_INTERVAL_SECS: u64 = 60;
 const UPDATE_INSTALL_COUNTDOWN_SECS: u64 = 15;
 const UPDATE_DOWNLOAD_PATH: &str = "data/updater/QUB-Core-Latest.exe";
 const DEFAULT_WALLET_SYNC_INTERVAL_SECS: u64 = 15;
+const HF127_HIGH_POWER_WARNING_PERCENT: u8 = 85;
 const ENJIN_MATRIX_METRICS_REFRESH_SECS: u64 = 300;
 const ENJIN_MATRIX_JIN_INITIAL_MAX_SUPPLY: u128 = 105_000_000;
 const ENJIN_MATRIX_RPC_URLS: &[&str] = &[
@@ -818,6 +819,16 @@ struct GuiPrefs {
     payout_address: String,
     cpu_percent: u8,
     gpu_percent: u8,
+    /// HF127/v1.8.3: zero uses the automatic logical-CPU plan; non-zero is an
+    /// explicit user-selected worker count with no QUB Core software ceiling.
+    cpu_worker_override: usize,
+    /// Zero uses safe GPU auto-tuning; non-zero is the exact OpenCL work-item
+    /// batch requested per selected device.
+    gpu_work_items_override: usize,
+    /// Session-only acknowledgement. It is deliberately not persisted: every
+    /// QUB Core launch requires an explicit confirmation before high-power mode.
+    #[serde(skip)]
+    confirm_unrestricted_mining_risk: bool,
     gpu_device_selector: String,
     theme: ThemeChoice,
     language: UiLanguage,
@@ -885,6 +896,13 @@ struct GuiPrefs {
 }
 
 
+fn hf127_unrestricted_mining_requested(prefs: &GuiPrefs) -> bool {
+    prefs.cpu_percent >= HF127_HIGH_POWER_WARNING_PERCENT
+        || prefs.gpu_percent >= HF127_HIGH_POWER_WARNING_PERCENT
+        || prefs.cpu_worker_override > 0
+        || (prefs.gpu_percent > 0 && prefs.gpu_work_items_override > 0)
+}
+
 impl Default for GuiPrefs {
     fn default() -> Self {
         Self {
@@ -892,6 +910,9 @@ impl Default for GuiPrefs {
             payout_address: String::new(),
             cpu_percent: 50,
             gpu_percent: 0,
+            cpu_worker_override: 0,
+            gpu_work_items_override: 0,
+            confirm_unrestricted_mining_risk: false,
             gpu_device_selector: gpu_miner::GPU_DEVICE_ALL.to_string(),
             theme: ThemeChoice::Dark,
             language: default_ui_language(),
@@ -1781,6 +1802,7 @@ fn tr_ko(en: &'static str) -> &'static str { en }
 impl QubCoreApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut prefs = load_gui_prefs().unwrap_or_default();
+        prefs.confirm_unrestricted_mining_risk = false;
         prefs.language = UiLanguage::EnUs; // v1.5.2 safety: temporarily disable broken localized rendering.
         if let Some(config_path) = cli_config_path() {
             prefs.config_path = config_path;
@@ -2807,7 +2829,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.send_dialog.message = format!("Pending in local mempool. relayed_to_peers={}. Waiting for a miner to include it in a block.", self.send_dialog.relayed_to_peers);
+                    self.send_dialog.message = format!("Pending in local mempool. acknowledged_by_peers={}. Durable delivery retry remains active until confirmation.", self.send_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.send_dialog.message = "Transaction is not visible in the local active chain or mempool yet. QUB Core will keep checking in the background.".to_string();
@@ -2825,7 +2847,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.conversion_dialog.message = format!("Pending in local mempool. relayed_to_peers={}. Waiting for a miner to include it in a block.", self.conversion_dialog.relayed_to_peers);
+                    self.conversion_dialog.message = format!("Pending in local mempool. acknowledged_by_peers={}. Durable delivery retry remains active until confirmation.", self.conversion_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.conversion_dialog.message = "Conversion request is not visible in the local active chain or mempool yet. QUB Core will keep checking in the background.".to_string();
@@ -2844,7 +2866,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.qub_jin_dialog.message = format!("{} pending in local mempool. relayed_to_peers={}. HF117 exact rebroadcast remains active until confirmation.", self.qub_jin_dialog.mode.pending_label(), self.qub_jin_dialog.relayed_to_peers);
+                    self.qub_jin_dialog.message = format!("{} pending in local mempool. acknowledged_by_peers={}. Durable HF127 delivery retry remains active until confirmation.", self.qub_jin_dialog.mode.pending_label(), self.qub_jin_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.qub_jin_dialog.message = format!("{} is not visible locally yet. QUB Core will keep checking and recovering it from wallet-pending-txs.json if it is still valid.", self.qub_jin_dialog.mode.pending_label());
@@ -2864,7 +2886,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.buy_jin_dialog.message = format!("JIN purchase pending in local mempool. Relayed to {} peer(s). Waiting for confirmation.", self.buy_jin_dialog.relayed_to_peers);
+                    self.buy_jin_dialog.message = format!("JIN purchase pending in local mempool. Acknowledged by {} peer(s). Durable delivery retry remains active until confirmation.", self.buy_jin_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.buy_jin_dialog.message = "JIN purchase is not visible locally yet. QUB Core will keep checking in the background.".to_string();
@@ -2880,7 +2902,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.qns_dialog.message = format!("Pending in local mempool. relayed_to_peers={}. Waiting for a miner to include it in a block.", self.qns_dialog.relayed_to_peers);
+                    self.qns_dialog.message = format!("Pending in local mempool. acknowledged_by_peers={}. Durable delivery retry remains active until confirmation.", self.qns_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.qns_dialog.message = "Registration tx is not visible in the local active chain or mempool yet. QUB Core will keep checking in the background.".to_string();
@@ -2898,7 +2920,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.start_background_snapshot_refresh();
                 }
                 TxUiStatus::PendingMempool => {
-                    self.pool_dialog.message = format!("Pool {} pending in local mempool. Relayed to {} peer(s). Waiting for confirmation.", self.pool_dialog.action, self.pool_dialog.relayed_to_peers);
+                    self.pool_dialog.message = format!("Pool {} pending in local mempool. Acknowledged by {} peer(s). Durable delivery retry remains active until confirmation.", self.pool_dialog.action, self.pool_dialog.relayed_to_peers);
                 }
                 TxUiStatus::NotFound => {
                     self.pool_dialog.message = "Pool transaction/share is not visible in the active chain or local mempool yet. QUB Core will keep checking.".to_string();
@@ -3517,8 +3539,21 @@ del "%~f0"
             self.set_mining_phase(MiningPhase::Off);
             return;
         }
+        if hf127_unrestricted_mining_requested(&self.prefs)
+            && !self.prefs.confirm_unrestricted_mining_risk
+        {
+            self.last_error = Some(
+                "High-power mining requires the red hardware-risk confirmation in Mining controls."
+                    .to_string(),
+            );
+            self.status_line = "Mining blocked until high-power risk is confirmed.".to_string();
+            self.set_mining_phase(MiningPhase::Off);
+            return;
+        }
         let cpu_percent = self.prefs.cpu_percent.clamp(1, 100);
         let gpu_percent = self.prefs.gpu_percent.clamp(0, 100);
+        let cpu_worker_override = self.prefs.cpu_worker_override;
+        let gpu_work_items_override = self.prefs.gpu_work_items_override;
         let gpu_device_selector = self.normalized_gpu_device_selector();
         if gpu_percent > 0 {
             self.status_line = format!("OpenCL GPU mining enabled at {}% on {}. CPU mining remains active and every GPU-found block is CPU-verified before submit.", gpu_percent, self.gpu_selector_status_label());
@@ -3539,7 +3574,20 @@ del "%~f0"
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let join = thread::spawn(move || run_miner(config_path, payout, cpu_percent, gpu_percent, gpu_device_selector, pace_to_target_spacing, tx, thread_stop));
+        let join = thread::spawn(move || {
+            run_miner(
+                config_path,
+                payout,
+                cpu_percent,
+                gpu_percent,
+                cpu_worker_override,
+                gpu_work_items_override,
+                gpu_device_selector,
+                pace_to_target_spacing,
+                tx,
+                thread_stop,
+            )
+        });
         self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
         self.status_line = "Starting solo miner in background: running QUB Core bounded green-light catch-up, then preparing the first candidate...".to_string();
         self.last_success = None;
@@ -3902,7 +3950,7 @@ del "%~f0"
                 self.conversion_dialog.status = SendDialogStatus::Pending;
                 self.conversion_dialog.txid = txid.clone();
                 self.conversion_dialog.relayed_to_peers = relayed_to_peers;
-                self.conversion_dialog.message = format!("Conversion request created, added to local mempool, and relayed to {relayed_to_peers} peer(s). Local mempool tx: {local_mempooltx}. Waiting for block confirmation.");
+                self.conversion_dialog.message = format!("Conversion request created, added to local mempool, and explicitly acknowledged by {relayed_to_peers} peer(s). Local mempool tx: {local_mempooltx}. Waiting for block confirmation.");
                 self.status_line = "JIN Coin -> Token conversion request is pending confirmation.".to_string();
                 self.last_success = Some(format!("Conversion request pending: {}", shorten_hash(&txid)));
                 self.conversion_rx = None;
@@ -4844,8 +4892,21 @@ del "%~f0"
             return;
         }
         let config_path = self.prefs.config_path.clone();
+        if hf127_unrestricted_mining_requested(&self.prefs)
+            && !self.prefs.confirm_unrestricted_mining_risk
+        {
+            self.last_error = Some(
+                "High-power mining requires the red hardware-risk confirmation in Mining controls."
+                    .to_string(),
+            );
+            self.status_line = "Mining blocked until high-power risk is confirmed.".to_string();
+            self.set_mining_phase(MiningPhase::Off);
+            return;
+        }
         let cpu_percent = self.prefs.cpu_percent.clamp(1, 100);
         let gpu_percent = self.prefs.gpu_percent.clamp(0, 100);
+        let cpu_worker_override = self.prefs.cpu_worker_override;
+        let gpu_work_items_override = self.prefs.gpu_work_items_override;
         let gpu_device_selector = self.normalized_gpu_device_selector();
         self.gpu_hash_rate_hps = 0.0;
         self.gpu_total_hashes = 0;
@@ -4857,7 +4918,20 @@ del "%~f0"
         let thread_stop = stop.clone();
         let pool_for_thread = pool_id.trim().to_string();
         let pool_for_status = pool_for_thread.clone();
-        let join = thread::spawn(move || run_pool_miner(config_path, pool_for_thread, miner_address, cpu_percent, gpu_percent, gpu_device_selector, tx, thread_stop));
+        let join = thread::spawn(move || {
+            run_pool_miner(
+                config_path,
+                pool_for_thread,
+                miner_address,
+                cpu_percent,
+                gpu_percent,
+                cpu_worker_override,
+                gpu_work_items_override,
+                gpu_device_selector,
+                tx,
+                thread_stop,
+            )
+        });
         self.pool_mining_pool_id = pool_for_status.clone();
         self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
         self.status_line = format!("Pool miner starting for {}: running fork-safety sync, submitting/confirming share, then preparing candidates...", shorten_hash(&pool_for_status));
@@ -5604,7 +5678,7 @@ del "%~f0"
                             ui.monospace(shorten_hash(&self.qub_jin_dialog.txid));
                             self.ui_explorer_entity_button(ui, "tx", &self.qub_jin_dialog.txid, "Open pending QUB/JIN transaction in QUB Explorer");
                         });
-                        ui.small(format!("Local mempool txs: {} | Relayed peers: {}", self.qub_jin_dialog.local_mempooltx, self.qub_jin_dialog.relayed_to_peers));
+                        ui.small(format!("Local mempool txs: {} | Acknowledged peers: {}", self.qub_jin_dialog.local_mempooltx, self.qub_jin_dialog.relayed_to_peers));
                         if ui.button("Keep open / refresh status").clicked() {
                             self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
                         }
@@ -6289,7 +6363,7 @@ del "%~f0"
         ui.add_space(10.0);
         match self.send_dialog.status {
             SendDialogStatus::Editing => {
-                ui.small("The transaction will be signed locally, added to your mempool, relayed to peers, then tracked until confirmed. If you type a .qub name, use Resolve QNS first to verify the destination address before sending.");
+                ui.small("The transaction will be signed locally, added to your mempool, submitted with explicit peer acknowledgements, then tracked until confirmed. If you type a .qub name, use Resolve QNS first to verify the destination address before sending.");
                 if self.send_dialog.asset.eq_ignore_ascii_case("JIN") {
                     ui.small("Safety: JIN transfer source is selected by address, not by total-wallet balance. The source address must have enough JIN plus tiny spendable QUB dust for the marker/authorization. JIN fee asset remains supported when enabled.");
                 }
@@ -7286,19 +7360,104 @@ impl QubCoreApp {
 
             ui.add_space(12.0);
             let old_cpu = self.prefs.cpu_percent;
-            ui.horizontal(|ui| { self.ui_icon(ui, "cpu", 16.0); ui.add(egui::Slider::new(&mut self.prefs.cpu_percent, 1..=100).text("CPU power %")); });
-            if self.prefs.cpu_percent != old_cpu { self.prefs_dirty = true; }
+            let old_cpu_override = self.prefs.cpu_worker_override;
+            ui.horizontal(|ui| {
+                self.ui_icon(ui, "cpu", 16.0);
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.cpu_percent, 1..=100)
+                        .text("CPU power %"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.prefs.cpu_percent)
+                        .range(1..=100)
+                        .suffix("%"),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("CPU worker override");
+                let cpu_override_prefix = if self.prefs.cpu_worker_override == 0 {
+                    "Auto "
+                } else {
+                    ""
+                };
+                ui.add(
+                    egui::DragValue::new(&mut self.prefs.cpu_worker_override)
+                        .speed(1.0)
+                        .prefix(cpu_override_prefix),
+                );
+                ui.small("0 = automatic; any positive value is the requested exact worker count. CPU power % still controls worker duty.");
+            });
+            if self.prefs.cpu_percent != old_cpu
+                || self.prefs.cpu_worker_override != old_cpu_override
+            {
+                self.prefs.confirm_unrestricted_mining_risk = false;
+                self.prefs_dirty = true;
+            }
             ui.horizontal(|ui| {
                 let logical = logical_cpus();
-                let (threads, duty) = resource_plan(logical, self.prefs.cpu_percent);
-                ui.small(format!("Plan: {threads}/{logical} worker(s), {duty}% duty"));
+                let (threads, duty) = resource_plan(
+                    logical,
+                    self.prefs.cpu_percent,
+                    self.prefs.cpu_worker_override,
+                );
+                ui.small(format!(
+                    "Plan: {threads} worker(s) on {logical} logical CPU(s), {duty}% duty"
+                ));
             });
             ui.add_space(4.0);
+            let old_gpu = self.prefs.gpu_percent;
+            let old_gpu_override = self.prefs.gpu_work_items_override;
             ui.horizontal(|ui| {
                 self.ui_icon(ui, "gpu", 16.0);
-                let response = ui.add_enabled(true, egui::Slider::new(&mut self.prefs.gpu_percent, 0..=100).text("GPU power %"));
-                if response.changed() { self.prefs_dirty = true; }
+                ui.add(
+                    egui::Slider::new(&mut self.prefs.gpu_percent, 0..=100)
+                        .text("GPU power %"),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.prefs.gpu_percent)
+                        .range(0..=100)
+                        .suffix("%"),
+                );
             });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("GPU work-item override / device");
+                ui.add(
+                    egui::DragValue::new(&mut self.prefs.gpu_work_items_override)
+                        .speed(4096.0),
+                );
+                ui.small("0 = safe auto-tuning; a positive value bypasses the automatic batch ceiling.");
+            });
+            if self.prefs.gpu_percent != old_gpu
+                || self.prefs.gpu_work_items_override != old_gpu_override
+            {
+                self.prefs.confirm_unrestricted_mining_risk = false;
+                self.prefs_dirty = true;
+            }
+
+            if hf127_unrestricted_mining_requested(&self.prefs) {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(64, 8, 8))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::RED))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "HIGH-POWER / UNRESTRICTED MINING (85%+ OR ANY MANUAL OVERRIDE) CAN CAUSE EXTREME HEAT, FAN NOISE, BATTERY OR PSU STRESS, DRIVER CRASHES, SYSTEM INSTABILITY AND HARDWARE DAMAGE. MONITOR TEMPERATURES, POWER DELIVERY AND COOLING.",
+                            )
+                            .strong()
+                            .color(egui::Color32::RED),
+                        );
+                        if ui
+                            .checkbox(
+                                &mut self.prefs.confirm_unrestricted_mining_risk,
+                                "I understand the hardware and stability risks and explicitly authorize unrestricted mining power",
+                            )
+                            .changed()
+                        {
+                            self.prefs_dirty = true;
+                        }
+                    });
+            }
 
             if self.gpu_device_options.is_empty() && self.gpu_device_last_scan.elapsed() > Duration::from_secs(15) {
                 self.refresh_gpu_devices();
@@ -10910,52 +11069,43 @@ fn qub_jin_action_preview_for_gui(config_path: &str, mode: QubJinMode, amount: &
     Ok(lines)
 }
 
-fn hf79_pre_tx_fast_sync(settings: &Settings) {
-    if !settings.p2p.enabled { return; }
-    // QUB Core/v1.6.9: transaction builders run in worker threads. Use the same
-    // bounded self-healing catch-up path as mining so sends and normal actions are signed
-    // against a fresh ledger even when the local node was parked behind.
-    let _ = p2p::hf90_auto_catchup(settings, 45_000);
-    // HF117: recover/rebroadcast exact wallet outbox txs only. Avoid a generic
-    // whole-mempool burst right before signing/sending a new transaction.
+fn hf127_pre_tx_canonical_gate(settings: &Settings, timeout_ms: u64) -> Result<()> {
+    p2p::hf127_transaction_parent_guard(settings, timeout_ms)?;
+    Ok(())
+}
+
+fn hf79_pre_tx_fast_sync(settings: &Settings) -> Result<()> {
+    hf127_pre_tx_canonical_gate(settings, 45_000)?;
     hf117_pre_tx_outbox_recovery(settings);
+    Ok(())
 }
 
-fn hf114_pre_jin_buy_sync(settings: &Settings) {
-    if !settings.p2p.enabled { return; }
-    // HF114: JIN buys must sync/re-anchor before signing, but must not trigger a
-    // whole-mempool rebroadcast burst that competes with mining relay right after
-    // the user presses Buy. Exact-tx relay happens after the buy is accepted.
-    let _ = p2p::hf90_auto_catchup(settings, 30_000);
+fn hf114_pre_jin_buy_sync(settings: &Settings) -> Result<()> {
+    hf127_pre_tx_canonical_gate(settings, 30_000)
 }
 
-fn hf119_pre_qub_jin_action_sync(settings: &Settings) {
-    if !settings.p2p.enabled { return; }
-    // HF119/v1.7.8: QUB/JIN Infuse/Melt needs a fresh local ledger, but the GUI
-    // action worker must not sit in the long generic pre-send path. Use a shorter
-    // bounded catch-up and then recover only exact wallet-outbox transactions.
-    let _ = p2p::hf90_auto_catchup(settings, 18_000);
+fn hf119_pre_qub_jin_action_sync(settings: &Settings) -> Result<()> {
+    hf127_pre_tx_canonical_gate(settings, 18_000)?;
     hf117_pre_tx_outbox_recovery(settings);
+    Ok(())
 }
 
-fn hf117_relay_exact_wallet_tx(settings: &Settings, tx: &Transaction, txid: &Hash256) -> usize {
-    if !settings.p2p.enabled { return 0; }
+fn hf117_relay_exact_wallet_tx(
+    settings: &Settings,
+    tx: &Transaction,
+    _txid: &Hash256,
+) -> usize {
+    if !settings.p2p.enabled {
+        return 0;
+    }
     if is_pool_share_transaction(tx) {
-        // HF124/v1.8.1: shares are frequent, short-lived work markers. One
-        // bounded relay fanout plus the node's six-second fair relay heartbeat
-        // is sufficient; the old 3 x 24-peer wallet retry path amplified every
-        // share into dozens of new connections.
         return p2p::broadcast_tx_limited(settings, tx, 8, 450).unwrap_or(0);
     }
-    // HF117/v1.7.8: exact, bounded relay for GUI-created wallet txs. This uses
-    // the same safe path as JIN buys, but applies it to normal QUB, MultiSend,
-    // QNS, Library, Blast and Pool-management txs too.
-    let mut relayed = p2p::broadcast_tx_limited(settings, tx, 24, 850).unwrap_or(0);
-    for _ in 0..2 {
-        relayed = relayed.saturating_add(p2p::rebroadcast_txid_limited(settings, txid, 24, 850).unwrap_or(0));
-        thread::sleep(Duration::from_millis(120));
-    }
-    relayed
+    // HF127/v1.8.3: one acknowledgement-based submit pass is enough. Durable
+    // retries are handled by the independent wallet-outbox delivery worker.
+    p2p::broadcast_tx_confirmed(settings, tx)
+        .map(|report| report.acknowledged())
+        .unwrap_or(0)
 }
 
 fn hf117_remember_pending_tx(settings: &Settings, tx: &Transaction, label: &str) -> Result<()> {
@@ -10968,22 +11118,16 @@ fn hf117_remember_pending_tx(settings: &Settings, tx: &Transaction, label: &str)
     remember_pending_tx(settings, &chain, tx, label)
 }
 
-fn hf117_recover_pending_tx_outbox(settings: &Settings, chain: &mut ChainState, only_txid: Option<&str>) -> Result<(usize, usize, usize)> {
+fn hf117_recover_pending_tx_outbox(
+    settings: &Settings,
+    chain: &mut ChainState,
+    _only_txid: Option<&str>,
+) -> Result<(usize, usize, usize)> {
+    // HF127 separates local outbox reconciliation from network delivery. The
+    // independent acknowledgement-based worker owns all retries, while status
+    // reads and pre-send checks remain free of socket side effects.
     let report = reconcile_pending_txs(settings, chain)?;
-    let mut relayed = 0usize;
-    if settings.p2p.enabled {
-        if let Ok(pending) = load_pending_txs(settings) {
-            for rec in pending.txs {
-                let txid_s = rec.txid.to_string();
-                if only_txid.map(|wanted| wanted != txid_s.as_str()).unwrap_or(false) { continue; }
-                if chain.tx_confirmations(rec.txid).map(|(_, c)| c >= rec.confirmations_required.max(1)).unwrap_or(false) { continue; }
-                if chain.tx_in_mempool(rec.txid) {
-                    relayed = relayed.saturating_add(hf117_relay_exact_wallet_tx(settings, &rec.tx, &rec.txid));
-                }
-            }
-        }
-    }
-    Ok((report.reaccepted, relayed, report.confirmed))
+    Ok((report.reaccepted, 0, report.confirmed))
 }
 
 fn hf117_pre_tx_outbox_recovery(settings: &Settings) {
@@ -10995,7 +11139,7 @@ fn hf117_pre_tx_outbox_recovery(settings: &Settings) {
 
 fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fee: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf114_pre_jin_buy_sync(&settings);
+    hf114_pre_jin_buy_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11012,7 +11156,7 @@ fn execute_gui_buy_jin(config_path: &str, listing_id: &str, amount_jin: &str, fe
 
 fn execute_gui_send_transaction(config_path: &str, recipient: &str, amount: &str, fee: &str, asset: &str, fee_asset: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf79_pre_tx_fast_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11071,7 +11215,7 @@ fn parse_gui_multi_entries(settings: &Settings, chain: &ChainState, entries: &st
 
 fn execute_gui_multi_send_transaction(config_path: &str, entries: &str, fee: &str, asset: &str, fee_asset: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf79_pre_tx_fast_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11149,7 +11293,7 @@ fn generate_gui_blast_code() -> String {
 
 fn execute_gui_blast_create(config_path: &str, total: &str, per_claim: &str, max_claims: &str, private_code: &str, fee: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf79_pre_tx_fast_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11165,7 +11309,7 @@ fn execute_gui_blast_create(config_path: &str, total: &str, per_claim: &str, max
 
 fn execute_gui_blast_claim(config_path: &str, claim_code: &str, claimant: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf79_pre_tx_fast_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11294,7 +11438,7 @@ fn execute_gui_qns_register(config_path: &str, name: &str, target: &str, fee: &s
 
 fn execute_gui_jin_token_conversion(config_path: &str, matrix_address: &str, amount: &str, fee: &str, fee_asset: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf79_pre_tx_fast_sync(&settings);
+    hf79_pre_tx_fast_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11315,7 +11459,7 @@ fn execute_gui_jin_token_conversion(config_path: &str, matrix_address: &str, amo
 
 fn execute_gui_qub_jin_infuse(config_path: &str, amount_jin: &str, fee: &str) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf119_pre_qub_jin_action_sync(&settings);
+    hf119_pre_qub_jin_action_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11331,7 +11475,7 @@ fn execute_gui_qub_jin_infuse(config_path: &str, amount_jin: &str, fee: &str) ->
 
 fn execute_gui_qub_jin_melt(config_path: &str, amount_qub: &str, fee: &str, min_jin: Option<&str>) -> Result<(String, usize, usize)> {
     let settings = load_gui_settings(config_path)?;
-    hf119_pre_qub_jin_action_sync(&settings);
+    hf119_pre_qub_jin_action_sync(&settings)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11367,7 +11511,7 @@ fn pool_topup_price_preview(config_path: &str, extra_slots: u32) -> String {
 
 fn execute_gui_pool_create(config_path: &str, name: &str, commission_bps: &str, capacity_slots: u32, manager_address: &str, fee: &str) -> Result<PoolGuiEvent> {
     let settings = load_gui_settings(config_path)?;
-    if settings.p2p.enabled { let _ = p2p::sync_until_converged(&settings, 3, 250); }
+    hf127_pre_tx_canonical_gate(&settings, 30_000)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     if wallet.keys.is_empty() { anyhow::bail!("wallet has no local private key"); }
@@ -11391,13 +11535,13 @@ fn execute_gui_pool_create(config_path: &str, name: &str, commission_bps: &str, 
         pool_id: txid.clone(),
         relayed_to_peers: relayed,
         local_mempooltx: chain.mempool.len(),
-        message: format!("Pool '{}' pending. Cost {} QUB, 50/50 protocol/miner split. Relayed to {} peer(s).", normalized, Amount::from_atoms(price)?, relayed),
+        message: format!("Pool '{}' pending. Cost {} QUB, 50/50 protocol/miner split. Acknowledged by {} peer(s).", normalized, Amount::from_atoms(price)?, relayed),
     })
 }
 
 fn execute_gui_pool_topup(config_path: &str, pool_id: &str, extra_slots: u32, fee: &str) -> Result<PoolGuiEvent> {
     let settings = load_gui_settings(config_path)?;
-    if settings.p2p.enabled { let _ = p2p::sync_until_converged(&settings, 3, 250); }
+    hf127_pre_tx_canonical_gate(&settings, 30_000)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
@@ -11414,13 +11558,13 @@ fn execute_gui_pool_topup(config_path: &str, pool_id: &str, extra_slots: u32, fe
         pool_id: pool_id_h.to_string(),
         relayed_to_peers: relayed,
         local_mempooltx: chain.mempool.len(),
-        message: format!("Capacity top-up +{} slots pending. Cost {} QUB. Relayed to {} peer(s).", extra_slots, Amount::from_atoms(price)?, relayed),
+        message: format!("Capacity top-up +{} slots pending. Cost {} QUB. Acknowledged by {} peer(s).", extra_slots, Amount::from_atoms(price)?, relayed),
     })
 }
 
 fn execute_gui_pool_set_commission(config_path: &str, pool_id: &str, new_bps: &str, fee: &str) -> Result<PoolGuiEvent> {
     let settings = load_gui_settings(config_path)?;
-    if settings.p2p.enabled { let _ = p2p::sync_until_converged(&settings, 3, 250); }
+    hf127_pre_tx_canonical_gate(&settings, 30_000)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
@@ -11437,13 +11581,13 @@ fn execute_gui_pool_set_commission(config_path: &str, pool_id: &str, new_bps: &s
         pool_id: pool_id_h.to_string(),
         relayed_to_peers: relayed,
         local_mempooltx: chain.mempool.len(),
-        message: format!("Commission decrease to {:.2}% pending. Relayed to {} peer(s).", bps as f64 / 100.0, relayed),
+        message: format!("Commission decrease to {:.2}% pending. Acknowledged by {} peer(s).", bps as f64 / 100.0, relayed),
     })
 }
 
 fn execute_gui_pool_rename(config_path: &str, pool_id: &str, new_name: &str, fee: &str) -> Result<PoolGuiEvent> {
     let settings = load_gui_settings(config_path)?;
-    if settings.p2p.enabled { let _ = p2p::sync_until_converged(&settings, 3, 250); }
+    hf127_pre_tx_canonical_gate(&settings, 30_000)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
@@ -11460,7 +11604,7 @@ fn execute_gui_pool_rename(config_path: &str, pool_id: &str, new_name: &str, fee
         pool_id: pool_id_h.to_string(),
         relayed_to_peers: relayed,
         local_mempooltx: chain.mempool.len(),
-        message: format!("Pool rename to '{}' pending. Relayed to {} peer(s).", normalized, relayed),
+        message: format!("Pool rename to '{}' pending. Acknowledged by {} peer(s).", normalized, relayed),
     })
 }
 
@@ -11498,7 +11642,7 @@ fn create_gui_local_pool_share(settings: &Settings, chain: &mut ChainState, pool
 
 fn execute_gui_pool_join(config_path: &str, pool_id: &str, miner_address: &str) -> Result<PoolGuiEvent> {
     let settings = load_gui_settings(config_path)?;
-    if settings.p2p.enabled { let _ = p2p::sync_until_converged(&settings, 3, 250); }
+    hf127_pre_tx_canonical_gate(&settings, 30_000)?;
     let mut chain = load_or_init_chain(&settings)?;
     let wallet = load_or_init_wallet(&settings)?;
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
@@ -11516,23 +11660,26 @@ fn execute_gui_pool_join(config_path: &str, pool_id: &str, miner_address: &str) 
 
 fn query_gui_tx_status(config_path: &str, txid: &str) -> Result<TxUiStatus> {
     let settings = load_gui_settings(config_path)?;
-    let mut chain = load_or_init_chain(&settings)?;
-    if let Ok((reaccepted, _relayed, _confirmed)) = hf117_recover_pending_tx_outbox(&settings, &mut chain, Some(txid)) {
-        if reaccepted > 0 { save_chain(&settings, &chain)?; }
-    }
+    let chain = load_or_init_chain(&settings)?;
     for (height, block) in chain.blocks.iter().enumerate().skip(1) {
-        if block.transactions.iter().any(|tx| tx.txid().to_string() == txid) {
+        if block
+            .transactions
+            .iter()
+            .any(|tx| tx.txid().to_string() == txid)
+        {
             let h = height as u32;
             let confirmations = chain.height().saturating_sub(h).saturating_add(1);
-            return Ok(TxUiStatus::Confirmed { height: h, confirmations });
+            return Ok(TxUiStatus::Confirmed {
+                height: h,
+                confirmations,
+            });
         }
     }
-    if chain.mempool.iter().any(|tx| tx.txid().to_string() == txid) {
-        if let Ok(txid_h) = Hash256::from_hex(txid) {
-            let _ = p2p::rebroadcast_txid_limited(&settings, &txid_h, 12, 650);
-        } else {
-            let _ = p2p::rebroadcast_local_mempool(&settings, 4);
-        }
+    if chain
+        .mempool
+        .iter()
+        .any(|tx| tx.txid().to_string() == txid)
+    {
         return Ok(TxUiStatus::PendingMempool);
     }
     Ok(TxUiStatus::NotFound)
@@ -11613,9 +11760,31 @@ fn gpu_device_selectors_for_mining(selected: &str) -> Vec<String> {
     }
 }
 
-fn run_miner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, pace_to_target_spacing: bool, events: mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) {
+fn run_miner(
+    config_path: String,
+    payout: String,
+    cpu_percent: u8,
+    gpu_percent: u8,
+    cpu_worker_override: usize,
+    gpu_work_items_override: usize,
+    gpu_device_selector: String,
+    pace_to_target_spacing: bool,
+    events: mpsc::Sender<MinerEvent>,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
-        match run_miner_inner(config_path.clone(), payout.clone(), cpu_percent, gpu_percent, gpu_device_selector.clone(), pace_to_target_spacing, &events, stop.clone()) {
+        match run_miner_inner(
+            config_path.clone(),
+            payout.clone(),
+            cpu_percent,
+            gpu_percent,
+            cpu_worker_override,
+            gpu_work_items_override,
+            gpu_device_selector.clone(),
+            pace_to_target_spacing,
+            &events,
+            stop.clone(),
+        ) {
             Ok(_) => break,
             Err(err) => {
                 let _ = events.send(MinerEvent::Status(format!("Miner worker recovered from transient error: {err:#}. Retrying in 5s...")));
@@ -11630,9 +11799,31 @@ fn run_miner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: 
     let _ = events.send(MinerEvent::Stopped);
 }
 
-fn run_pool_miner(config_path: String, pool_id_s: String, miner_address: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, events: mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) {
+fn run_pool_miner(
+    config_path: String,
+    pool_id_s: String,
+    miner_address: String,
+    cpu_percent: u8,
+    gpu_percent: u8,
+    cpu_worker_override: usize,
+    gpu_work_items_override: usize,
+    gpu_device_selector: String,
+    events: mpsc::Sender<MinerEvent>,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
-        match run_pool_miner_inner(config_path.clone(), pool_id_s.clone(), miner_address.clone(), cpu_percent, gpu_percent, gpu_device_selector.clone(), &events, stop.clone()) {
+        match run_pool_miner_inner(
+            config_path.clone(),
+            pool_id_s.clone(),
+            miner_address.clone(),
+            cpu_percent,
+            gpu_percent,
+            cpu_worker_override,
+            gpu_work_items_override,
+            gpu_device_selector.clone(),
+            &events,
+            stop.clone(),
+        ) {
             Ok(_) => break,
             Err(err) => {
                 let _ = events.send(MinerEvent::Status(format!("Pool miner worker recovered from transient error: {err:#}. Retrying in 5s...")));
@@ -11647,10 +11838,21 @@ fn run_pool_miner(config_path: String, pool_id_s: String, miner_address: String,
     let _ = events.send(MinerEvent::Stopped);
 }
 
-fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
+fn run_pool_miner_inner(
+    config_path: String,
+    pool_id_s: String,
+    miner_address: String,
+    cpu_percent: u8,
+    gpu_percent: u8,
+    cpu_worker_override: usize,
+    gpu_work_items_override: usize,
+    gpu_device_selector: String,
+    events: &mpsc::Sender<MinerEvent>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     let pool_id = Hash256::from_hex(&pool_id_s)?;
     let logical = logical_cpus();
-    let (threads, duty) = resource_plan(logical, cpu_percent);
+    let (threads, duty) = resource_plan(logical, cpu_percent, cpu_worker_override);
     let mut total_hashes = 0u64;
     let mut share_nonce_start = 0u64;
     let mut last_share_parent: Option<(u32, Hash256)> = None;
@@ -11780,7 +11982,6 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             target_height.saturating_sub(1),
             shorten_hash(&candidate_parts.prev_block_hash.to_string())
         )));
-        let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
         let hash_counter = Arc::new(AtomicU64::new(0));
@@ -11788,10 +11989,11 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
         let gpu_enabled = gpu_percent > 0;
         let gpu_selectors = if gpu_enabled { gpu_device_selectors_for_mining(&gpu_device_selector) } else { Vec::new() };
         let gpu_device_count = if gpu_enabled { gpu_selectors.len().max(1) } else { 0 };
-        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent).saturating_mul(gpu_device_count);
+        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override).saturating_mul(gpu_device_count);
         let mut gpu_total_hashes = 0u64;
         let (found_tx, found_rx) = mpsc::channel::<Block>();
-        let mut joins = Vec::with_capacity(threads + gpu_device_count);
+        let mut joins = Vec::new();
+        let mut cpu_worker_start_error = None::<String>;
 
         for worker_id in 0..threads {
             let worker_parts = candidate_parts.clone();
@@ -11801,9 +12003,41 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
             let worker_stop = stop.clone();
             let worker_round_stop = round_stop.clone();
             let worker_hashes = hash_counter.clone();
-            joins.push(thread::spawn(move || {
-                pool_mine_worker(worker_id, threads, duty, worker_parts, worker_outputs, pool_id, worker_hashes, worker_found_tx, worker_events, worker_stop, worker_round_stop);
-            }));
+            match thread::Builder::new()
+                .name(format!("qub-pool-cpu-{worker_id}"))
+                .spawn(move || {
+                    pool_mine_worker(
+                        worker_id,
+                        threads,
+                        duty,
+                        worker_parts,
+                        worker_outputs,
+                        pool_id,
+                        worker_hashes,
+                        worker_found_tx,
+                        worker_events,
+                        worker_stop,
+                        worker_round_stop,
+                    );
+                })
+            {
+                Ok(join) => joins.push(join),
+                Err(err) => {
+                    cpu_worker_start_error = Some(format!(
+                        "Could not start requested CPU worker {worker_id}: {err}. No partial CPU nonce-lane plan will be used. Reduce the manual worker override or inspect operating-system thread limits."
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(message) = cpu_worker_start_error {
+            round_stop.store(true, Ordering::Relaxed);
+            drop(found_tx);
+            for join in joins {
+                let _ = join.join();
+            }
+            let _ = events.send(MinerEvent::Status(message.clone()));
+            anyhow::bail!(message);
         }
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
@@ -11814,11 +12048,41 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
                 let gpu_stop = stop.clone();
                 let gpu_round_stop = round_stop.clone();
                 let gpu_hashes = gpu_hash_counter.clone();
-                joins.push(thread::spawn(move || {
-                    gpu_pool_mine_worker(gpu_parts, gpu_outputs, pool_id, gpu_percent, gpu_selector, gpu_index, target_height, gpu_hashes, gpu_found_tx, gpu_events, gpu_stop, gpu_round_stop);
-                }));
+                match thread::Builder::new()
+                    .name(format!("qub-pool-gpu-{gpu_index}"))
+                    .spawn(move || {
+                        gpu_pool_mine_worker(
+                            gpu_parts,
+                            gpu_outputs,
+                            pool_id,
+                            gpu_percent,
+                            gpu_work_items_override,
+                            gpu_selector,
+                            gpu_index,
+                            target_height,
+                            gpu_hashes,
+                            gpu_found_tx,
+                            gpu_events,
+                            gpu_stop,
+                            gpu_round_stop,
+                        );
+                    })
+                {
+                    Ok(join) => joins.push(join),
+                    Err(err) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Could not start GPU worker {gpu_index}: {err}. Continuing with the workers that started successfully."
+                        )));
+                    }
+                }
             }
         }
+        if joins.is_empty() {
+            let message = "No CPU/GPU mining worker could be started. Reduce manual worker/work-item overrides or inspect system, driver, memory, and thread limits.";
+            let _ = events.send(MinerEvent::Status(message.to_string()));
+            anyhow::bail!(message);
+        }
+        let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         drop(found_tx);
 
         let mut last_tick = Instant::now();
@@ -11939,9 +12203,20 @@ fn run_pool_miner_inner(config_path: String, pool_id_s: String, miner_address: S
     Ok(())
 }
 
-fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_percent: u8, gpu_device_selector: String, _pace_to_target_spacing: bool, events: &mpsc::Sender<MinerEvent>, stop: Arc<AtomicBool>) -> Result<()> {
+fn run_miner_inner(
+    config_path: String,
+    payout: String,
+    cpu_percent: u8,
+    gpu_percent: u8,
+    cpu_worker_override: usize,
+    gpu_work_items_override: usize,
+    gpu_device_selector: String,
+    _pace_to_target_spacing: bool,
+    events: &mpsc::Sender<MinerEvent>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     let logical = logical_cpus();
-    let (threads, duty) = resource_plan(logical, cpu_percent);
+    let (threads, duty) = resource_plan(logical, cpu_percent, cpu_worker_override);
     let mut total_hashes = 0u64;
     let mut gpu_total_hashes = 0u64;
 
@@ -11999,12 +12274,12 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             target_height.saturating_sub(1),
             shorten_hash(&candidate_parts.prev_block_hash.to_string())
         )));
-        let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
         let hash_counter = Arc::new(AtomicU64::new(0));
         let (found_tx, found_rx) = mpsc::channel::<Block>();
-        let mut joins = Vec::with_capacity(threads);
+        let mut joins = Vec::new();
+        let mut cpu_worker_start_error = None::<String>;
 
         for worker_id in 0..threads {
             let worker_parts = candidate_parts.clone();
@@ -12014,27 +12289,47 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
             let worker_stop = stop.clone();
             let worker_round_stop = round_stop.clone();
             let worker_hashes = hash_counter.clone();
-            joins.push(thread::spawn(move || {
-                mine_worker(
-                    worker_id,
-                    threads,
-                    duty,
-                    worker_parts,
-                    worker_miner,
-                    worker_hashes,
-                    worker_found_tx,
-                    worker_events,
-                    worker_stop,
-                    worker_round_stop,
-                );
-            }));
+            match thread::Builder::new()
+                .name(format!("qub-solo-cpu-{worker_id}"))
+                .spawn(move || {
+                    mine_worker(
+                        worker_id,
+                        threads,
+                        duty,
+                        worker_parts,
+                        worker_miner,
+                        worker_hashes,
+                        worker_found_tx,
+                        worker_events,
+                        worker_stop,
+                        worker_round_stop,
+                    );
+                })
+            {
+                Ok(join) => joins.push(join),
+                Err(err) => {
+                    cpu_worker_start_error = Some(format!(
+                        "Could not start requested CPU worker {worker_id}: {err}. No partial CPU nonce-lane plan will be used. Reduce the manual worker override or inspect operating-system thread limits."
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(message) = cpu_worker_start_error {
+            round_stop.store(true, Ordering::Relaxed);
+            drop(found_tx);
+            for join in joins {
+                let _ = join.join();
+            }
+            let _ = events.send(MinerEvent::Status(message.clone()));
+            anyhow::bail!(message);
         }
 
         let gpu_hash_counter = Arc::new(AtomicU64::new(0));
         let gpu_enabled = gpu_percent > 0;
         let gpu_selectors = if gpu_enabled { gpu_device_selectors_for_mining(&gpu_device_selector) } else { Vec::new() };
         let gpu_device_count = if gpu_enabled { gpu_selectors.len().max(1) } else { 0 };
-        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent).saturating_mul(gpu_device_count);
+        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override).saturating_mul(gpu_device_count);
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
                 let gpu_parts = candidate_parts.clone();
@@ -12044,23 +12339,40 @@ fn run_miner_inner(config_path: String, payout: String, cpu_percent: u8, gpu_per
                 let gpu_stop = stop.clone();
                 let gpu_round_stop = round_stop.clone();
                 let gpu_hashes = gpu_hash_counter.clone();
-                joins.push(thread::spawn(move || {
-                    gpu_mine_worker(
-                        gpu_parts,
-                        gpu_miner_addr,
-                        gpu_percent,
-                        gpu_selector,
-                        gpu_index,
-                        target_height,
-                        gpu_hashes,
-                        gpu_found_tx,
-                        gpu_events,
-                        gpu_stop,
-                        gpu_round_stop,
-                    );
-                }));
+                match thread::Builder::new()
+                    .name(format!("qub-solo-gpu-{gpu_index}"))
+                    .spawn(move || {
+                        gpu_mine_worker(
+                            gpu_parts,
+                            gpu_miner_addr,
+                            gpu_percent,
+                            gpu_work_items_override,
+                            gpu_selector,
+                            gpu_index,
+                            target_height,
+                            gpu_hashes,
+                            gpu_found_tx,
+                            gpu_events,
+                            gpu_stop,
+                            gpu_round_stop,
+                        );
+                    })
+                {
+                    Ok(join) => joins.push(join),
+                    Err(err) => {
+                        let _ = events.send(MinerEvent::Status(format!(
+                            "Could not start GPU worker {gpu_index}: {err}. Continuing with the workers that started successfully."
+                        )));
+                    }
+                }
             }
         }
+        if joins.is_empty() {
+            let message = "No CPU/GPU mining worker could be started. Reduce manual worker/work-item overrides or inspect system, driver, memory, and thread limits.";
+            let _ = events.send(MinerEvent::Status(message.to_string()));
+            anyhow::bail!(message);
+        }
+        let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         drop(found_tx);
 
         let mut last_tick = Instant::now();
@@ -12223,6 +12535,7 @@ fn gpu_mine_worker(
     candidate_parts: Arc<CandidateBlockParts>,
     miner: Address,
     gpu_percent: u8,
+    gpu_work_items_override: usize,
     gpu_selector: String,
     gpu_index: usize,
     target_height: u32,
@@ -12241,17 +12554,17 @@ fn gpu_mine_worker(
     };
 
     let device = backend.device_name().to_string();
-    let workers = gpu_miner::initial_work_items(gpu_percent);
+    let workers = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let _ = events.send(MinerEvent::GpuStarted { device: device.clone(), workers, power: gpu_percent, target_height });
 
     let mut extra_nonce = 9_000_000_000u64.saturating_add((gpu_index as u64).saturating_mul(100_000_000));
     let mut local_total_hashes = 0u64;
     let mut last_report = Instant::now();
     let mut last_report_total = 0u64;
-    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent);
-    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent)); }
+    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent, gpu_work_items_override);
+    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override)); }
     let mut tune_index = 0usize;
-    let mut best_batch = gpu_miner::initial_work_items(gpu_percent);
+    let mut best_batch = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let mut best_hps = 0.0f64;
     let mut tuning_announced = false;
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
@@ -12440,6 +12753,7 @@ fn gpu_pool_mine_worker(
     pool_outputs: Arc<Vec<TxOut>>,
     pool_id: Hash256,
     gpu_percent: u8,
+    gpu_work_items_override: usize,
     gpu_selector: String,
     gpu_index: usize,
     target_height: u32,
@@ -12458,17 +12772,17 @@ fn gpu_pool_mine_worker(
     };
 
     let device = backend.device_name().to_string();
-    let workers = gpu_miner::initial_work_items(gpu_percent);
+    let workers = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let _ = events.send(MinerEvent::GpuStarted { device: device.clone(), workers, power: gpu_percent, target_height });
 
     let mut extra_nonce = 12_000_000_000u64.saturating_add((gpu_index as u64).saturating_mul(100_000_000));
     let mut local_total_hashes = 0u64;
     let mut last_report = Instant::now();
     let mut last_report_total = 0u64;
-    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent);
-    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent)); }
+    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent, gpu_work_items_override);
+    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override)); }
     let mut tune_index = 0usize;
-    let mut best_batch = gpu_miner::initial_work_items(gpu_percent);
+    let mut best_batch = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let mut best_hps = 0.0f64;
     let mut tuning_announced = false;
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
@@ -12693,22 +13007,22 @@ fn logical_cpus() -> usize {
     thread::available_parallelism().map(|n| n.get()).unwrap_or(1).max(1)
 }
 
-fn resource_plan(logical_cpus: usize, cpu_percent: u8) -> (usize, u8) {
+fn resource_plan(
+    logical_cpus: usize,
+    cpu_percent: u8,
+    worker_override: usize,
+) -> (usize, u8) {
+    if worker_override > 0 {
+        return (worker_override, cpu_percent.clamp(1, 100));
+    }
     let cpu_percent_u8 = cpu_percent.clamp(1, 100);
     let cpu_percent = cpu_percent_u8 as f32;
     let logical = logical_cpus.max(1);
-    // high-performance/v1.6.0: 100% in the GUI is now a stronger high-cap mining mode. Some Windows
-    // systems report conservative available parallelism or leave cores underfed
-    // with one worker per logical CPU because the hash loop is memory/driver noisy.
-    // Low/mid settings remain light; only the top slider position oversubscribes.
-    let worker_cap = if cpu_percent_u8 >= 100 {
-        logical.saturating_mul(2).min(256).max(1)
-    } else {
-        logical
-    };
-    let desired_capacity = (worker_cap as f32 * cpu_percent / 100.0).max(0.05);
-    let threads = desired_capacity.ceil().clamp(1.0, worker_cap as f32) as usize;
-    let duty = ((desired_capacity / threads as f32) * 100.0).round().clamp(1.0, 100.0) as u8;
+    let desired_capacity = (logical as f32 * cpu_percent / 100.0).max(0.05);
+    let threads = desired_capacity.ceil().clamp(1.0, logical as f32) as usize;
+    let duty = ((desired_capacity / threads as f32) * 100.0)
+        .round()
+        .clamp(1.0, 100.0) as u8;
     (threads.max(1), duty.max(1))
 }
 
@@ -13860,15 +14174,17 @@ fn windows_check_and_stage_update(_url: &str, current_version: &str, last_signat
 
 #[cfg(test)]
 mod tests {
-    use super::resource_plan;
+    use super::{
+        hf127_unrestricted_mining_requested, resource_plan, GuiPrefs,
+        HF127_HIGH_POWER_WARNING_PERCENT,
+    };
 
     #[test]
     fn resource_plan_is_bounded() {
         for logical in 1..=128 {
             for pct in 1..=100 {
-                let (threads, duty) = resource_plan(logical, pct);
-                let cap = if pct == 100 { logical.saturating_mul(2).min(256).max(1) } else { logical };
-                assert!(threads >= 1 && threads <= cap);
+                let (threads, duty) = resource_plan(logical, pct, 0);
+                assert!(threads >= 1 && threads <= logical);
                 assert!((1..=100).contains(&duty));
             }
         }
@@ -13876,8 +14192,39 @@ mod tests {
 
     #[test]
     fn resource_plan_uses_all_workers_at_full_power() {
-        let (threads, duty) = resource_plan(8, 100);
-        assert_eq!(threads, 16);
+        let (threads, duty) = resource_plan(8, 100, 0);
+        assert_eq!(threads, 8);
         assert_eq!(duty, 100);
+    }
+
+
+    #[test]
+    fn hf127_high_power_confirmation_threshold_is_explicit() {
+        let mut prefs = GuiPrefs::default();
+        prefs.cpu_percent = HF127_HIGH_POWER_WARNING_PERCENT.saturating_sub(1);
+        prefs.gpu_percent = 0;
+        assert!(!hf127_unrestricted_mining_requested(&prefs));
+
+        prefs.cpu_percent = HF127_HIGH_POWER_WARNING_PERCENT;
+        assert!(hf127_unrestricted_mining_requested(&prefs));
+
+        prefs.cpu_percent = 50;
+        prefs.cpu_worker_override = 1;
+        assert!(hf127_unrestricted_mining_requested(&prefs));
+
+        prefs.cpu_worker_override = 0;
+        prefs.gpu_percent = 0;
+        prefs.gpu_work_items_override = 1_000_000;
+        assert!(!hf127_unrestricted_mining_requested(&prefs));
+
+        prefs.gpu_percent = 1;
+        assert!(hf127_unrestricted_mining_requested(&prefs));
+    }
+
+    #[test]
+    fn hf127_resource_plan_honors_unrestricted_override() {
+        let (threads, duty) = resource_plan(8, 75, 513);
+        assert_eq!(threads, 513);
+        assert_eq!(duty, 75);
     }
 }

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.8.2";
+const RPC_VERSION: &str = "1.8.3";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;
@@ -279,7 +279,7 @@ pub fn start_embedded(settings: Settings, chain: Arc<Mutex<ChainState>>) -> Resu
     let bind = settings.rpc.bind.clone();
     let listener = prepare_listener(&settings, &bind)?;
     let state = Arc::new(build_server_state(settings, RpcBackend::Embedded(chain))?);
-    println!("QUB HF126 embedded RPC listening on http://{bind}");
+    println!("QUB HF127 embedded RPC listening on http://{bind}");
     println!(
         "RPC mode={} remote={} state_changes=true mining_templates=true",
         state.backend.mode_name(),
@@ -301,7 +301,7 @@ pub fn run_standalone(settings: Settings, bind_override: Option<&str>) -> Result
         settings,
         RpcBackend::StandaloneReadOnly,
     )?);
-    println!("QUB HF126 standalone read-only RPC listening on http://{bind}");
+    println!("QUB HF127 standalone read-only RPC listening on http://{bind}");
     println!("State-changing endpoints require embedded `qubd node` mode.");
     serve(listener, state);
     Ok(())
@@ -1253,26 +1253,119 @@ fn submit_transaction(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, 
     let transaction: Transaction =
         serde_json::from_value(tx_value).context("invalid transaction object")?;
     let txid = transaction.txid();
-    let accepted = state.backend.with_chain_write(&state.settings, |chain| {
+
+    // HF127/v1.8.3: make raw RPC submission idempotent. A caller retrying after
+    // a lost HTTP response must not turn an already accepted transaction into a
+    // misleading 422 error. Only a genuinely new transaction mutates/persists
+    // the canonical mempool.
+    let local_status = state.backend.with_chain_write(&state.settings, |chain| {
+        if chain.tx_confirmations(txid).is_some() {
+            return Ok("already_confirmed");
+        }
+        if chain.tx_in_mempool(txid) {
+            return Ok("already_known");
+        }
         let accepted_txid =
             chain.accept_transaction_to_mempool(transaction.clone(), &state.settings)?;
         if accepted_txid != txid {
             bail!("transaction ID mismatch");
         }
         save_chain(&state.settings, chain)?;
-        Ok(())
+        Ok("accepted")
     });
-    if let Err(err) = accepted {
+    let local_status = match local_status {
+        Ok(status) => status,
+        Err(err) => {
+            return Ok((
+                422,
+                json!({
+                    "ok": false,
+                    "error": "transaction_rejected",
+                    "detail": err.to_string(),
+                    "txid": txid.to_string(),
+                    "accepted_locally": false,
+                }),
+            ));
+        }
+    };
+
+    if local_status == "already_confirmed" {
         return Ok((
-            422,
-            json!({"error":"transaction_rejected","detail":err.to_string(),"txid":txid.to_string()}),
+            200,
+            json!({
+                "ok": true,
+                "txid": txid.to_string(),
+                "local_status": local_status,
+                "accepted_locally": true,
+                "already_confirmed": true,
+                "network_delivery_confirmed": true,
+                "delivery_pending_retry": false,
+            }),
         ));
     }
-    let relayed = crate::p2p::broadcast_tx(&state.settings, &transaction).unwrap_or(0);
-    Ok((
-        200,
-        json!({"ok":true,"txid":txid.to_string(),"relayed_to_peers":relayed}),
-    ))
+
+    // Raw RPC submissions use the same durable outbox and acknowledgement
+    // protocol as GUI/CLI sends. Once the transaction is accepted locally, an
+    // unwritable/corrupt/full outbox is a hard reliability failure: return 503
+    // transparently rather than pretending that network delivery is protected.
+    let chain_snapshot = state
+        .backend
+        .with_chain_read(&state.settings, |chain| Ok(chain.clone()))?;
+    if let Err(err) = remember_pending_tx(
+        &state.settings,
+        &chain_snapshot,
+        &transaction,
+        "rpc-submit-transaction",
+    ) {
+        return Ok((
+            503,
+            json!({
+                "ok": false,
+                "error": "reliable_outbox_unavailable",
+                "detail": err.to_string(),
+                "txid": txid.to_string(),
+                "local_status": local_status,
+                "accepted_locally": true,
+                "network_delivery_confirmed": false,
+                "delivery_pending_retry": false,
+                "operator_action": "repair the durable transaction outbox before relying on network delivery",
+            }),
+        ));
+    }
+
+    match crate::p2p::broadcast_tx_confirmed(&state.settings, &transaction) {
+        Ok(relay_report) => Ok((
+            200,
+            json!({
+                "ok": true,
+                "txid": txid.to_string(),
+                "local_status": local_status,
+                "accepted_locally": true,
+                "network_delivery_confirmed": relay_report.delivered(),
+                "acknowledged_by_peers": relay_report.acknowledged(),
+                "relayed_to_peers": relay_report.acknowledged(),
+                "official_seed_acknowledgements": relay_report.official_acknowledgements,
+                "delivery_pending_retry": relay_report.pending_retry,
+                "relay_report": relay_report,
+            }),
+        )),
+        Err(err) => Ok((
+            200,
+            json!({
+                "ok": true,
+                "txid": txid.to_string(),
+                "local_status": local_status,
+                "accepted_locally": true,
+                "network_delivery_confirmed": false,
+                "acknowledged_by_peers": 0,
+                "relayed_to_peers": 0,
+                "official_seed_acknowledgements": 0,
+                "delivery_pending_retry": true,
+                "delivery_error": err.to_string(),
+                "note": "transaction is durable locally and the independent delivery worker will retry",
+            }),
+        )),
+    }
 }
 
 fn tip_event_value(state: &Arc<RpcServerState>, after: &str, wait_ms: u64) -> Result<Value> {

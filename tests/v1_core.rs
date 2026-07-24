@@ -1904,12 +1904,243 @@ fn hf124_pool_shares_are_not_persisted_or_resurrected_by_wallet_outbox() {
             created_unix: unix_time_u32() as u64,
             last_rebroadcast_unix: 0,
             confirmations_required: HF117_PENDING_TX_CONFIRMATIONS,
+            delivery_attempts: 0,
+            last_delivery_attempt_unix: 0,
+            next_delivery_retry_unix: 0,
+            peer_ack_count: 0,
+            official_seed_ack_count: 0,
+            last_ack_status: String::new(),
+            last_ack_height: 0,
+            last_ack_tip: String::new(),
+            last_rejection_reason: String::new(),
+            delivered_unix: 0,
         }],
     };
     save_pending_txs(&settings, &legacy).unwrap();
     let report = reconcile_pending_txs(&settings, &mut chain).unwrap();
     assert_eq!(report.dropped, 1);
     assert!(load_pending_txs(&settings).unwrap().txs.is_empty());
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf127_pending_tx_v1_json_defaults_delivery_fields() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf127-pending-v1-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+    let chain = ChainState::new_with_genesis(&settings).unwrap();
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(vec![1, 2, 3]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 7,
+    };
+    let paths = NodePaths::from_settings(&settings);
+    paths.ensure_dirs().unwrap();
+    let value = serde_json::json!({
+        "version": 1,
+        "network": settings.network.name,
+        "txs": [{
+            "txid": tx.txid(),
+            "tx": tx,
+            "label": "legacy-v1",
+            "created_height": chain.height(),
+            "created_unix": unix_time_u32() as u64,
+            "last_rebroadcast_unix": 0,
+            "confirmations_required": HF117_PENDING_TX_CONFIRMATIONS
+        }]
+    });
+    std::fs::write(
+        &paths.pending_txs_file,
+        serde_json::to_string_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    let pending = load_pending_txs(&settings).unwrap();
+    assert_eq!(pending.txs.len(), 1);
+    let record = &pending.txs[0];
+    assert_eq!(record.delivery_attempts, 0);
+    assert_eq!(record.peer_ack_count, 0);
+    assert_eq!(record.official_seed_ack_count, 0);
+    assert_eq!(record.delivered_unix, 0);
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+
+#[test]
+fn hf127_corrupt_pending_outbox_fails_closed_without_overwrite() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf127-corrupt-outbox-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+    let chain = ChainState::new_with_genesis(&settings).unwrap();
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(vec![9, 8, 7]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 11,
+    };
+    let paths = NodePaths::from_settings(&settings);
+    paths.ensure_dirs().unwrap();
+    let corrupt = b"{ definitely-not-valid-json";
+    std::fs::write(&paths.pending_txs_file, corrupt).unwrap();
+
+    let err = remember_pending_tx(&settings, &chain, &tx, "must-not-overwrite")
+        .expect_err("corrupt outbox must fail closed");
+    assert!(!err.to_string().is_empty());
+    assert_eq!(std::fs::read(&paths.pending_txs_file).unwrap(), corrupt);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf127_idempotent_remember_preserves_delivery_history() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf127-idempotent-outbox-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+    let chain = ChainState::new_with_genesis(&settings).unwrap();
+    let tx = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(vec![5, 4, 3]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 12,
+    };
+
+    remember_pending_tx(&settings, &chain, &tx, "first-label").unwrap();
+    update_pending_tx_delivery(
+        &settings,
+        tx.txid(),
+        3,
+        2,
+        1,
+        "accepted",
+        7,
+        "tip",
+        "",
+        true,
+        unix_time_u32() as u64 + 300,
+    )
+    .unwrap();
+    remember_pending_tx(&settings, &chain, &tx, "updated-label").unwrap();
+
+    let pending = load_pending_txs(&settings).unwrap();
+    assert_eq!(pending.txs.len(), 1);
+    let record = &pending.txs[0];
+    assert_eq!(record.label, "updated-label");
+    assert_eq!(record.delivery_attempts, 3);
+    assert_eq!(record.peer_ack_count, 2);
+    assert_eq!(record.official_seed_ack_count, 1);
+    assert_eq!(record.last_ack_status, "accepted");
+    assert!(record.delivered_unix > 0);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn hf127_full_pending_outbox_never_evicts_unconfirmed_payment() {
+    let mut settings = regtest();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let data_dir = std::env::temp_dir().join(format!(
+        "qub-hf127-full-outbox-{}-{unique}",
+        std::process::id()
+    ));
+    settings.node.data_dir = data_dir.to_string_lossy().to_string();
+    let chain = ChainState::new_with_genesis(&settings).unwrap();
+
+    let records = (0..HF117_PENDING_TX_MAX_RECORDS)
+        .map(|index| {
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    signature_script: ScriptBuf(vec![index as u8]),
+                    sequence: u32::MAX,
+                }],
+                outputs: Vec::new(),
+                locktime: index as u32,
+            };
+            PendingTxRecord {
+                txid: tx.txid(),
+                tx,
+                label: format!("pending-{index}"),
+                created_height: chain.height(),
+                created_unix: unix_time_u32() as u64,
+                last_rebroadcast_unix: 0,
+                confirmations_required: HF117_PENDING_TX_CONFIRMATIONS,
+                delivery_attempts: 0,
+                last_delivery_attempt_unix: 0,
+                next_delivery_retry_unix: 0,
+                peer_ack_count: 0,
+                official_seed_ack_count: 0,
+                last_ack_status: String::new(),
+                last_ack_height: 0,
+                last_ack_tip: String::new(),
+                last_rejection_reason: String::new(),
+                delivered_unix: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    save_pending_txs(
+        &settings,
+        &PendingTxFile {
+            version: 2,
+            network: settings.network.name.clone(),
+            txs: records,
+        },
+    )
+    .unwrap();
+
+    let extra = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(vec![0xFE, 0xED]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 10_000,
+    };
+    let err = remember_pending_tx(&settings, &chain, &extra, "must-be-rejected")
+        .expect_err("full outbox must not evict an unconfirmed payment");
+    assert!(err.to_string().contains("outbox is full"));
+    let pending = load_pending_txs(&settings).unwrap();
+    assert_eq!(pending.txs.len(), HF117_PENDING_TX_MAX_RECORDS);
+    assert!(!pending.txs.iter().any(|record| record.txid == extra.txid()));
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
