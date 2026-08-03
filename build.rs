@@ -36,8 +36,12 @@ fn main() {
         res.set_icon(ico_path.to_str().expect("ico path str"));
         res.set("ProductName", product_name);
         res.set("FileDescription", file_description);
-        res.set("ProductVersion", "1.8.1");
-        res.set("FileVersion", "1.8.1.0");
+        // Keep Windows Explorer/file-property identity aligned with Cargo,
+        // the GUI, P2P/RPC identity and the installer. The updater verifies
+        // installer metadata, while operators commonly use the executable
+        // metadata for incident response and release diagnostics.
+        res.set("ProductVersion", "1.8.4");
+        res.set("FileVersion", "1.8.4.0");
         res.compile().expect("compile windows resources");
     }
 }

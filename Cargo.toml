@@ -1,10 +1,10 @@
 [package]
 name = "qubd"
-version = "1.8.3"
+version = "1.8.4"
 edition = "2021"
 license = "MIT"
 authors = ["QUB Core"]
-description = "Qubit Coin v1.8.3 HF127 reliable transaction delivery, low-latency propagation and full-power mining controls"
+description = "Qubit Coin v1.8.4 HF128 mining, pool, sync and updater reliability"
 readme = "README.md"
 
 [features]

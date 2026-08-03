@@ -14,10 +14,20 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
-$Version = '1.8.3'
+$Version = '1.8.4'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
+
+function Assert-NativeSuccess {
+    param(
+        [Parameter(Mandatory)][string]$Operation,
+        [Parameter(Mandatory)][int]$ExitCode
+    )
+    if ($ExitCode -ne 0) {
+        throw "$Operation failed with native exit code $ExitCode"
+    }
+}
 
 # Avoid VCRUNTIME140.dll deployment failures on clean Windows installs.
 # .cargo/config.toml enables crt-static. Keep this explicit for direct script builds,
@@ -28,11 +38,34 @@ if (($env:RUSTFLAGS -as [string]) -notmatch 'crt-static') {
 
 if (-not $SkipTests) {
     cargo test --locked
+    Assert-NativeSuccess -Operation 'cargo test --locked' -ExitCode $LASTEXITCODE
+}
+
+$ReleaseDir = Join-Path $Root 'target\x86_64-pc-windows-msvc\release'
+$ExpectedReleaseExecutables = @(
+    (Join-Path $ReleaseDir 'qub-core.exe'),
+    (Join-Path $ReleaseDir 'qubd.exe'),
+    (Join-Path $ReleaseDir 'qub-rpc-miner.exe')
+)
+
+# A failed native command must never fall through and package an executable
+# left by an older build. Remove only the three expected release outputs.
+foreach ($Exe in $ExpectedReleaseExecutables) {
+    Remove-Item -Force $Exe -ErrorAction SilentlyContinue
 }
 
 cargo build --locked --release --bin qub-core --target x86_64-pc-windows-msvc
+Assert-NativeSuccess -Operation 'cargo build qub-core' -ExitCode $LASTEXITCODE
 cargo build --locked --release --bin qubd --target x86_64-pc-windows-msvc
+Assert-NativeSuccess -Operation 'cargo build qubd' -ExitCode $LASTEXITCODE
 cargo build --locked --release --bin qub-rpc-miner --target x86_64-pc-windows-msvc
+Assert-NativeSuccess -Operation 'cargo build qub-rpc-miner' -ExitCode $LASTEXITCODE
+
+foreach ($Exe in $ExpectedReleaseExecutables) {
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
+        throw "Expected freshly built executable is missing: $Exe"
+    }
+}
 
 function Find-SignTool {
     $candidates = @(
@@ -59,7 +92,6 @@ New-Item -ItemType Directory -Force -Path (Join-Path $DistRoot 'updates') | Out-
 $ChannelUpdateDir = Join-Path $DistRoot "updates\$Config\windows-x64"
 New-Item -ItemType Directory -Force -Path $ChannelUpdateDir | Out-Null
 
-$ReleaseDir = Join-Path $Root 'target\x86_64-pc-windows-msvc\release'
 Copy-Item (Join-Path $ReleaseDir 'qub-core.exe') (Join-Path $Dist 'QUB-Core.exe')
 Copy-Item (Join-Path $ReleaseDir 'qubd.exe') (Join-Path $Dist 'tools\qubd.exe')
 Copy-Item (Join-Path $ReleaseDir 'qub-rpc-miner.exe') (Join-Path $Dist 'tools\qub-rpc-miner.exe')
@@ -83,6 +115,9 @@ foreach ($Doc in @(
     'RELEASE_NOTES-v1.8.3-HF127.md',
     'HF127-v183-RELIABILITY-REVIEW.md',
     'HF127-v183-DEPLOY-RUNBOOK.md',
+    'RELEASE_NOTES-v1.8.4-HF128.md',
+    'HF128-v184-RELIABILITY-REVIEW.md',
+    'HF128-v184-DEPLOY-RUNBOOK.md',
     'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
     'QUB-Windows-Code-Signing-v1.0.0.md',
     'QUB-Mainnet-Release-Readiness-v1.0.0.md',
@@ -422,7 +457,8 @@ if ($BuildInstaller) {
         url = "$UpdateBaseUrl/$Config/windows-x64/$InstallerName"
         latest_url = "$UpdateBaseUrl/$Config/windows-x64/QUB-Core-Latest.exe"
         sha256 = $VersionedHash
-        notes = 'Manifest-based private QUB Core updater. Unsigned private builds are allowed only for the closed miner group until Authenticode signing is ready.'
+        size = [int64](Get-Item $VersionedUpdateInstaller).Length
+        notes = 'HF128 bounded manifest updater. Unsigned private builds are accepted only when both manifest and artifact stay on the exact official HTTPS origin; custom origins require the pinned Authenticode signer.'
     }
     $ManifestJson = $Manifest | ConvertTo-Json -Depth 8
     $ManifestPath = Join-Path $ChannelUpdateDir 'manifest.json'

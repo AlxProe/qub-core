@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.8.3/"; // HF127 reliable transaction delivery and unrestricted mining controls
+const USER_AGENT: &str = "/QUB Core:1.8.4/"; // HF128 mining, pool, sync and updater reliability
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -600,6 +600,12 @@ struct PeerSession {
     listen_addr: String,
     role: String,
     miner_address: String,
+    sync_peer_height: u32,
+    sync_peer_tip: String,
+    sync_local_height: u32,
+    sync_local_tip: String,
+    sync_from_height: u32,
+    sync_requested_at: Option<Instant>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1751,21 +1757,42 @@ fn official_snapshot_peers(settings: &Settings) -> Vec<String> {
 fn official_snapshot_peer_candidates(
     settings: &Settings,
     timeout_ms: u64,
-) -> Vec<(String, u32, String, u128)> {
-    let mut out: Vec<(String, u32, String, u128)> = Vec::new();
+) -> Vec<(String, u32, String, u128, String)> {
+    let mut out: Vec<(String, u32, String, u128, String)> = Vec::new();
+    let mut seen_node_ids = HashMap::<String, String>::new();
     for addr in official_snapshot_peers(settings).into_iter().take(4) {
         if should_skip_outbound(settings, &addr) {
             continue;
         }
         let started = Instant::now();
         match probe_peer(settings, &addr, Duration::from_millis(timeout_ms.max(150))) {
-            Ok(info) => out.push((
+            Ok(info) => {
+                let identity = info.node_id.trim().to_string();
+                if !identity.is_empty() {
+                    if let Some(first_addr) = seen_node_ids.get(&identity) {
+                        eprintln!(
+                            "HF128 seed identity dedupe: {} and {} report the same node_id {}; counting one independent source",
+                            first_addr, addr, identity
+                        );
+                        continue;
+                    }
+                    seen_node_ids.insert(identity.clone(), addr.clone());
+                }
+                out.push((
+                    addr,
+                    info.height,
+                    info.tip_hash,
+                    started.elapsed().as_millis(),
+                    identity,
+                ));
+            }
+            Err(_) => out.push((
                 addr,
-                info.height,
-                info.tip_hash,
+                0,
+                String::new(),
                 started.elapsed().as_millis(),
+                String::new(),
             )),
-            Err(_) => out.push((addr, 0, String::new(), started.elapsed().as_millis())),
         }
     }
     out.sort_by(|a, b| b.1.cmp(&a.1).then(a.3.cmp(&b.3)).then(a.0.cmp(&b.0)));
@@ -1776,12 +1803,15 @@ fn best_official_peer_tip(settings: &Settings, timeout_ms: u64) -> Result<(usize
     let candidates = official_snapshot_peer_candidates(settings, timeout_ms);
     let contacted = candidates
         .iter()
-        .filter(|(_, height, _, _)| *height > 0)
+        .filter(|(_, height, _, _, node_id)| *height > 0 && !node_id.trim().is_empty())
         .count();
     let mut best_height = 0u32;
     let mut best_tip = String::new();
-    for (_, height, tip, _) in candidates {
-        if height >= best_height {
+    for (_, height, tip, _, node_id) in candidates {
+        if height == 0 || tip.trim().is_empty() || node_id.trim().is_empty() {
+            continue;
+        }
+        if height > best_height {
             best_height = height;
             best_tip = tip;
         }
@@ -4067,8 +4097,7 @@ struct Hf126EqualHeightTipEvidence {
 
 impl Hf126EqualHeightTipEvidence {
     fn confirmed(&self) -> bool {
-        (self.http_matches > 0 && self.official_tcp_matches > 0)
-            || self.official_tcp_matches >= 2
+        self.official_tcp_matches >= 2
             || (self.http_matches > 0 && self.direct_matches >= 2)
     }
 }
@@ -4146,7 +4175,7 @@ fn hf126_verified_equal_height_competing_tip(
         }
     }
 
-    for (_, height, tip, _) in
+    for (_, height, tip, _, _) in
         official_snapshot_peer_candidates(settings, timeout_ms.max(220).min(900))
     {
         if hf126_is_same_height_competing_tip(local_height, &local_tip, height, &tip) {
@@ -4719,11 +4748,11 @@ fn sync_official_direct_full_chain(
     if candidates.is_empty() {
         candidates = official_snapshot_peers(settings)
             .into_iter()
-            .map(|addr| (addr, 0, String::new(), 0))
+            .map(|addr| (addr, 0, String::new(), 0, String::new()))
             .collect();
     }
 
-    for (addr, candidate_height, candidate_tip, _) in candidates.into_iter().take(4) {
+    for (addr, candidate_height, candidate_tip, _, _) in candidates.into_iter().take(4) {
         if Instant::now() >= deadline {
             break;
         }
@@ -4895,7 +4924,7 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
     }
 
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(4_000));
-    for (addr, candidate_height, _candidate_tip, _latency_ms) in
+    for (addr, candidate_height, _candidate_tip, _latency_ms, _node_id) in
         official_snapshot_peer_candidates(settings, 650)
             .into_iter()
             .take(4)
@@ -5042,7 +5071,8 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
                             if blocks.is_empty() {
                                 continue;
                             }
-                            let more_expected = blocks.len() == settings.p2p.max_blocks_per_message;
+                            let more_expected =
+                                blocks.len() == settings.p2p.max_blocks_per_message;
                             let next_from = start_height.saturating_add(blocks.len() as u32);
                             let mut chain = load_chain_for_hf90_catchup(settings)?;
                             let before_height = chain.height();
@@ -5639,14 +5669,100 @@ fn send_adaptive_chain_requests(
 ) -> Result<()> {
     let peer_tip_differs =
         peer_height == local.height() && peer_tip_hash != local.tip_hash().to_string();
-    for from_height in adaptive_from_heights(local.height(), peer_height, peer_tip_differs)
-        .into_iter()
-        .take(10)
-    {
-        send_wire(stream, &WireMessage::GetHeaders { from_height })?;
-        send_wire(stream, &WireMessage::GetChain { from_height })?;
-    }
+    let from_height = if peer_height > local.height() {
+        local.height().saturating_add(1)
+    } else if peer_tip_differs {
+        local.height().saturating_sub(8)
+    } else {
+        return Ok(());
+    };
+    send_wire(stream, &WireMessage::GetChain { from_height })?;
     Ok(())
+}
+
+fn request_peer_chain_if_needed(
+    stream: &mut TcpStream,
+    local: &ChainState,
+    peer_height: u32,
+    peer_tip: &str,
+    session: &mut PeerSession,
+) -> Result<bool> {
+    let local_tip = local.tip_hash().to_string();
+    let peer_differs = peer_height == local.height() && peer_tip != local_tip;
+    let from_height = if peer_height > local.height() {
+        local.height().saturating_add(1)
+    } else if peer_differs {
+        local.height().saturating_sub(8)
+    } else {
+        return Ok(false);
+    };
+    let same_view = session.sync_peer_height == peer_height
+        && session.sync_peer_tip == peer_tip
+        && session.sync_local_height == local.height()
+        && session.sync_local_tip == local_tip
+        && session.sync_from_height == from_height;
+    if same_view
+        && session
+            .sync_requested_at
+            .map(|at| at.elapsed() < Duration::from_secs(30))
+            .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    request_peer_chain_from(
+        stream,
+        local,
+        peer_height,
+        peer_tip,
+        from_height,
+        session,
+    )?;
+    Ok(true)
+}
+
+fn request_peer_chain_from(
+    stream: &mut TcpStream,
+    local: &ChainState,
+    peer_height: u32,
+    peer_tip: &str,
+    from_height: u32,
+    session: &mut PeerSession,
+) -> Result<()> {
+    session.sync_peer_height = peer_height;
+    session.sync_peer_tip = peer_tip.to_string();
+    session.sync_local_height = local.height();
+    session.sync_local_tip = local.tip_hash().to_string();
+    session.sync_from_height = from_height;
+    session.sync_requested_at = Some(Instant::now());
+    send_wire(stream, &WireMessage::GetChain { from_height })
+}
+
+fn request_earlier_peer_chain(
+    stream: &mut TcpStream,
+    local: &ChainState,
+    session: &mut PeerSession,
+    previous_from: u32,
+) -> Result<bool> {
+    if previous_from == 0 {
+        return Ok(false);
+    }
+    let overlap = local.height().saturating_sub(previous_from).max(2);
+    let next_window = overlap.saturating_mul(4).min(local.height().max(1));
+    let mut next_from = local.height().saturating_sub(next_window);
+    if next_from >= previous_from {
+        next_from = previous_from.saturating_sub(1);
+    }
+    let peer_height = session.height;
+    let peer_tip = session.tip_hash.clone();
+    request_peer_chain_from(
+        stream,
+        local,
+        peer_height,
+        &peer_tip,
+        next_from,
+        session,
+    )?;
+    Ok(true)
 }
 
 fn try_adopt_overlapping_blocks(
@@ -8597,10 +8713,9 @@ fn handle_peer(
             send_wire(&mut stream, &WireMessage::GetAddr)?;
             send_wire(&mut stream, &WireMessage::GetPeerList)?;
             send_wire(&mut stream, &WireMessage::GetMempool)?;
-            if outbound {
-                send_wire(&mut stream, &WireMessage::GetHeaders { from_height: 0 })?;
-                send_wire(&mut stream, &WireMessage::GetChain { from_height: 0 })?;
-            }
+            // HF128 waits for the remote Version and requests one bounded
+            // missing suffix/overlap. HF127 requested the entire chain from
+            // genesis on every outbound connection before knowing peer state.
         }
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut peer_errors = 0u32;
@@ -8765,6 +8880,23 @@ fn handle_peer(
                             continue;
                         }
                     }
+                    if let WireMessage::Version { node_id: remote_node_id, .. } = &message {
+                        if remote_node_id_is_self(&settings, remote_node_id) {
+                            if outbound {
+                                hf128_quarantine_self_alias(&settings, &peer_key);
+                                if let Ok(mut known) = peers.lock() {
+                                    known.remove(&peer_key);
+                                }
+                            }
+                            let _ = send_wire(
+                                &mut stream,
+                                &WireMessage::Reject {
+                                    reason: "self connection rejected by node identity".to_string(),
+                                },
+                            );
+                            bail!("self connection rejected for peer alias {peer_key}");
+                        }
+                    }
                     if let Err(err) = process_peer_message(
                         &settings,
                         &peer_key,
@@ -8877,7 +9009,7 @@ fn process_peer_message(
             listen_addr,
             genesis_hash,
             user_agent,
-            node_id,
+            node_id: remote_node_id,
             role,
             miner_address,
             ..
@@ -8889,7 +9021,7 @@ fn process_peer_message(
             session.height = height;
             session.tip_hash = tip_hash.clone();
             session.user_agent = user_agent.clone();
-            session.node_id = node_id.clone();
+            session.node_id = remote_node_id.clone();
             session.listen_addr = listen_addr.clone();
             session.role = role.clone();
             session.miner_address = miner_address.clone();
@@ -8901,7 +9033,7 @@ fn process_peer_message(
                 record_peer_observation(
                     settings,
                     peer_addr,
-                    &node_id,
+                    &remote_node_id,
                     &listen_addr,
                     height,
                     &tip_hash,
@@ -8923,7 +9055,13 @@ fn process_peer_message(
             let local_height = local_snapshot.height();
             let local_tip = local_snapshot.tip_hash().to_string();
             if height > local_height || (height == local_height && tip_hash != local_tip) {
-                send_adaptive_chain_requests(stream, &local_snapshot, height, &tip_hash)?;
+                let _ = request_peer_chain_if_needed(
+                    stream,
+                    &local_snapshot,
+                    height,
+                    &tip_hash,
+                    session,
+                )?;
             } else if height < local_height {
                 let _ = hf127_push_missing_suffix(stream, settings, &local_snapshot, session)?;
             }
@@ -8940,7 +9078,13 @@ fn process_peer_message(
             drop(local);
             if height > local_height || (height == local_height && tip_hash != local_tip) {
                 let local_snapshot = chain.lock().expect("chain mutex poisoned").clone();
-                send_adaptive_chain_requests(stream, &local_snapshot, height, &tip_hash)?;
+                let _ = request_peer_chain_if_needed(
+                    stream,
+                    &local_snapshot,
+                    height,
+                    &tip_hash,
+                    session,
+                )?;
             }
         }
         WireMessage::GetHeaders { from_height } => {
@@ -8948,14 +9092,17 @@ fn process_peer_message(
             send_headers(stream, settings, &local, from_height)?;
         }
         WireMessage::Headers { headers } => {
-            let local_height = chain.lock().expect("chain mutex poisoned").height();
-            if headers.last().map(|h| h.height).unwrap_or(0) > local_height {
-                send_wire(
-                    stream,
-                    &WireMessage::GetChain {
-                        from_height: local_height.saturating_add(1),
-                    },
-                )?;
+            let local = chain.lock().expect("chain mutex poisoned").clone();
+            if let Some(last) = headers.last() {
+                if last.height > local.height() {
+                    let _ = request_peer_chain_if_needed(
+                        stream,
+                        &local,
+                        last.height,
+                        &last.hash,
+                        session,
+                    )?;
+                }
             }
         }
         WireMessage::GetChain { from_height } => {
@@ -8970,12 +9117,12 @@ fn process_peer_message(
                 bail!("too many blocks in chain message");
             }
             if blocks.is_empty() {
+                let local = chain.lock().expect("chain mutex poisoned").clone();
+                let _ = request_earlier_peer_chain(stream, &local, session, start_height)?;
                 return Ok(());
             }
-            let more_expected = blocks.len() == settings.p2p.max_blocks_per_message;
             let next_from = start_height.saturating_add(blocks.len() as u32);
             let base = chain.lock().expect("chain mutex poisoned").clone();
-            let local_height_before = base.height();
             let mut candidate = base.clone();
             let mut changed = false;
             if start_height <= candidate.height().saturating_add(1) {
@@ -9008,20 +9155,32 @@ fn process_peer_message(
                         }
                     }
                     Ok(false) => {
-                        if start_height == local_height_before.saturating_add(1) {
-                            request_earlier_fork_window(stream, local_height_before, start_height)?;
-                        }
+                        let _ = request_earlier_peer_chain(
+                            stream,
+                            &base,
+                            session,
+                            start_height,
+                        )?;
                     }
                     Err(_) => {
-                        request_earlier_fork_window(stream, local_height_before, start_height)?;
+                        let _ = request_earlier_peer_chain(
+                            stream,
+                            &base,
+                            session,
+                            start_height,
+                        )?;
                     }
                 }
             } else {
-                send_wire(
+                let peer_height = session.height;
+                let peer_tip = session.tip_hash.clone();
+                request_peer_chain_from(
                     stream,
-                    &WireMessage::GetChain {
-                        from_height: base.height().saturating_add(1),
-                    },
+                    &base,
+                    peer_height,
+                    &peer_tip,
+                    base.height().saturating_add(1),
+                    session,
                 )?;
             }
             if changed {
@@ -9031,12 +9190,17 @@ fn process_peer_message(
                     let _ = relay_chain_to_known_peers(&relay_settings, Some(&source));
                 });
             }
-            if more_expected {
-                send_wire(
+            if changed && next_from <= session.height {
+                let local = chain.lock().expect("chain mutex poisoned").clone();
+                let peer_height = session.height;
+                let peer_tip = session.tip_hash.clone();
+                request_peer_chain_from(
                     stream,
-                    &WireMessage::GetChain {
-                        from_height: next_from,
-                    },
+                    &local,
+                    peer_height,
+                    &peer_tip,
+                    next_from,
+                    session,
                 )?;
             }
         }
@@ -9257,7 +9421,7 @@ fn process_client_message(
             tip_hash,
             user_agent,
             listen_addr,
-            node_id,
+            node_id: remote_node_id,
             role,
             miner_address,
             ..
@@ -9266,11 +9430,15 @@ fn process_client_message(
                 bail!("unsupported protocol {protocol}");
             }
             validate_remote_network(settings, &network, &magic, &genesis_hash)?;
+            if remote_node_id_is_self(settings, &remote_node_id) {
+                hf128_quarantine_self_alias(settings, addr);
+                bail!("self connection rejected for {addr}");
+            }
             if !hf127_is_submit_role(&role) {
                 record_peer_observation(
                     settings,
                     addr,
-                    &node_id,
+                    &remote_node_id,
                     &listen_addr,
                     height,
                     &tip_hash,
@@ -9606,6 +9774,11 @@ fn send_chain(
         .blocks
         .len()
         .min(start.saturating_add(settings.p2p.max_blocks_per_message));
+    // Preserve protocol-2 rolling compatibility: HF127 peers request the next
+    // window only when this count reaches max_blocks_per_message. A shorter
+    // byte-bounded response would deserialize on HF127 but silently stop its
+    // sync. Framing changes therefore require an explicit negotiated
+    // capability and are intentionally not introduced by HF128.
     let blocks = if start < chain.blocks.len() {
         chain.blocks[start..end].to_vec()
     } else {
@@ -9701,7 +9874,51 @@ fn connect_peer(addr: &str, timeout: Duration) -> Result<TcpStream> {
 }
 
 fn should_skip_outbound(settings: &Settings, addr: &str) -> bool {
-    is_self_or_empty_addr(settings, addr)
+    is_self_or_empty_addr(settings, addr) || hf128_self_alias_is_quarantined(settings, addr)
+}
+
+fn hf128_self_alias_quarantine() -> &'static Mutex<HashSet<String>> {
+    static QUARANTINE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    QUARANTINE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn hf128_self_alias_key(settings: &Settings, addr: &str) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        settings.network.name,
+        settings.node.data_dir,
+        normalize_peer_addr(addr)
+    )
+}
+
+fn hf128_self_alias_is_quarantined(settings: &Settings, addr: &str) -> bool {
+    let normalized = normalize_peer_addr(addr);
+    if normalized.is_empty() {
+        return false;
+    }
+    let key = hf128_self_alias_key(settings, &normalized);
+    hf128_self_alias_quarantine()
+        .lock()
+        .map(|quarantine| quarantine.contains(&key))
+        .unwrap_or(false)
+}
+
+fn hf128_quarantine_self_alias(settings: &Settings, addr: &str) -> bool {
+    let normalized = normalize_peer_addr(addr);
+    if normalized.is_empty() {
+        return false;
+    }
+    let key = hf128_self_alias_key(settings, &normalized);
+    let inserted = hf128_self_alias_quarantine()
+        .lock()
+        .map(|mut quarantine| quarantine.insert(key))
+        .unwrap_or(false);
+    if inserted {
+        eprintln!(
+            "HF128 learned self-alias quarantined for this process: {normalized}"
+        );
+    }
+    inserted
 }
 
 fn is_self_or_empty_addr(settings: &Settings, addr: &str) -> bool {
@@ -9746,7 +9963,7 @@ fn known_peers(settings: &Settings) -> Result<Vec<String>> {
     let mut push_unique = |addr: String| {
         let normalized = normalize_peer_addr(&addr);
         if !normalized.is_empty()
-            && !is_self_or_empty_addr(settings, &normalized)
+            && !should_skip_outbound(settings, &normalized)
             && !out.iter().any(|p| p == &normalized)
         {
             out.push(normalized);
@@ -9986,8 +10203,25 @@ fn node_id_path(settings: &Settings) -> PathBuf {
     NodePaths::from_settings(settings).data_dir.join("node_id")
 }
 
+fn node_id_creation_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn node_id(settings: &Settings) -> Result<String> {
     let path = node_id_path(settings);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let value = raw.trim();
+        if value.len() >= 16 && value.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(value.to_string());
+        }
+    }
+    // Multiple startup/probe threads can ask for identity concurrently. Lock
+    // creation and re-check after acquiring it so one process never advertises
+    // two transient IDs or writes a truncated race winner.
+    let _guard = node_id_creation_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("node identity creation lock poisoned"))?;
     if let Ok(raw) = std::fs::read_to_string(&path) {
         let value = raw.trim();
         if value.len() >= 16 && value.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -10511,33 +10745,30 @@ pub fn peer_status_cached(settings: &Settings) -> Result<P2PNetworkSnapshot> {
     // hashing/submitting.
     let official_tip = official_http_tip(settings, 700).ok().flatten();
     if let Some((height, tip_hash)) = official_tip.clone() {
-        for seed in release_bootnodes(settings).into_iter().take(2) {
-            let seed = normalize_peer_addr(&seed);
-            if seed.is_empty() || should_skip_outbound(settings, &seed) {
-                continue;
-            }
-            snapshot.peers.push(P2PPeerStatus {
-                addr: seed,
-                reachable: false,
-                global_live: true,
-                height: Some(height),
-                tip_hash: Some(tip_hash.clone()),
-                user_agent: Some("official-http-tip".to_string()),
-                error: None,
-                node_id: None,
-                observed_addr: None,
-                listen_addr: None,
-                role: Some("seed tip".to_string()),
-                miner_address: None,
-                last_seen_unix: Some(unix_time_u32() as u64),
-                seen_age_secs: Some(0),
-            });
-        }
+        // One HTTP publication is one observation, even when several DNS
+        // aliases can download it. HF127 duplicated this row under two seed
+        // names, which made the GUI appear to prove independent seed agreement.
+        snapshot.peers.push(P2PPeerStatus {
+            addr: "download.qubit-coin.io/mainnet/snapshots/tip.json".to_string(),
+            reachable: false,
+            global_live: true,
+            height: Some(height),
+            tip_hash: Some(tip_hash),
+            user_agent: Some("official-http-publication".to_string()),
+            error: None,
+            node_id: None,
+            observed_addr: None,
+            listen_addr: None,
+            role: Some("single HTTP publication (not an independent seed)".to_string()),
+            miner_address: None,
+            last_seen_unix: Some(unix_time_u32() as u64),
+            seen_age_secs: Some(0),
+        });
     }
     // HF88: HTTP snapshots can lag while seed nodes are live. Add a tiny direct
     // official-seed probe to the non-blocking peer view so known-tip/mining UI
     // does not freeze at a stale HTTP height.
-    for (addr, height, tip_hash, _) in official_snapshot_peer_candidates(settings, 350)
+    for (addr, height, tip_hash, _, node_id) in official_snapshot_peer_candidates(settings, 350)
         .into_iter()
         .take(3)
     {
@@ -10552,7 +10783,7 @@ pub fn peer_status_cached(settings: &Settings) -> Result<P2PNetworkSnapshot> {
             tip_hash: Some(tip_hash),
             user_agent: Some("official-direct-tip".to_string()),
             error: None,
-            node_id: None,
+            node_id: if node_id.trim().is_empty() { None } else { Some(node_id) },
             observed_addr: None,
             listen_addr: None,
             role: Some("direct seed".to_string()),
@@ -11040,6 +11271,10 @@ fn probe_peer(settings: &Settings, addr: &str, timeout: Duration) -> Result<P2PP
                     bail!("unsupported protocol {protocol}");
                 }
                 validate_remote_network(settings, &network, &magic, &genesis_hash)?;
+                if remote_node_id_is_self(settings, &node_id) {
+                    hf128_quarantine_self_alias(settings, addr);
+                    bail!("peer address {addr} resolves back to this node_id");
+                }
                 return Ok(P2PProbeInfo {
                     height,
                     tip_hash,
@@ -11056,6 +11291,16 @@ fn probe_peer(settings: &Settings, addr: &str, timeout: Duration) -> Result<P2PP
         }
     }
     bail!("no version response")
+}
+
+fn remote_node_id_is_self(settings: &Settings, remote_node_id: &str) -> bool {
+    let remote = remote_node_id.trim();
+    if remote.is_empty() {
+        return false;
+    }
+    node_id(settings)
+        .map(|local| !local.trim().is_empty() && local == remote)
+        .unwrap_or(false)
 }
 
 fn fetch_peer_list(
@@ -11125,6 +11370,26 @@ mod hf125_tests {
             outputs: Vec::new(),
             locktime: marker as u32,
         }
+    }
+
+    #[test]
+    fn hf128_learned_self_alias_quarantine_is_scoped_and_idempotent() {
+        let mut settings = regtest_settings();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        settings.node.data_dir = format!("hf128-self-alias-{nonce}");
+        let alias = format!("legacy-self-{nonce}.example:17444");
+
+        assert!(!should_skip_outbound(&settings, &alias));
+        assert!(hf128_quarantine_self_alias(&settings, &alias));
+        assert!(should_skip_outbound(&settings, &alias));
+        assert!(!hf128_quarantine_self_alias(&settings, &alias));
+
+        let mut independent = settings.clone();
+        independent.node.data_dir.push_str("-independent");
+        assert!(!should_skip_outbound(&independent, &alias));
     }
 
     #[test]
@@ -11300,7 +11565,7 @@ mod hf125_tests {
         assert!(!evidence.confirmed());
 
         evidence.official_tcp_matches = 1;
-        assert!(evidence.confirmed());
+        assert!(!evidence.confirmed());
 
         evidence.http_matches = 0;
         evidence.official_tcp_matches = 2;
@@ -11313,6 +11578,7 @@ mod hf125_tests {
         evidence.http_matches = 1;
         assert!(evidence.confirmed());
     }
+
     #[test]
     fn hf127_submit_tx_and_ack_wire_messages_roundtrip() {
         let tx = dummy_tx(1, 77);

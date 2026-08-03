@@ -1248,23 +1248,35 @@ pub(crate) fn load_fast_status(
 }
 
 
-pub fn load_committed_chain(settings: &Settings, full_validate: bool) -> Result<ChainState> {
+/// Loads one committed chain view and returns the identity of the exact Fast
+/// Chain Engine commit that produced it. Keeping both values in the same read
+/// closes the identity-before-load race for cache users such as Explorer API.
+pub fn load_committed_chain_with_identity(
+    settings: &Settings,
+    full_validate: bool,
+) -> Result<(ChainState, Option<FastStorageIdentity>)> {
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
     if paths.fast_storage_exists() {
-        return load_fast_chain(settings, &paths, full_validate).map(|(chain, _)| chain);
+        return load_fast_chain(settings, &paths, full_validate)
+            .map(|(chain, identity)| (chain, Some(identity)));
     }
     if !paths.chain_file.exists() {
-        return ChainState::new_with_genesis(settings);
+        return ChainState::new_with_genesis(settings).map(|chain| (chain, None));
     }
     let raw = fs::read_to_string(&paths.chain_file)
         .with_context(|| format!("read {}", paths.chain_file.display()))?;
     let persisted: PersistedChainState = serde_json::from_str(&raw)?;
-    if full_validate {
+    let chain = if full_validate {
         ChainState::from_persisted(persisted, settings)
     } else {
         ChainState::from_persisted_unchecked_for_ui(persisted, settings)
-    }
+    }?;
+    Ok((chain, None))
+}
+
+pub fn load_committed_chain(settings: &Settings, full_validate: bool) -> Result<ChainState> {
+    load_committed_chain_with_identity(settings, full_validate).map(|(chain, _)| chain)
 }
 
 pub fn fast_storage_identity(settings: &Settings) -> Result<Option<FastStorageIdentity>> {

@@ -1,3 +1,6 @@
+# Legacy single-seed template only. HF128 production deployments MUST use the
+# regional mainnet-seed-ams3.toml / mainnet-seed-nyc3.toml files so each host
+# advertises one unique address and never bootstraps through its own alias.
 [network]
 name = "mainnet"
 magic = "0x4d425542"

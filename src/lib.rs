@@ -3541,6 +3541,8 @@ fn candidate_mempool_transactions(
     settings: &Settings,
     height: u32,
     solo_miner_for_legacy_jin: Option<&str>,
+    exclude_jin_fee_transactions: bool,
+    preferred_pool_share: Option<Hash256>,
 ) -> Result<(Vec<Transaction>, u64)> {
     let mut scratch = chain.utxos.as_ref().clone();
     let mut txs = Vec::new();
@@ -3584,7 +3586,42 @@ fn candidate_mempool_transactions(
     // blocks; they must not turn every official template into a block that
     // validate_pools_block() will reject.
     let mut selected_pool_shares = 0usize;
+    let mut reserved_share_txid = None;
+    // HF128 bootstrap liveness: reserve exactly one valid share for the pool
+    // whose confirmed PPLNS window is empty. Without this reservation, 128
+    // older shares belonging to other pools can consume the global block cap
+    // and leave the target pool with no deterministic compatibility payout.
+    if let Some(preferred_pool_id) = preferred_pool_share {
+        for tx in &pool_share_transactions {
+            let Some(share) = parse_pool_share_tx(tx) else {
+                continue;
+            };
+            if share.pool_id != preferred_pool_id
+                || txs.len() + 1 >= settings.consensus.max_block_transactions
+                || selected_pool_shares >= settings.pools.max_share_txs_per_block
+            {
+                continue;
+            }
+            if validate_tx_contextual(tx, &scratch, height, settings, true).is_err() {
+                continue;
+            }
+            if pool_context
+                .validate_and_apply(tx, &chain.blocks, &scratch, height, 0, settings)
+                .is_err()
+            {
+                continue;
+            }
+            let txid = tx.txid();
+            txs.push((**tx).clone());
+            selected_pool_shares = selected_pool_shares.saturating_add(1);
+            reserved_share_txid = Some(txid);
+            break;
+        }
+    }
     for tx in pool_share_transactions {
+        if reserved_share_txid == Some(tx.txid()) {
+            continue;
+        }
         if txs.len() + 1 >= settings.consensus.max_block_transactions {
             break;
         }
@@ -3632,6 +3669,15 @@ fn candidate_mempool_transactions(
     for tx in non_pool_transactions {
         if txs.len() + 1 >= settings.consensus.max_block_transactions {
             break;
+        }
+
+        // HF128/v1.8.4: a markerless pool-compatibility block is deliberately
+        // interpreted as a generic block by HF127 nodes. Native-JIN fees must
+        // therefore wait for the next ordinary POOLBLOCK1 template; otherwise
+        // legacy JIN accounting would credit the entire JIN fee to coinbase
+        // output[0] instead of applying the deterministic pool split.
+        if exclude_jin_fee_transactions && transaction_jin_fee_units(settings, tx) > 0 {
+            continue;
         }
 
         if hf106_jin_sale_standardness_policy(tx, settings).is_err() {
@@ -3791,16 +3837,34 @@ pub struct CandidateBlockParts {
     pub version: u32,
     pub reward_atoms: u64,
     pub non_coinbase_transactions: Vec<Transaction>,
+    /// False when a selected QUB Melt makes the legacy POOLBLOCK1 payout
+    /// equation impossible. This is template policy only, never consensus.
+    pub legacy_pool_marker_compatible: bool,
 }
 
-pub fn build_candidate_block_parts(
+fn build_candidate_block_parts_with_policy(
     chain: &ChainState,
     settings: &Settings,
     solo_miner_for_legacy_jin: Option<&str>,
+    exclude_jin_fee_transactions: bool,
+    preferred_pool_share: Option<Hash256>,
 ) -> Result<CandidateBlockParts> {
     let height = chain.height().saturating_add(1);
-    let (transactions, fees) =
-        candidate_mempool_transactions(chain, settings, height, solo_miner_for_legacy_jin)?;
+    let (transactions, fees) = candidate_mempool_transactions(
+        chain,
+        settings,
+        height,
+        solo_miner_for_legacy_jin,
+        exclude_jin_fee_transactions,
+        preferred_pool_share,
+    )?;
+    let mut legacy_pool_marker_compatible = true;
+    for tx in &transactions {
+        if qub_jin_melt_burn_atoms_for_fee(settings, tx, height)? > 0 {
+            legacy_pool_marker_compatible = false;
+            break;
+        }
+    }
     let reward_atoms = block_subsidy(height as u64, settings)
         .checked_add(fees)
         .context("reward overflow")?;
@@ -3812,7 +3876,171 @@ pub fn build_candidate_block_parts(
         version: expected_block_version(settings, height),
         reward_atoms,
         non_coinbase_transactions: transactions,
+        legacy_pool_marker_compatible,
     })
+}
+
+pub fn build_candidate_block_parts(
+    chain: &ChainState,
+    settings: &Settings,
+    solo_miner_for_legacy_jin: Option<&str>,
+) -> Result<CandidateBlockParts> {
+    build_candidate_block_parts_with_policy(
+        chain,
+        settings,
+        solo_miner_for_legacy_jin,
+        false,
+        None,
+    )
+}
+
+fn build_pool_compatibility_candidate_block_parts(
+    chain: &ChainState,
+    settings: &Settings,
+    preferred_pool_share: Option<Hash256>,
+) -> Result<CandidateBlockParts> {
+    build_candidate_block_parts_with_policy(
+        chain,
+        settings,
+        None,
+        true,
+        preferred_pool_share,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolCandidateMode {
+    ConsensusPplns,
+    MeltCompatibility,
+    ShareBootstrapCompatibility,
+}
+
+impl PoolCandidateMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ConsensusPplns => "pool",
+            Self::MeltCompatibility => "pool_compat_melt",
+            Self::ShareBootstrapCompatibility => "pool_compat_bootstrap",
+        }
+    }
+
+    pub fn compatibility_reason(self) -> Option<&'static str> {
+        match self {
+            Self::ConsensusPplns => None,
+            Self::MeltCompatibility => Some("melt"),
+            Self::ShareBootstrapCompatibility => Some("share-bootstrap"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolCandidatePlan {
+    pub parts: CandidateBlockParts,
+    pub outputs: Vec<TxOut>,
+    pub mode: PoolCandidateMode,
+}
+
+/// HF128/v1.8.4 transport/template policy. HF127's generic validator subtracts
+/// the QUB Melt burn from claimable fees, while its pool validator compares the
+/// POOLBLOCK1 outputs against the raw input/output delta. No marked pool block
+/// can satisfy both equations. A markerless compatibility coinbase keeps the
+/// exact generic reward and deterministic pool payouts, so unchanged HF127
+/// nodes accept it without an activation height or consensus split.
+pub fn build_pool_candidate_plan(
+    chain: &ChainState,
+    settings: &Settings,
+    pool_id: Hash256,
+) -> Result<PoolCandidatePlan> {
+    let spend_height = chain.height().saturating_add(1);
+    if !settings.features.pooled_mining_enabled || !settings.pools.enabled {
+        bail!("pooled mining is disabled on this network");
+    }
+    if spend_height < settings.pools.activation_height {
+        bail!(
+            "pooled mining activates at block #{}",
+            settings.pools.activation_height
+        );
+    }
+    let registry = pools::cached_pools_registry_from_blocks(settings, &chain.blocks)?;
+    if !registry.contains_key(&pool_id) {
+        bail!("unknown pool_id");
+    }
+    let confirmed_score = pool_share_scores_from_blocks(
+        settings,
+        &chain.blocks,
+        spend_height,
+        pool_id,
+    )
+    .values()
+    .copied()
+    .fold(0u128, u128::saturating_add);
+
+    let mut mode = if confirmed_score == 0 {
+        PoolCandidateMode::ShareBootstrapCompatibility
+    } else {
+        PoolCandidateMode::ConsensusPplns
+    };
+    let mut parts = if mode == PoolCandidateMode::ConsensusPplns {
+        build_candidate_block_parts(chain, settings, None)?
+    } else {
+        build_pool_compatibility_candidate_block_parts(chain, settings, Some(pool_id))?
+    };
+
+    if mode == PoolCandidateMode::ConsensusPplns && !parts.legacy_pool_marker_compatible {
+        mode = PoolCandidateMode::MeltCompatibility;
+        parts = build_pool_compatibility_candidate_block_parts(chain, settings, None)?;
+    }
+
+    let outputs = if mode == PoolCandidateMode::ConsensusPplns {
+        expected_pool_coinbase_outputs(
+            settings,
+            &chain.blocks,
+            pool_id,
+            parts.reward_atoms as u128,
+        )?
+    } else {
+        expected_pool_compatibility_coinbase_outputs(
+            settings,
+            &chain.blocks,
+            pool_id,
+            parts.reward_atoms as u128,
+            &parts.non_coinbase_transactions,
+        )?
+    };
+
+    Ok(PoolCandidatePlan {
+        parts,
+        outputs,
+        mode,
+    })
+}
+
+pub fn create_pool_candidate_coinbase(
+    parts: &CandidateBlockParts,
+    outputs: &[TxOut],
+    pool_id: Hash256,
+    extra_nonce: u64,
+    mode: PoolCandidateMode,
+) -> Transaction {
+    let signature_script = match mode.compatibility_reason() {
+        Some(reason) => pool_compatibility_marker_script(
+            parts.height,
+            extra_nonce,
+            pool_id,
+            reason,
+        ),
+        None => pool_block_marker_script(parts.height, extra_nonce, pool_id),
+    };
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script,
+            sequence: u32::MAX,
+        }],
+        outputs: outputs.to_vec(),
+        locktime: 0,
+    }
 }
 
 pub fn block_from_candidate_parts(parts: &CandidateBlockParts, coinbase: Transaction) -> Block {
@@ -3857,35 +4085,15 @@ pub fn build_candidate_pool_block(
     pool_id: Hash256,
     extra_nonce: u64,
 ) -> Result<Block> {
-    let height = chain.height() + 1;
-    if !pools_active(settings, height) {
-        bail!(
-            "pooled mining activates at block #{}",
-            settings.pools.activation_height
-        );
-    }
-    let registry = pools::cached_pools_registry_from_blocks(settings, &chain.blocks)?;
-    if !registry.contains_key(&pool_id) {
-        bail!("unknown pool_id");
-    }
-    let parts = build_candidate_block_parts(chain, settings, None)?;
-    let outputs = expected_pool_coinbase_outputs(
-        settings,
-        &chain.blocks,
+    let plan = build_pool_candidate_plan(chain, settings, pool_id)?;
+    let coinbase = create_pool_candidate_coinbase(
+        &plan.parts,
+        &plan.outputs,
         pool_id,
-        parts.reward_atoms as u128,
-    )?;
-    let coinbase = Transaction {
-        version: 1,
-        inputs: vec![TxIn {
-            previous_output: OutPoint::null(),
-            signature_script: pool_block_marker_script(parts.height, extra_nonce, pool_id),
-            sequence: u32::MAX,
-        }],
-        outputs,
-        locktime: 0,
-    };
-    Ok(block_from_candidate_parts(&parts, coinbase))
+        extra_nonce,
+        plan.mode,
+    );
+    Ok(block_from_candidate_parts(&plan.parts, coinbase))
 }
 
 pub fn mine_next_block(
@@ -3958,6 +4166,12 @@ pub fn mine_next_pool_block(
 
 fn mining_payout_label(settings: &Settings, block: &Block) -> (String, String) {
     if let Some(pool_id) = parse_pool_block_marker(block) {
+        return (format!("pool:{}", pool_id), "pool".to_string());
+    }
+    if let Some((pool_id, _reason)) = parse_pool_compatibility_marker(block) {
+        // POOLCOMPAT1 is display/diagnostic metadata only. Treat its payout
+        // label as the same pool for mining statistics without changing any
+        // consensus or native-JIN fee accounting path.
         return (format!("pool:{}", pool_id), "pool".to_string());
     }
     if let Some(address) = block
@@ -7110,25 +7324,27 @@ pub fn format_jin_amount(units: u128) -> String {
     format!("{whole}.{s}")
 }
 
+pub fn transaction_jin_fee_units(settings: &Settings, tx: &Transaction) -> u128 {
+    let transfer_fees = jin_transfers_in_tx(tx, settings)
+        .into_iter()
+        .filter(|(_, transfer, _)| transfer.fee_asset == "JIN")
+        .map(|(_, transfer, _)| transfer.fee_units)
+        .fold(0u128, u128::saturating_add);
+    let conversion_fees = jin_conversions_in_tx(tx, settings)
+        .into_iter()
+        .filter(|(_, conversion, _)| conversion.fee_asset == "JIN")
+        .map(|(_, conversion, _)| conversion.fee_units)
+        .fold(0u128, u128::saturating_add);
+    transfer_fees.saturating_add(conversion_fees)
+}
+
 pub fn block_jin_fee_units(settings: &Settings, block: &Block) -> u128 {
     block
         .transactions
         .iter()
         .skip(1)
-        .map(|tx| {
-            let transfer_fees = jin_transfers_in_tx(tx, settings)
-                .into_iter()
-                .filter(|(_, t, _)| t.fee_asset == "JIN")
-                .map(|(_, t, _)| t.fee_units)
-                .fold(0u128, |a, b| a.saturating_add(b));
-            let conversion_fees = jin_conversions_in_tx(tx, settings)
-                .into_iter()
-                .filter(|(_, t, _)| t.fee_asset == "JIN")
-                .map(|(_, t, _)| t.fee_units)
-                .fold(0u128, |a, b| a.saturating_add(b));
-            transfer_fees.saturating_add(conversion_fees)
-        })
-        .fold(0u128, |a, b| a.saturating_add(b))
+        .map(|tx| transaction_jin_fee_units(settings, tx))
+        .fold(0u128, u128::saturating_add)
 }
 
 pub fn jin_active(settings: &Settings, height: u32) -> bool {

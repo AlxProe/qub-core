@@ -189,6 +189,13 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
             "hf127_tx_submit_reserve_lane": true,
             "hf127_low_latency_propagation": true,
             "hf127_full_power_mining_controls": true,
+            "hf128_live_mining_power_application": true,
+            "hf128_pool_liveness_compatibility": true,
+            "hf128_bounded_chain_sync": true,
+            "hf128_seed_identity_dedupe": true,
+            "hf128_self_alias_quarantine": true,
+            "hf128_atomic_explorer_snapshot": true,
+            "hf128_updater_recovery": true,
             "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
             "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
             "hf121_status_fast": true,
@@ -274,6 +281,13 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "hf127_tx_submit_reserve_lane": true,
         "hf127_low_latency_propagation": true,
         "hf127_full_power_mining_controls": true,
+        "hf128_live_mining_power_application": true,
+        "hf128_pool_liveness_compatibility": true,
+        "hf128_bounded_chain_sync": true,
+        "hf128_seed_identity_dedupe": true,
+        "hf128_self_alias_quarantine": true,
+        "hf128_atomic_explorer_snapshot": true,
+        "hf128_updater_recovery": true,
         "generated_at_unix": now,
         "status_generated_at_unix": status.generated_at_unix,
         "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
@@ -1697,7 +1711,7 @@ fn cmd_pool_mine(
                         "pool_id": pool_id.to_string(),
                         "miner_address": key.address.clone(),
                         "pool_block_not_mined": err.to_string(),
-                        "note": "Pool payout uses confirmed prior-window shares. Confirm at least one pool-share tx first, then pool-mine can build deterministic pool blocks.",
+                        "note": "HF128 can bootstrap an empty PPLNS window from a valid pending share. Re-run pool-join or pool-mine to submit or refresh a current-parent share; no solo confirmation is required.",
                     }))?
                 );
                 break;
@@ -2529,12 +2543,19 @@ fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
             }
         }
 
-        let chain = Arc::new(load_committed_chain(settings, false)?);
+        // Load the chain and its identity from the same immutable FCE commit.
+        // Reading identity first and chain second could cache generation N+1
+        // under generation N during a concurrent block commit, making API
+        // readers appear stuck until another commit invalidated the cache.
+        let (loaded, exact_identity) = load_committed_chain_with_identity(settings, false)?;
+        let exact_identity = exact_identity
+            .context("Fast Chain Engine identity disappeared during Explorer chain load")?;
+        let chain = Arc::new(loaded);
         if let Ok(mut cache) = explorer_chain_cache().lock() {
             cache.insert(
                 key,
                 ExplorerChainCacheEntry {
-                    identity,
+                    identity: exact_identity,
                     chain: Arc::clone(&chain),
                 },
             );
@@ -2660,7 +2681,7 @@ fn explorer_route(
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.3",
+            "version": "1.8.4",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -3152,7 +3173,19 @@ fn block_summary_json(settings: &Settings, block: &Block, height: u32) -> serde_
         .first()
         .map(|tx| tx.outputs.iter().map(|o| o.value.atoms()).sum::<u64>())
         .unwrap_or(0);
-    let pool_id = parse_pool_block_marker(block).map(|id| id.to_string());
+    let consensus_pool_id = parse_pool_block_marker(block).map(|id| id.to_string());
+    // POOLCOMPAT1 is diagnostic metadata for APIs/UI only. Consensus and JIN
+    // accounting continue to recognize only POOLBLOCK1.
+    let pool_compatibility = parse_pool_compatibility_marker(block);
+    let pool_compatibility_reason = pool_compatibility
+        .as_ref()
+        .map(|(_, reason)| reason.clone());
+    let pool_id = consensus_pool_id.clone().or_else(|| {
+        pool_compatibility
+            .as_ref()
+            .map(|(id, _)| id.to_string())
+    });
+    let is_pool_compatibility = pool_compatibility.is_some();
     serde_json::json!({
         "height": height,
         "hash": block.block_hash().to_string(),
@@ -3165,6 +3198,9 @@ fn block_summary_json(settings: &Settings, block: &Block, height: u32) -> serde_
         "miner_address": coinbase_to.unwrap_or_else(|| "unknown".to_string()),
         "pool_block": pool_id.is_some(),
         "pool_id": pool_id,
+        "pool_consensus_marker": consensus_pool_id.is_some(),
+        "pool_compatibility": is_pool_compatibility,
+        "pool_compatibility_reason": pool_compatibility_reason,
         "bits": format!("0x{:08x}", block.header.bits),
         "nonce": block.header.nonce,
         "merkle_root": block.header.merkle_root.to_string(),
@@ -3485,5 +3521,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.3\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.4\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

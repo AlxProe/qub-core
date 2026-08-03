@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.8.3";
+const RPC_VERSION: &str = "1.8.4";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;
@@ -86,6 +86,8 @@ struct MiningJob {
     coinbase: Transaction,
     non_coinbase_transactions: Arc<Vec<Transaction>>,
     mode: String,
+    pool_candidate_mode: Option<String>,
+    compatibility_reason: Option<String>,
     payout_label: String,
     extra_nonce: u64,
 }
@@ -279,7 +281,7 @@ pub fn start_embedded(settings: Settings, chain: Arc<Mutex<ChainState>>) -> Resu
     let bind = settings.rpc.bind.clone();
     let listener = prepare_listener(&settings, &bind)?;
     let state = Arc::new(build_server_state(settings, RpcBackend::Embedded(chain))?);
-    println!("QUB HF127 embedded RPC listening on http://{bind}");
+    println!("QUB HF128 embedded RPC listening on http://{bind}");
     println!(
         "RPC mode={} remote={} state_changes=true mining_templates=true",
         state.backend.mode_name(),
@@ -301,7 +303,7 @@ pub fn run_standalone(settings: Settings, bind_override: Option<&str>) -> Result
         settings,
         RpcBackend::StandaloneReadOnly,
     )?);
-    println!("QUB HF127 standalone read-only RPC listening on http://{bind}");
+    println!("QUB HF128 standalone read-only RPC listening on http://{bind}");
     println!("State-changing endpoints require embedded `qubd node` mode.");
     serve(listener, state);
     Ok(())
@@ -1013,12 +1015,19 @@ fn create_templates(
     }
 
     state.backend.with_chain_read(&state.settings, |chain| {
-        let (mode, payout_label, parts, pool_outputs) = if let Some(address_text) = address_text {
+        let (
+            mode,
+            payout_label,
+            parts,
+            pool_outputs,
+            pool_candidate_mode,
+            compatibility_reason,
+        ) = if let Some(address_text) = address_text {
             let address =
                 Address::parse_with_prefix(address_text, &state.settings.network.address_prefix)?;
             let label = address.to_string();
             let parts = build_candidate_block_parts(chain, &state.settings, Some(&label))?;
-            ("solo".to_string(), label, parts, None)
+            ("solo".to_string(), label, parts, None, None, None)
         } else {
             let pool_id = Hash256::from_hex(pool_text.unwrap_or_default())?;
             if !pools_active(&state.settings, chain.height().saturating_add(1)) {
@@ -1028,18 +1037,17 @@ fn create_templates(
             if !registry.contains_key(&pool_id) {
                 bail!("unknown pool_id");
             }
-            let parts = build_candidate_block_parts(chain, &state.settings, None)?;
-            let outputs = expected_pool_coinbase_outputs(
-                &state.settings,
-                &chain.blocks,
-                pool_id,
-                parts.reward_atoms as u128,
-            )?;
+            let plan = build_pool_candidate_plan(chain, &state.settings, pool_id)?;
+            let pool_mode = plan.mode;
             (
+                // Keep the stable RPC v1 discriminator for existing miners.
+                // HF128 policy detail is exposed only through additive fields.
                 "pool".to_string(),
                 format!("pool:{pool_id}"),
-                parts,
-                Some((pool_id, outputs)),
+                plan.parts,
+                Some((pool_id, plan.outputs, pool_mode)),
+                Some(pool_mode.label().to_string()),
+                pool_mode.compatibility_reason().map(str::to_string),
             )
         };
 
@@ -1056,21 +1064,15 @@ fn create_templates(
                 )?;
                 create_coinbase(parts.height, parts.reward_atoms, &address, extra_nonce)?
             } else {
-                let (pool_id, outputs) = pool_outputs.as_ref().context("missing pool outputs")?;
-                Transaction {
-                    version: 1,
-                    inputs: vec![TxIn {
-                        previous_output: OutPoint::null(),
-                        signature_script: pool_block_marker_script(
-                            parts.height,
-                            extra_nonce,
-                            *pool_id,
-                        ),
-                        sequence: u32::MAX,
-                    }],
-                    outputs: outputs.clone(),
-                    locktime: 0,
-                }
+                let (pool_id, outputs, pool_mode) =
+                    pool_outputs.as_ref().context("missing pool outputs")?;
+                create_pool_candidate_coinbase(
+                    &parts,
+                    outputs,
+                    *pool_id,
+                    extra_nonce,
+                    *pool_mode,
+                )
             };
             let mut txids = Vec::with_capacity(tail.len() + 1);
             txids.push(coinbase.txid());
@@ -1105,6 +1107,8 @@ fn create_templates(
                 coinbase: coinbase.clone(),
                 non_coinbase_transactions: Arc::clone(&tail),
                 mode: mode.clone(),
+                pool_candidate_mode: pool_candidate_mode.clone(),
+                compatibility_reason: compatibility_reason.clone(),
                 payout_label: payout_label.clone(),
                 extra_nonce,
             };
@@ -1130,6 +1134,8 @@ fn template_value(settings: &Settings, job: &MiningJob, include_full: bool) -> V
         "job_id":job.id,
         "network":settings.network.name,
         "mode":job.mode,
+        "pool_candidate_mode":job.pool_candidate_mode,
+        "compatibility_reason":job.compatibility_reason,
         "payout_label":job.payout_label,
         "height":job.height,
         "parent_hash":job.parent_hash.to_string(),
@@ -1239,6 +1245,8 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
             "height":job.height,
             "hash":block_hash.to_string(),
             "mode":job.mode,
+            "pool_candidate_mode":job.pool_candidate_mode,
+            "compatibility_reason":job.compatibility_reason,
             "payout_label":job.payout_label,
             "relay_acknowledged":relay_report.acknowledged(),
             "relay_pending_retry":relay_report.pending_retry,
@@ -1621,6 +1629,8 @@ mod tests {
                 },
                 non_coinbase_transactions: Arc::new(Vec::new()),
                 mode: "solo".to_string(),
+                pool_candidate_mode: None,
+                compatibility_reason: None,
                 payout_label: "test".to_string(),
                 extra_nonce: index,
             };

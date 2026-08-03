@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,7 @@ mod gpu_miner;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
-use std::process::Command;
+use std::process::{Command, Stdio};
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.3";
+const APP_VERSION: &str = "v1.8.4";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -72,8 +72,16 @@ const DEFAULT_TESTNET_UPDATE_URL: &str = "https://download.qubit-coin.io/testnet
 const DEFAULT_UPDATE_URL: &str = DEFAULT_MAINNET_UPDATE_URL;
 const ALLOW_UNSIGNED_MAINNET_UPDATES_PRIVATE_BUILD: bool = true;
 const UPDATE_CHECK_INTERVAL_SECS: u64 = 60;
+// The manifest and installer each have three bounded download attempts. Their
+// combined worst-case network budget is a little over 15 minutes, before local
+// hashing and bounded Authenticode inspection. Keep the GUI watchdog safely
+// above that budget; operation-unique staging paths make even an exceptional
+// late worker harmless to a subsequent retry.
+const UPDATE_CHECK_WATCHDOG_SECS: u64 = 20 * 60;
 const UPDATE_INSTALL_COUNTDOWN_SECS: u64 = 15;
-const UPDATE_DOWNLOAD_PATH: &str = "data/updater/QUB-Core-Latest.exe";
+const UPDATE_MANIFEST_MAX_BYTES: u64 = 1_048_576;
+const UPDATE_INSTALLER_MAX_BYTES: u64 = 1_073_741_824;
+const UPDATE_INSTALL_RESULT_PATH: &str = "data/updater/install-result.txt";
 const DEFAULT_WALLET_SYNC_INTERVAL_SECS: u64 = 15;
 const HF127_HIGH_POWER_WARNING_PERCENT: u8 = 85;
 const ENJIN_MATRIX_METRICS_REFRESH_SECS: u64 = 300;
@@ -125,6 +133,9 @@ const FIATJ_APPROVE_GAS_LIMIT: u64 = 70_000;
 static HF105_CATCHUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static HF105_CATCHUP_EPOCH: AtomicU64 = AtomicU64::new(0);
 static HF105_CATCHUP_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+static HF128_CATCHUP_FORCE_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static HF128_UPDATE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static HF105_SNAPSHOT_WORKER_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static HF105_SNAPSHOT_WORKER_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -159,6 +170,11 @@ fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
     // gate merely because a slow worker crossed an elapsed-time threshold; that
     // created phantom completion pulses and status churn while the original
     // consensus writer was still alive.
+    if force {
+        // A manual Sync/Repair request must survive an already-running
+        // automatic pulse. HF127 silently discarded it at this point.
+        HF128_CATCHUP_FORCE_PENDING.store(true, Ordering::SeqCst);
+    }
     if HF105_CATCHUP_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -167,25 +183,46 @@ fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
     }
     HF105_CATCHUP_STARTED_MS.store(now_ms, Ordering::SeqCst);
     thread::spawn(move || {
-        let _ = std::panic::catch_unwind(|| {
-            let _ = (|| -> Result<()> {
-                let settings = load_gui_settings(&config_path)?;
-                if settings.p2p.enabled && matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
-                    if force {
-                        // HF111/v1.7.1: force/manual/auto-heal repairs use a
-                        // deeper official-only chain repair path. This replaces
-                        // the user workaround of deleting local data while keeping
-                        // wallet.json safe.
-                        let _ = p2p::hf110_deep_official_repair(&settings, 420_000);
-                    } else {
-                        let _ = p2p::hf90_auto_catchup(&settings, 240_000);
+        let mut first_force = force;
+        loop {
+            // Always consume the queued flag, even when this worker was born
+            // from a force request. Using `force || swap(false)` leaves the
+            // flag set because `||` short-circuits and turns one click into an
+            // endless sequence of 420-second repairs.
+            let queued_force = HF128_CATCHUP_FORCE_PENDING.swap(false, Ordering::SeqCst);
+            let run_force = first_force || queued_force;
+            first_force = false;
+            let _ = std::panic::catch_unwind(|| {
+                let _ = (|| -> Result<()> {
+                    let settings = load_gui_settings(&config_path)?;
+                    if settings.p2p.enabled && matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
+                        if run_force {
+                            // HF111/v1.7.1: force/manual/auto-heal repairs use a
+                            // deeper official-only chain repair path. This replaces
+                            // the user workaround of deleting local data while keeping
+                            // wallet.json safe.
+                            let _ = p2p::hf110_deep_official_repair(&settings, 420_000);
+                        } else {
+                            let _ = p2p::hf90_auto_catchup(&settings, 240_000);
+                        }
                     }
-                }
-                Ok(())
-            })();
-        });
+                    Ok(())
+                })();
+            });
+            if !HF128_CATCHUP_FORCE_PENDING.load(Ordering::SeqCst) {
+                break;
+            }
+            // A force request arrived while the automatic pass owned the
+            // writer. Run it in this same worker with no competing disk writer.
+            HF105_CATCHUP_STARTED_MS.store(hf85_now_ms(), Ordering::SeqCst);
+        }
         HF105_CATCHUP_EPOCH.fetch_add(1, Ordering::SeqCst);
         HF105_CATCHUP_IN_FLIGHT.store(false, Ordering::SeqCst);
+        // Close the tiny handoff race: if a force request arrived after the
+        // final loop check but before the gate opened, immediately reacquire it.
+        if HF128_CATCHUP_FORCE_PENDING.load(Ordering::SeqCst) {
+            spawn_hf85_catchup_pulse(config_path, true);
+        }
     });
 }
 
@@ -1001,6 +1038,9 @@ struct UpdateDialog {
     status: UpdateStatus,
     latest_version: String,
     installer_path: String,
+    installer_sha256: String,
+    installer_bytes: u64,
+    installer_allow_unsigned: bool,
     remote_signature: String,
     message: String,
     auto_install_at: Option<Instant>,
@@ -1009,7 +1049,15 @@ struct UpdateDialog {
 #[derive(Debug)]
 enum UpdateEvent {
     UpToDate { signature: String, message: String },
-    Ready { version: String, installer_path: String, signature: String, message: String },
+    Ready {
+        version: String,
+        installer_path: String,
+        installer_sha256: String,
+        installer_bytes: u64,
+        installer_allow_unsigned: bool,
+        signature: String,
+        message: String,
+    },
     Failed(String),
 }
 
@@ -1318,11 +1366,13 @@ enum MinerEvent {
     GpuStarted { device: String, workers: usize, power: u8, target_height: u32 },
     GpuHashrate { hps: f64, total_hashes: u64, workers: usize, device: String, target_height: u32 },
     GpuStatus(String),
-    BlockFound { height: u32, hash: String, txs: usize, reward: String },
+    GpuStopped { device: String },
+    BlockFound { height: u32, hash: String, txs: usize, reward: String, mode: String },
     BlockStale { height: u32, hash: String, winner_hash: String },
     Status(String),
     Error(String),
-    Stopped,
+    PlanRejected(String),
+    Stopped { restart_allowed: bool },
 }
 
 #[derive(Debug)]
@@ -1490,6 +1540,7 @@ struct QubCoreApp {
     gpu_device_rates: HashMap<String, (f64, u64, usize)>,
     miner_threads: usize,
     miner_duty: u8,
+    miner_gpu_power: u8,
     target_height: u32,
     block_history: VecDeque<BlockCard>,
     last_local_mined_at: Option<Instant>,
@@ -1508,6 +1559,7 @@ struct QubCoreApp {
     update_rx: Option<mpsc::Receiver<UpdateEvent>>,
     update_check_in_flight: bool,
     update_check_forced: bool,
+    update_check_started_at: Option<Instant>,
     last_update_check: Instant,
     qr_cache_address: String,
     qr_cache_texture: Option<egui::TextureHandle>,
@@ -1902,6 +1954,7 @@ impl QubCoreApp {
             gpu_device_rates: HashMap::new(),
             miner_threads: 0,
             miner_duty: 0,
+            miner_gpu_power: 0,
             target_height: 0,
             block_history: VecDeque::new(),
             last_local_mined_at: None,
@@ -1920,6 +1973,7 @@ impl QubCoreApp {
             update_rx: None,
             update_check_in_flight: false,
             update_check_forced: false,
+            update_check_started_at: None,
             last_update_check: Instant::now() - Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS),
             qr_cache_address: String::new(),
             qr_cache_texture: None,
@@ -1970,6 +2024,10 @@ impl QubCoreApp {
         app.normalize_update_prefs_for_network();
         app.apply_hf105_first_run_auto_restart_default();
         app.update_runtime_identity();
+        if let Some(update_error) = consume_update_install_error() {
+            app.last_error = Some(update_error.clone());
+            app.status_line = update_error;
+        }
         if app.prefs.setup_complete {
             let after_update_restart = consume_hf86_post_update_restart_marker();
             if after_update_restart {
@@ -2041,21 +2099,15 @@ impl QubCoreApp {
             || current.eq_ignore_ascii_case(LEGACY_DEFAULT_UPDATE_URL)
             || current.eq_ignore_ascii_case(LEGACY_MAINNET_UPDATE_URL)
             || current.eq_ignore_ascii_case(LEGACY_TESTNET_UPDATE_URL)
-            || current.ends_with("/QUB-Core-Latest.exe")
             || (channel == "mainnet" && current.contains("/testnet/"))
             || (channel == "testnet" && current.contains("/mainnet/"));
         if should_migrate_url {
             self.prefs.update_url = desired_url.to_string();
             self.prefs_dirty = true;
         }
-        if channel == "mainnet" && ALLOW_UNSIGNED_MAINNET_UPDATES_PRIVATE_BUILD {
-            if !self.prefs.auto_check_updates || !self.prefs.auto_download_updates || !self.prefs.auto_install_updates {
-                self.prefs.auto_check_updates = true;
-                self.prefs.auto_download_updates = true;
-                self.prefs.auto_install_updates = true;
-                self.prefs_dirty = true;
-            }
-        }
+        // Auto-update booleans are user choices. Defaults remain enabled for a
+        // new profile, but normalization must never turn an explicit opt-out
+        // back on (HF127 made all three checkboxes effectively non-persistent).
         if self.prefs.pace_to_target_spacing {
             self.prefs.pace_to_target_spacing = false;
             self.prefs_dirty = true;
@@ -3186,7 +3238,18 @@ Personal record: {}", format_hps(current), format_hps(peak)));
     }
 
     fn start_update_check(&mut self, force: bool) {
-        if self.update_check_in_flight { return; }
+        if self.update_check_in_flight {
+            if force {
+                self.update_dialog.open = true;
+                let elapsed = self
+                    .update_check_started_at
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(0);
+                self.update_dialog.message =
+                    format!("An update check is already running ({elapsed}s elapsed).");
+            }
+            return;
+        }
         self.normalize_update_prefs_for_network();
         if !force {
             if !self.prefs.setup_complete || !self.prefs.auto_check_updates || !self.prefs.auto_download_updates {
@@ -3197,18 +3260,41 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         if url.is_empty() { return; }
         self.update_check_in_flight = true;
         self.update_check_forced = force;
+        self.update_check_started_at = Some(Instant::now());
         self.update_dialog.status = UpdateStatus::Checking;
         self.update_dialog.message = format!("Checking {} for QUB Core updates...", url);
         let last_sig = self.update_dialog.remote_signature.clone();
         let current_version = APP_VERSION.to_string();
-        let allow_unsigned_update = self.snapshot.network.eq_ignore_ascii_case("testnet")
-            || (self.is_mainnet_network() && ALLOW_UNSIGNED_MAINNET_UPDATES_PRIVATE_BUILD);
+        // Update trust follows the immutable build channel, just like the
+        // normalized URL. The first automatic check can start before the chain
+        // snapshot has loaded, when `snapshot.network` is still "not loaded".
+        let allow_unsigned_update = build_channel() == "testnet"
+            || (build_channel() == "mainnet"
+                && ALLOW_UNSIGNED_MAINNET_UPDATES_PRIVATE_BUILD);
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let event = windows_check_and_stage_update(&url, &current_version, &last_sig, allow_unsigned_update)
+        if let Err(err) = thread::Builder::new()
+            .name("qub-update-check".to_string())
+            .spawn(move || {
+                let event = windows_check_and_stage_update(
+                    &url,
+                    &current_version,
+                    &last_sig,
+                    allow_unsigned_update,
+                )
                 .unwrap_or_else(|err| UpdateEvent::Failed(format!("{err:#}")));
-            let _ = tx.send(event);
-        });
+                let _ = tx.send(event);
+            })
+        {
+            self.update_check_in_flight = false;
+            self.update_check_forced = false;
+            self.update_check_started_at = None;
+            self.update_dialog.status = UpdateStatus::Failed;
+            self.update_dialog.message = format!("Could not start update worker: {err}");
+            self.update_dialog.open = force;
+            self.last_error = Some(self.update_dialog.message.clone());
+            self.last_update_check = Instant::now();
+            return;
+        }
         self.update_rx = Some(rx);
         self.last_update_check = Instant::now();
     }
@@ -3219,6 +3305,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             Some(Ok(UpdateEvent::UpToDate { signature, message })) => {
                 self.update_check_in_flight = false;
                 self.update_check_forced = false;
+                self.update_check_started_at = None;
                 self.update_dialog.remote_signature = signature;
                 if self.update_dialog.status != UpdateStatus::Ready {
                     self.update_dialog.status = UpdateStatus::UpToDate;
@@ -3226,12 +3313,24 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 }
                 self.update_rx = None;
             }
-            Some(Ok(UpdateEvent::Ready { version, installer_path, signature, message })) => {
+            Some(Ok(UpdateEvent::Ready {
+                version,
+                installer_path,
+                installer_sha256,
+                installer_bytes,
+                installer_allow_unsigned,
+                signature,
+                message,
+            })) => {
                 self.update_check_in_flight = false;
                 self.update_check_forced = false;
+                self.update_check_started_at = None;
                 self.update_dialog.status = UpdateStatus::Ready;
                 self.update_dialog.latest_version = version.clone();
                 self.update_dialog.installer_path = installer_path;
+                self.update_dialog.installer_sha256 = installer_sha256;
+                self.update_dialog.installer_bytes = installer_bytes;
+                self.update_dialog.installer_allow_unsigned = installer_allow_unsigned;
                 self.update_dialog.remote_signature = signature;
                 self.update_dialog.message = message;
                 self.update_dialog.open = true;
@@ -3250,6 +3349,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 let was_forced = self.update_check_forced;
                 self.update_check_in_flight = false;
                 self.update_check_forced = false;
+                self.update_check_started_at = None;
                 self.update_dialog.status = UpdateStatus::Failed;
                 self.update_dialog.message = err.clone();
                 self.last_error = Some(format!("Update check failed: {err}"));
@@ -3260,6 +3360,10 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 self.update_check_in_flight = false;
                 self.update_check_forced = false;
+                self.update_check_started_at = None;
+                self.update_dialog.status = UpdateStatus::Failed;
+                self.update_dialog.message = "Update worker stopped before returning a result. Click Check now to retry.".to_string();
+                self.last_error = Some(self.update_dialog.message.clone());
                 self.update_rx = None;
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {
@@ -3270,14 +3374,41 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             }
         }
 
-        if self.prefs.setup_complete && !self.update_check_in_flight && self.last_update_check.elapsed() >= Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS) {
+        if self.update_check_in_flight
+            && self
+                .update_check_started_at
+                .map(|started| started.elapsed() >= Duration::from_secs(UPDATE_CHECK_WATCHDOG_SECS))
+                .unwrap_or(false)
+        {
+            self.update_check_in_flight = false;
+            self.update_check_forced = false;
+            self.update_check_started_at = None;
+            self.update_rx = None;
+            self.update_dialog.status = UpdateStatus::Failed;
+            self.update_dialog.message = "Update check timed out after 20 minutes. The staged file was not installed; click Check now to retry.".to_string();
+            self.update_dialog.open = true;
+            self.last_error = Some(self.update_dialog.message.clone());
+        }
+
+        if self.prefs.setup_complete
+            && !self.update_check_in_flight
+            && !matches!(self.update_dialog.status, UpdateStatus::Ready | UpdateStatus::Installing)
+            && self.last_update_check.elapsed() >= Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS)
+        {
             self.start_update_check(false);
         }
 
         if self.update_dialog.status == UpdateStatus::Ready {
             if let Some(at) = self.update_dialog.auto_install_at {
                 if Instant::now() >= at {
-                    let _ = self.install_downloaded_update();
+                    if let Err(err) = self.install_downloaded_update() {
+                        let message = format!("Could not launch the verified update installer: {err:#}");
+                        self.update_dialog.status = UpdateStatus::Failed;
+                        self.update_dialog.auto_install_at = None;
+                        self.update_dialog.message = message.clone();
+                        self.update_dialog.open = true;
+                        self.last_error = Some(message);
+                    }
                 }
             }
         }
@@ -3294,27 +3425,78 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             if !installer.exists() {
                 anyhow::bail!("downloaded installer not found: {}", installer.display());
             }
+            let expected_hash = self.update_dialog.installer_sha256.trim().to_ascii_lowercase();
+            if expected_hash.len() != 64
+                || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || self.update_dialog.installer_bytes == 0
+            {
+                anyhow::bail!("staged installer verification metadata is missing; run Check now again")
+            }
+            hf128_validate_update_file_size(
+                &installer,
+                Some(self.update_dialog.installer_bytes),
+                UPDATE_INSTALLER_MAX_BYTES,
+            )?;
+            let actual_hash = hf128_sha256_file(&installer)?;
+            if actual_hash != expected_hash {
+                anyhow::bail!(
+                    "staged installer changed after verification: got SHA256 {}, expected {}",
+                    actual_hash,
+                    expected_hash
+                );
+            }
+            let (installer_version, signature_status, signer) =
+                hf128_installer_metadata(&installer)?;
+            if installer_version.is_empty()
+                || compare_versions(&installer_version, &self.update_dialog.latest_version)
+                    != std::cmp::Ordering::Equal
+            {
+                anyhow::bail!(
+                    "staged installer version changed: got '{}', expected '{}'",
+                    installer_version,
+                    self.update_dialog.latest_version
+                );
+            }
+            hf128_validate_installer_signature(
+                &signature_status,
+                &signer,
+                self.update_dialog.installer_allow_unsigned,
+            )?;
             self.update_dialog.status = UpdateStatus::Installing;
             self.update_dialog.message = format!("Installing QUB Core {} and restarting...", self.update_dialog.latest_version);
             self.stop_mining();
-            // HF106: always mark this relaunch as an update restart so the
-            // dedicated post-update mining policy overrides normal app-open auto mining.
-            let _ = write_hf86_post_update_restart_marker();
             self.save_prefs_if_needed();
             let current_exe = std::env::current_exe().context("current exe unavailable")?;
             let app_dir = current_exe.parent().context("missing current exe dir")?;
             let config_path = resolve_app_read_path(&self.prefs.config_path);
             let launcher = app_write_path("data/updater/install-and-relaunch.cmd");
+            let restart_marker = app_write_path(HF105_POST_UPDATE_RESTART_MARKER);
+            let install_result = app_write_path(UPDATE_INSTALL_RESULT_PATH);
             if let Some(parent) = launcher.parent() { std::fs::create_dir_all(parent)?; }
             let script = format!(r#"@echo off
 setlocal
 ping 127.0.0.1 -n 3 >nul
 start /wait "" "{}" /SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR="{}"
+set "QUB_UPDATE_RC=%ERRORLEVEL%"
+if not "%QUB_UPDATE_RC%"=="0" (
+  >"{}" echo QUB Core update installer failed with exit code %QUB_UPDATE_RC%. The previous version was relaunched; retry from Updates or install manually.
+  start "" "{}" --config "{}"
+  del "%~f0"
+  exit /b %QUB_UPDATE_RC%
+)
+if exist "{}" del /q "{}"
+>"{}" echo post-update-restart
 start "" "{}" --config "{}"
 del "%~f0"
 "#,
                 installer.display(),
                 app_dir.display(),
+                install_result.display(),
+                current_exe.display(),
+                config_path.display(),
+                install_result.display(),
+                install_result.display(),
+                restart_marker.display(),
                 current_exe.display(),
                 config_path.display(),
             );
@@ -3558,7 +3740,9 @@ del "%~f0"
         if gpu_percent > 0 {
             self.status_line = format!("OpenCL GPU mining enabled at {}% on {}. CPU mining remains active and every GPU-found block is CPU-verified before submit.", gpu_percent, self.gpu_selector_status_label());
         }
+        self.hash_rate_hps = 0.0;
         self.gpu_hash_rate_hps = 0.0;
+        self.total_hashes = 0;
         self.gpu_total_hashes = 0;
         self.gpu_workers = 0;
         self.gpu_device.clear();
@@ -3574,20 +3758,31 @@ del "%~f0"
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let join = thread::spawn(move || {
-            run_miner(
-                config_path,
-                payout,
-                cpu_percent,
-                gpu_percent,
-                cpu_worker_override,
-                gpu_work_items_override,
-                gpu_device_selector,
-                pace_to_target_spacing,
-                tx,
-                thread_stop,
-            )
-        });
+        let join = match thread::Builder::new()
+            .name("qub-solo-controller".to_string())
+            .spawn(move || {
+                run_miner(
+                    config_path,
+                    payout,
+                    cpu_percent,
+                    gpu_percent,
+                    cpu_worker_override,
+                    gpu_work_items_override,
+                    gpu_device_selector,
+                    pace_to_target_spacing,
+                    tx,
+                    thread_stop,
+                )
+            })
+        {
+            Ok(join) => join,
+            Err(err) => {
+                self.set_mining_phase(MiningPhase::Off);
+                self.last_error = Some(format!("Could not start the solo mining controller: {err}"));
+                self.status_line = "Mining did not start; the operating system refused the controller thread.".to_string();
+                return;
+            }
+        };
         self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
         self.status_line = "Starting solo miner in background: running QUB Core bounded green-light catch-up, then preparing the first candidate...".to_string();
         self.last_success = None;
@@ -3628,18 +3823,19 @@ del "%~f0"
             String::new()
         };
 
-        if let Some(mut miner) = self.miner.take() {
+        if let Some(miner) = &mut self.miner {
             miner.stop();
-            drop(miner);
         }
 
         self.hash_rate_hps = 0.0;
         self.gpu_hash_rate_hps = 0.0;
+        self.total_hashes = 0;
         self.gpu_total_hashes = 0;
         self.gpu_workers = 0;
         self.gpu_device_rates.clear();
         self.miner_threads = 0;
         self.miner_duty = 0;
+        self.miner_gpu_power = 0;
         self.target_height = self.snapshot.height.saturating_add(1);
         self.set_mining_phase(MiningPhase::Off);
         self.manual_stop_requested = false;
@@ -3665,28 +3861,95 @@ del "%~f0"
         self.auto_restart_mining_at = None;
         self.desired_pool_mining_pool_id.clear();
         self.pool_mining_pool_id.clear();
-        if let Some(mut miner) = self.miner.take() {
-            // HF72/v1.5.8: Stop must be immediate from the user's perspective.
-            // Signal all workers and drop/detach the handle now; do not wait for
-            // the worker to finish a guard/snapshot/GPU round before releasing UI.
+        if let Some(miner) = &mut self.miner {
+            // Keep the controller handle until its Stopped acknowledgement.
+            // The UI remains non-blocking, while a quick Start cannot overlap
+            // a slow final OpenCL clFinish from the previous generation.
             miner.stop();
-            drop(miner);
         }
         self.hash_rate_hps = 0.0;
         self.gpu_hash_rate_hps = 0.0;
+        self.total_hashes = 0;
+        self.gpu_total_hashes = 0;
         self.gpu_workers = 0;
+        self.gpu_device.clear();
         self.gpu_device_rates.clear();
         self.miner_threads = 0;
         self.miner_duty = 0;
+        self.miner_gpu_power = 0;
         self.target_height = self.snapshot.height.saturating_add(1);
         self.set_mining_phase(MiningPhase::Off);
-        self.status_line = "Mining stopped locally. Worker threads were signalled and will exit in the background.".to_string();
+        self.status_line = "Mining stop requested. Finishing the bounded CPU/GPU dispatch before another plan can start.".to_string();
+    }
+
+    fn apply_changed_mining_controls(&mut self) {
+        // A manual Stop remains authoritative until the user presses Start.
+        // Slider edits while the acknowledged old controller is retiring must
+        // never turn Stop into an implicit reconfiguration restart.
+        if self.manual_stop_requested {
+            return;
+        }
+        let reconfigure_pending = self.auto_restart_mining_at.is_some()
+            && !self.manual_stop_requested;
+        if self.miner.is_none() && !reconfigure_pending {
+            return;
+        }
+
+        let wanted_pool = if !self.desired_pool_mining_pool_id.trim().is_empty() {
+            self.desired_pool_mining_pool_id.clone()
+        } else {
+            self.pool_mining_pool_id.clone()
+        };
+        if let Some(miner) = &mut self.miner {
+            miner.stop();
+        }
+        self.hash_rate_hps = 0.0;
+        self.gpu_hash_rate_hps = 0.0;
+        self.total_hashes = 0;
+        self.gpu_total_hashes = 0;
+        self.gpu_workers = 0;
+        self.gpu_device.clear();
+        self.gpu_device_rates.clear();
+        self.miner_threads = 0;
+        self.miner_duty = 0;
+        self.miner_gpu_power = 0;
+        self.set_mining_phase(MiningPhase::Off);
+
+        if hf127_unrestricted_mining_requested(&self.prefs)
+            && !self.prefs.confirm_unrestricted_mining_risk
+        {
+            self.auto_restart_mining_at = None;
+            self.desired_pool_mining_pool_id = wanted_pool;
+            self.manual_stop_requested = true;
+            self.status_line = "Mining paused safely: confirm the high-power warning, then press Start to apply the new plan.".to_string();
+            self.last_error = Some("The requested mining plan was not applied because high-power authorization is not checked. The previous workers were stopped.".to_string());
+            return;
+        }
+
+        self.desired_pool_mining_pool_id = wanted_pool;
+        self.pool_mining_pool_id.clear();
+        self.manual_stop_requested = false;
+        // The old MinerHandle remains owned until its explicit Stopped event.
+        // auto-restart additionally requires self.miner == None, so no wall
+        // clock guess can overlap two OpenCL plan generations.
+        self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(2));
+        self.status_line = format!(
+            "Applying mining plan: CPU {}%, GPU {}%. Previous workers are stopping; the acknowledged plan restarts automatically.",
+            self.prefs.cpu_percent,
+            self.prefs.gpu_percent
+        );
     }
 
     fn poll_miner_events(&mut self) {
         let mut should_drop_miner = false;
         let mut should_refresh_snapshot = false;
         let mut phase_change: Option<MiningPhase> = None;
+        let mut plan_rejected = false;
+        let miner_stopping = self
+            .miner
+            .as_ref()
+            .map(|miner| miner.stop.load(Ordering::Relaxed))
+            .unwrap_or(false);
 
         // HF78/v1.6.0 fixed: drain miner events while borrowing only the
         // receiver, then process the events after that borrow has ended. This
@@ -3698,6 +3961,17 @@ del "%~f0"
             }
         }
         for event in pending_events {
+            if miner_stopping
+                && !matches!(
+                    &event,
+                    MinerEvent::PlanRejected(_)
+                        | MinerEvent::Stopped { .. }
+                        | MinerEvent::BlockFound { .. }
+                        | MinerEvent::BlockStale { .. }
+                )
+            {
+                continue;
+            }
             match event {
                     MinerEvent::Started { threads, duty, target_height } => {
                         self.miner_threads = threads;
@@ -3721,12 +3995,19 @@ del "%~f0"
                     }
                     MinerEvent::GpuStarted { device, workers, power, target_height } => {
                         if !device.is_empty() {
-                            self.gpu_device_rates.entry(device.clone()).or_insert((0.0, 0, workers));
+                            self.gpu_device_rates
+                                .entry(device.clone())
+                                .and_modify(|entry| {
+                                    entry.0 = 0.0;
+                                    entry.2 = workers;
+                                })
+                                .or_insert((0.0, 0, workers));
                             self.recompute_gpu_aggregate();
                         } else {
                             self.gpu_device = self.gpu_selector_status_label();
                             self.gpu_workers = workers;
                         }
+                        self.miner_gpu_power = power;
                         self.target_height = target_height;
                         let active_lanes = if self.gpu_workers > 0 { self.gpu_workers } else { workers };
                         self.status_line = format!("OpenCL GPU active on {} at {}% power ({} total work item batch, high-performance full-SHA adaptive GPU auto-tune mode). CPU verification is enforced.", self.gpu_device, power, active_lanes);
@@ -3745,8 +4026,15 @@ del "%~f0"
                     MinerEvent::GpuStatus(status) => {
                         self.status_line = status;
                     }
-                    MinerEvent::BlockFound { height, hash, txs, reward } => {
-                        if self.pool_mining_pool_id.trim().is_empty() {
+                    MinerEvent::GpuStopped { device } => {
+                        if let Some(entry) = self.gpu_device_rates.get_mut(&device) {
+                            entry.0 = 0.0;
+                            entry.2 = 0;
+                        }
+                        self.recompute_gpu_aggregate();
+                    }
+                    MinerEvent::BlockFound { height, hash, txs, reward, mode } => {
+                        if mode == "solo" {
                             let card = BlockCard { height, hash: hash.clone(), txs, reward: reward.clone(), at: Instant::now(), confirmed: false, confirmations: 0 };
                             self.last_block_card = Some(card.clone());
                             self.block_history.push_front(card);
@@ -3755,6 +4043,16 @@ del "%~f0"
                             self.last_success = Some(format!("Your block #{height} passed local consensus and durable storage. Network delivery is acknowledged or being retried automatically. Waiting for active-chain confirmation. Reward candidate: {reward}."));
                             self.status_line = "Your block is valid locally; network delivery and confirmation are tracked separately...".to_string();
                             // mined.mp3 is intentionally played only when the solo block is confirmed on the active chain.
+                        } else if mode.starts_with("pool_compat_") {
+                            self.last_block_card = None;
+                            self.last_local_mined_at = None;
+                            let reason = if mode == "pool_compat_melt" {
+                                "a QUB Melt was confirmed without invoking the legacy pool-marker fee mismatch"
+                            } else {
+                                "pending pool shares bootstrapped an empty confirmed PPLNS window"
+                            };
+                            self.last_success = Some(format!("Pool compatibility block #{} passed unchanged HF127 consensus and durable storage: {}. QUB payouts remain deterministic; normal consensus-marked pool mining resumes automatically on the next parent.", height, reason));
+                            self.status_line = "HF128 pool compatibility block accepted; returning to ordinary PPLNS mode on the next parent.".to_string();
                         } else {
                             self.last_block_card = None;
                             self.last_local_mined_at = None;
@@ -3779,8 +4077,18 @@ del "%~f0"
                         self.last_error = Some(err.clone());
                         self.status_line = err;
                     }
-                    MinerEvent::Stopped => {
-                        self.status_line = "Miner stopped.".to_string();
+                    MinerEvent::PlanRejected(err) => {
+                        plan_rejected = true;
+                        self.last_error = Some(err.clone());
+                        self.status_line = format!("Mining plan rejected: {err}");
+                    }
+                    MinerEvent::Stopped { restart_allowed } => {
+                        if !restart_allowed {
+                            plan_rejected = true;
+                        }
+                        if !plan_rejected {
+                            self.status_line = "Miner stopped.".to_string();
+                        }
                         should_drop_miner = true;
                     }
                 }
@@ -3791,16 +4099,22 @@ del "%~f0"
         }
         if should_drop_miner {
             let wanted_pool = self.desired_pool_mining_pool_id.clone();
-            let should_auto_restart = !self.manual_stop_requested
+            let should_auto_restart = !plan_rejected
+                && !self.manual_stop_requested
                 && self.update_dialog.status != UpdateStatus::Ready
                 && self.update_dialog.status != UpdateStatus::Installing
                 && !self.prefs.payout_address.trim().is_empty();
             self.miner = None;
             self.hash_rate_hps = 0.0;
             self.gpu_hash_rate_hps = 0.0;
+            self.total_hashes = 0;
+            self.gpu_total_hashes = 0;
             self.miner_threads = 0;
             self.gpu_workers = 0;
+            self.gpu_device.clear();
+            self.gpu_device_rates.clear();
             self.miner_duty = 0;
+            self.miner_gpu_power = 0;
             self.set_mining_phase(MiningPhase::Off);
             if should_auto_restart {
                 if !wanted_pool.trim().is_empty() {
@@ -4908,7 +5222,9 @@ del "%~f0"
         let cpu_worker_override = self.prefs.cpu_worker_override;
         let gpu_work_items_override = self.prefs.gpu_work_items_override;
         let gpu_device_selector = self.normalized_gpu_device_selector();
+        self.hash_rate_hps = 0.0;
         self.gpu_hash_rate_hps = 0.0;
+        self.total_hashes = 0;
         self.gpu_total_hashes = 0;
         self.gpu_workers = 0;
         self.gpu_device.clear();
@@ -4918,23 +5234,35 @@ del "%~f0"
         let thread_stop = stop.clone();
         let pool_for_thread = pool_id.trim().to_string();
         let pool_for_status = pool_for_thread.clone();
-        let join = thread::spawn(move || {
-            run_pool_miner(
-                config_path,
-                pool_for_thread,
-                miner_address,
-                cpu_percent,
-                gpu_percent,
-                cpu_worker_override,
-                gpu_work_items_override,
-                gpu_device_selector,
-                tx,
-                thread_stop,
-            )
-        });
+        let join = match thread::Builder::new()
+            .name("qub-pool-controller".to_string())
+            .spawn(move || {
+                run_pool_miner(
+                    config_path,
+                    pool_for_thread,
+                    miner_address,
+                    cpu_percent,
+                    gpu_percent,
+                    cpu_worker_override,
+                    gpu_work_items_override,
+                    gpu_device_selector,
+                    tx,
+                    thread_stop,
+                )
+            })
+        {
+            Ok(join) => join,
+            Err(err) => {
+                self.set_mining_phase(MiningPhase::Off);
+                self.desired_pool_mining_pool_id.clear();
+                self.last_error = Some(format!("Could not start the pool mining controller: {err}"));
+                self.status_line = "Pool mining did not start; the operating system refused the controller thread.".to_string();
+                return;
+            }
+        };
         self.pool_mining_pool_id = pool_for_status.clone();
         self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
-        self.status_line = format!("Pool miner starting for {}: running fork-safety sync, submitting/confirming share, then preparing candidates...", shorten_hash(&pool_for_status));
+        self.status_line = format!("Pool miner starting for {}: running fork-safety sync, submitting one current-parent share, then preparing a liveness-safe candidate...", shorten_hash(&pool_for_status));
         self.last_success = None;
         self.last_error = None;
     }
@@ -5517,7 +5845,7 @@ del "%~f0"
             ui.label("Miner address");
             ui.text_edit_singleline(&mut self.pool_dialog.miner_address);
         });
-        ui.small("Join submits a zero-fee PoW-gated share. The first confirmed share makes this address active in the pool window. A network block must confirm the share before a pool block can pay it.");
+        ui.small("Join submits a zero-fee PoW-gated share. HF128 can confirm and deterministically pay the first pending share in a markerless compatibility block; subsequent blocks use ordinary consensus-marked PPLNS.");
         ui.horizontal_wrapped(|ui| {
             let can_join = self.pool_activation_ready() && self.snapshot.wallet_keys > 0 && !self.pool_dialog.selected_pool_id.trim().is_empty();
             if self.ui_icon_button_enabled(ui, can_join, "join-pool", "Join / submit share").clicked() {
@@ -6758,7 +7086,14 @@ del "%~f0"
                 ui.add_space(8.0);
                 if ui.checkbox(&mut self.prefs.auto_check_updates, "Auto check for updates").changed() { self.prefs_dirty = true; }
                 if ui.checkbox(&mut self.prefs.auto_download_updates, "Auto download updates").changed() { self.prefs_dirty = true; }
-                if ui.checkbox(&mut self.prefs.auto_install_updates, "Auto install downloaded updates").changed() { self.prefs_dirty = true; }
+                if ui.checkbox(&mut self.prefs.auto_install_updates, "Auto install downloaded updates").changed() {
+                    self.prefs_dirty = true;
+                    if !self.prefs.auto_install_updates {
+                        // An opt-out is immediate, including while the Ready
+                        // countdown is already visible.
+                        self.update_dialog.auto_install_at = None;
+                    }
+                }
                 if ui.checkbox(&mut self.prefs.stop_miner_on_update_available, "Stop miner when update is ready").changed() { self.prefs_dirty = true; }
                 if ui.checkbox(&mut self.prefs.start_mining_after_update_restart, "After update restart: start mining automatically").changed() { self.prefs_dirty = true; }
                 ui.indent("after_update_restart_mining_mode", |ui| {
@@ -6787,7 +7122,13 @@ del "%~f0"
                         self.start_update_check(true);
                     }
                     if self.update_dialog.status == UpdateStatus::Ready && self.ui_icon_button(ui, "install-and-restart", "Install & restart").clicked() {
-                        let _ = self.install_downloaded_update();
+                        if let Err(err) = self.install_downloaded_update() {
+                            let message = format!("Could not launch the verified update installer: {err:#}");
+                            self.update_dialog.status = UpdateStatus::Failed;
+                            self.update_dialog.auto_install_at = None;
+                            self.update_dialog.message = message.clone();
+                            self.last_error = Some(message);
+                        }
                     }
                     if self.update_dialog.status == UpdateStatus::Ready && ui.button("Later").clicked() {
                         self.update_dialog.auto_install_at = None;
@@ -7390,8 +7731,13 @@ impl QubCoreApp {
             if self.prefs.cpu_percent != old_cpu
                 || self.prefs.cpu_worker_override != old_cpu_override
             {
-                self.prefs.confirm_unrestricted_mining_risk = false;
+                if self.prefs.cpu_percent > old_cpu
+                    || self.prefs.cpu_worker_override > old_cpu_override
+                {
+                    self.prefs.confirm_unrestricted_mining_risk = false;
+                }
                 self.prefs_dirty = true;
+                self.apply_changed_mining_controls();
             }
             ui.horizontal(|ui| {
                 let logical = logical_cpus();
@@ -7425,13 +7771,18 @@ impl QubCoreApp {
                     egui::DragValue::new(&mut self.prefs.gpu_work_items_override)
                         .speed(4096.0),
                 );
-                ui.small("0 = safe auto-tuning; a positive value bypasses the automatic batch ceiling.");
+                ui.small("0 = stable auto-tuning. A positive value controls total requested range sizing; HF128 splits oversized ranges into continuous watchdog-safe OpenCL dispatches without capping total work.");
             });
             if self.prefs.gpu_percent != old_gpu
                 || self.prefs.gpu_work_items_override != old_gpu_override
             {
-                self.prefs.confirm_unrestricted_mining_risk = false;
+                if self.prefs.gpu_percent > old_gpu
+                    || self.prefs.gpu_work_items_override > old_gpu_override
+                {
+                    self.prefs.confirm_unrestricted_mining_risk = false;
+                }
                 self.prefs_dirty = true;
+                self.apply_changed_mining_controls();
             }
 
             if hf127_unrestricted_mining_requested(&self.prefs) {
@@ -7482,13 +7833,14 @@ impl QubCoreApp {
             });
             if self.normalized_gpu_device_selector() != before_gpu_selector {
                 self.prefs_dirty = true;
+                self.apply_changed_mining_controls();
             }
             if self.gpu_device_options.is_empty() {
                 ui.small("No OpenCL GPU detected yet by the GUI scan. Mining can still try auto-detect at start; install/update GPU drivers if this remains empty.");
             } else {
                 ui.small(format!("Detected {} OpenCL GPU device(s). Default All uses high-performance devices only; All detected GPUs is available for experimental hybrid/iGPU testing.", self.gpu_device_options.len()));
             }
-            ui.small("OpenCL GPU mining is available. If GPU power is 0, CPU mining is used. QUB Core keeps high-performance full double-SHA GPU batches and per-device auto-tuning. Hybrid laptops default to the strongest GPU; All detected GPUs can run iGPU+dGPU if the drivers expose both, but thermals/power sharing may lower the discrete GPU boost.");
+            ui.small("OpenCL GPU mining is available. HF128 separates stable batch tuning from real active/idle GPU duty: 100% dispatches continuously, while lower values idle interruptibly in the requested ratio. Hybrid laptops default to the strongest GPU.");
         }
 
         egui::CollapsingHeader::new("Library")
@@ -9160,7 +9512,7 @@ impl QubCoreApp {
                 self.metric_info(ui, "cpu-workers", "CPU workers", self.miner_threads.to_string(), "CPU worker threads used by the current resource plan.");
                 self.metric_info(ui, "gpu", "GPU workers", if self.gpu_workers == 0 { "off".to_string() } else { self.gpu_workers.to_string() }, "OpenCL GPU work-item batch size used by the miner.");
                 self.metric_info(ui, "gpu", "GPU device", if self.gpu_device.is_empty() { "-".to_string() } else { self.gpu_device.clone() }, "OpenCL GPU selected by QUB Core for mining.");
-                self.metric_info(ui, "duty", "Duty", if self.miner_duty == 0 { "-".to_string() } else { format!("{}% CPU / {}% GPU", self.miner_duty, self.prefs.gpu_percent) }, "Resource duty requested by your CPU/GPU sliders. GPU 100% uses high-performance full double-SHA OpenCL with per-device auto-tuned batches. Hybrid laptops default to the high-performance GPU path, and every GPU-found block is still CPU-verified.");
+                self.metric_info(ui, "duty", "Applied duty", if self.miner_duty == 0 { "-".to_string() } else { format!("{}% CPU / {}% GPU", self.miner_duty, self.miner_gpu_power) }, "The resource plan acknowledged by the active workers. HF128 applies GPU power as measured active/idle duty independently of batch tuning; 100% has no duty sleep.");
                 self.metric_info(ui, "target-block", "Target block", if self.target_height == 0 { "-".to_string() } else { format!("#{}", self.target_height) }, "Block height currently targeted by the miner candidate.");
             });
             ui.add_space(10.0);
@@ -9867,13 +10219,6 @@ fn app_write_path(path: &str) -> PathBuf {
     if p.is_absolute() { p } else { app_base_dir().join(p) }
 }
 
-fn write_hf86_post_update_restart_marker() -> Result<()> {
-    let path = app_write_path(HF105_POST_UPDATE_RESTART_MARKER);
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    std::fs::write(path, b"post-update-restart")?;
-    Ok(())
-}
-
 fn consume_hf86_post_update_restart_marker() -> bool {
     let path = app_write_path(HF105_POST_UPDATE_RESTART_MARKER);
     if path.exists() {
@@ -9882,6 +10227,14 @@ fn consume_hf86_post_update_restart_marker() -> bool {
     } else {
         false
     }
+}
+
+fn consume_update_install_error() -> Option<String> {
+    let path = app_write_path(UPDATE_INSTALL_RESULT_PATH);
+    let message = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(path);
+    let message = message.trim().to_string();
+    (!message.is_empty()).then_some(message)
 }
 
 fn resolve_app_read_path(path: &str) -> PathBuf {
@@ -10395,7 +10748,9 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
                 .first()
                 .map(|tx| tx.outputs.iter().map(|out| out.value.atoms()).sum::<u64>())
                 .unwrap_or(0);
-            let pool_id_opt = parse_pool_block_marker(block);
+            let pool_id_opt = parse_pool_block_marker(block).or_else(|| {
+                parse_pool_compatibility_marker(block).map(|(pool_id, _reason)| pool_id)
+            });
             let pool_block = pool_id_opt.is_some();
             let pool_id = pool_id_opt.map(|id| id.to_string()).unwrap_or_default();
             let pool_name = pool_id_opt
@@ -11772,6 +12127,9 @@ fn run_miner(
     events: mpsc::Sender<MinerEvent>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut restart_allowed = true;
+    let mut cpu_session_total = 0u64;
+    let gpu_session_totals: GpuSessionTotals = Arc::new(Mutex::new(HashMap::new()));
     while !stop.load(Ordering::Relaxed) {
         match run_miner_inner(
             config_path.clone(),
@@ -11783,10 +12141,17 @@ fn run_miner(
             gpu_device_selector.clone(),
             pace_to_target_spacing,
             &events,
+            &mut cpu_session_total,
+            gpu_session_totals.clone(),
             stop.clone(),
         ) {
             Ok(_) => break,
             Err(err) => {
+                if let Some(message) = permanent_miner_plan_message(&err) {
+                    restart_allowed = false;
+                    let _ = events.send(MinerEvent::PlanRejected(message));
+                    break;
+                }
                 let _ = events.send(MinerEvent::Status(format!("Miner worker recovered from transient error: {err:#}. Retrying in 5s...")));
                 for _ in 0..50 {
                     if stop.load(Ordering::Relaxed) { break; }
@@ -11796,7 +12161,7 @@ fn run_miner(
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = events.send(MinerEvent::Stopped);
+    let _ = events.send(MinerEvent::Stopped { restart_allowed });
 }
 
 fn run_pool_miner(
@@ -11811,6 +12176,9 @@ fn run_pool_miner(
     events: mpsc::Sender<MinerEvent>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut restart_allowed = true;
+    let mut cpu_session_total = 0u64;
+    let gpu_session_totals: GpuSessionTotals = Arc::new(Mutex::new(HashMap::new()));
     while !stop.load(Ordering::Relaxed) {
         match run_pool_miner_inner(
             config_path.clone(),
@@ -11822,10 +12190,17 @@ fn run_pool_miner(
             gpu_work_items_override,
             gpu_device_selector.clone(),
             &events,
+            &mut cpu_session_total,
+            gpu_session_totals.clone(),
             stop.clone(),
         ) {
             Ok(_) => break,
             Err(err) => {
+                if let Some(message) = permanent_miner_plan_message(&err) {
+                    restart_allowed = false;
+                    let _ = events.send(MinerEvent::PlanRejected(message));
+                    break;
+                }
                 let _ = events.send(MinerEvent::Status(format!("Pool miner worker recovered from transient error: {err:#}. Retrying in 5s...")));
                 for _ in 0..50 {
                     if stop.load(Ordering::Relaxed) { break; }
@@ -11835,7 +12210,20 @@ fn run_pool_miner(
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = events.send(MinerEvent::Stopped);
+    let _ = events.send(MinerEvent::Stopped { restart_allowed });
+}
+
+const PERMANENT_MINER_PLAN_PREFIX: &str = "PERMANENT_MINER_PLAN:";
+
+fn permanent_miner_plan_error(message: impl AsRef<str>) -> anyhow::Error {
+    anyhow::anyhow!("{} {}", PERMANENT_MINER_PLAN_PREFIX, message.as_ref())
+}
+
+fn permanent_miner_plan_message(err: &anyhow::Error) -> Option<String> {
+    let message = format!("{err:#}");
+    message
+        .find(PERMANENT_MINER_PLAN_PREFIX)
+        .map(|index| message[index + PERMANENT_MINER_PLAN_PREFIX.len()..].trim().to_string())
 }
 
 fn run_pool_miner_inner(
@@ -11848,12 +12236,13 @@ fn run_pool_miner_inner(
     gpu_work_items_override: usize,
     gpu_device_selector: String,
     events: &mpsc::Sender<MinerEvent>,
+    cpu_session_total: &mut u64,
+    gpu_session_totals: GpuSessionTotals,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let pool_id = Hash256::from_hex(&pool_id_s)?;
     let logical = logical_cpus();
     let (threads, duty) = resource_plan(logical, cpu_percent, cpu_worker_override);
-    let mut total_hashes = 0u64;
     let mut share_nonce_start = 0u64;
     let mut last_share_parent: Option<(u32, Hash256)> = None;
 
@@ -11913,6 +12302,23 @@ fn run_pool_miner_inner(
         });
         if own_share_pending {
             last_share_parent = Some(share_parent);
+        } else if last_share_parent == Some(share_parent) {
+            let confirmed_score = pool_share_scores_from_blocks(
+                &settings,
+                &chain.blocks,
+                chain.height().saturating_add(1),
+                pool_id,
+            )
+            .values()
+            .copied()
+            .fold(0u128, u128::saturating_add);
+            if confirmed_score == 0 {
+                // The locally submitted bootstrap share was evicted or lost
+                // during reload/relay. Admission duplicate checks are the
+                // authority, so allow one deterministic resubmission instead
+                // of leaving this empty pool stalled on the same parent.
+                last_share_parent = None;
+            }
         }
         if last_share_parent != Some(share_parent) {
             match create_gui_local_pool_share(
@@ -11941,29 +12347,14 @@ fn run_pool_miner_inner(
             }
         }
 
-        let scores = pool_share_scores_from_blocks(&settings, &chain.blocks, chain.height() + 1, pool_id);
-        if scores.get(&key.address).copied().unwrap_or(0) == 0 {
-            let _ = events.send(MinerEvent::Status("Waiting for your first pool share to confirm before mining pool blocks.".to_string()));
-            for _ in 0..20 {
-                if stop.load(Ordering::Relaxed) { break; }
-                thread::sleep(Duration::from_millis(100));
-            }
-            continue;
-        }
-
-        // HF124/v1.8.1: build the pool transaction set and payout outputs once
-        // per canonical parent, then share immutable parts across all workers.
-        let candidate_parts = Arc::new(build_candidate_block_parts(
-            &chain,
-            &settings,
-            None,
-        )?);
-        let pool_outputs = Arc::new(expected_pool_coinbase_outputs(
-            &settings,
-            &chain.blocks,
-            pool_id,
-            candidate_parts.reward_atoms as u128,
-        )?);
+        // HF128/v1.8.4: one centralized planner selects an ordinary
+        // consensus-marked PPLNS block, a markerless Melt compatibility block,
+        // or a markerless empty-window share bootstrap. All modes retain the
+        // unchanged HF127 block/transaction validators.
+        let candidate_plan = build_pool_candidate_plan(&chain, &settings, pool_id)?;
+        let pool_mode = candidate_plan.mode;
+        let candidate_parts = Arc::new(candidate_plan.parts);
+        let pool_outputs = Arc::new(candidate_plan.outputs);
         let target_height = candidate_parts.height;
         let selected_pool_shares = candidate_parts
             .non_coinbase_transactions
@@ -11975,22 +12366,23 @@ fn run_pool_miner_inner(
             .iter()
             .filter(|tx| is_pool_share_transaction(tx))
             .count();
+        let template_label = match pool_mode {
+            PoolCandidateMode::ConsensusPplns => "HF128 consensus PPLNS",
+            PoolCandidateMode::MeltCompatibility => "HF128 markerless Melt compatibility",
+            PoolCandidateMode::ShareBootstrapCompatibility => "HF128 markerless share bootstrap",
+        };
         let _ = events.send(MinerEvent::Status(format!(
-            "HF124 stable pool template: {selected_pool_shares}/{available_pool_shares} pool share(s), {} candidate transaction(s) from {} mempool transaction(s), parent #{} {}.",
+            "{template_label} template: {selected_pool_shares}/{available_pool_shares} pool share(s), {} candidate transaction(s) from {} mempool transaction(s), parent #{} {}.",
             candidate_parts.non_coinbase_transactions.len(),
             chain.mempool.len(),
             target_height.saturating_sub(1),
             shorten_hash(&candidate_parts.prev_block_hash.to_string())
         )));
-        let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
         let hash_counter = Arc::new(AtomicU64::new(0));
         let gpu_hash_counter = Arc::new(AtomicU64::new(0));
         let gpu_enabled = gpu_percent > 0;
         let gpu_selectors = if gpu_enabled { gpu_device_selectors_for_mining(&gpu_device_selector) } else { Vec::new() };
-        let gpu_device_count = if gpu_enabled { gpu_selectors.len().max(1) } else { 0 };
-        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override).saturating_mul(gpu_device_count);
-        let mut gpu_total_hashes = 0u64;
         let (found_tx, found_rx) = mpsc::channel::<Block>();
         let mut joins = Vec::new();
         let mut cpu_worker_start_error = None::<String>;
@@ -12013,6 +12405,7 @@ fn run_pool_miner_inner(
                         worker_parts,
                         worker_outputs,
                         pool_id,
+                        pool_mode,
                         worker_hashes,
                         worker_found_tx,
                         worker_events,
@@ -12037,7 +12430,7 @@ fn run_pool_miner_inner(
                 let _ = join.join();
             }
             let _ = events.send(MinerEvent::Status(message.clone()));
-            anyhow::bail!(message);
+            return Err(permanent_miner_plan_error(message));
         }
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
@@ -12048,6 +12441,7 @@ fn run_pool_miner_inner(
                 let gpu_stop = stop.clone();
                 let gpu_round_stop = round_stop.clone();
                 let gpu_hashes = gpu_hash_counter.clone();
+                let gpu_totals = gpu_session_totals.clone();
                 match thread::Builder::new()
                     .name(format!("qub-pool-gpu-{gpu_index}"))
                     .spawn(move || {
@@ -12055,12 +12449,14 @@ fn run_pool_miner_inner(
                             gpu_parts,
                             gpu_outputs,
                             pool_id,
+                            pool_mode,
                             gpu_percent,
                             gpu_work_items_override,
                             gpu_selector,
                             gpu_index,
                             target_height,
                             gpu_hashes,
+                            gpu_totals,
                             gpu_found_tx,
                             gpu_events,
                             gpu_stop,
@@ -12080,7 +12476,7 @@ fn run_pool_miner_inner(
         if joins.is_empty() {
             let message = "No CPU/GPU mining worker could be started. Reduce manual worker/work-item overrides or inspect system, driver, memory, and thread limits.";
             let _ = events.send(MinerEvent::Status(message.to_string()));
-            anyhow::bail!(message);
+            return Err(permanent_miner_plan_error(message));
         }
         let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         drop(found_tx);
@@ -12121,8 +12517,8 @@ fn run_pool_miner_inner(
             if last_tick.elapsed() >= Duration::from_secs(1) {
                 let elapsed = last_tick.elapsed().as_secs_f64().max(0.001);
                 let delta = hash_counter.swap(0, Ordering::Relaxed);
-                total_hashes = total_hashes.saturating_add(delta);
-                let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes, threads, duty, target_height });
+                *cpu_session_total = (*cpu_session_total).saturating_add(delta);
+                let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes: *cpu_session_total, threads, duty, target_height });
                 if gpu_enabled {
                     // Per-device GPU workers now report their own measured rates.
                     // Drain the aggregate counter so it cannot overwrite the faster
@@ -12136,9 +12532,11 @@ fn run_pool_miner_inner(
         round_stop.store(true, Ordering::Relaxed);
         for join in joins { let _ = join.join(); }
         let delta = hash_counter.swap(0, Ordering::Relaxed);
-        total_hashes = total_hashes.saturating_add(delta);
-        let elapsed = round_started.elapsed().as_secs_f64().max(0.001);
-        let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes, threads, duty, target_height });
+        *cpu_session_total = (*cpu_session_total).saturating_add(delta);
+        if delta > 0 {
+            let elapsed = last_tick.elapsed().as_secs_f64().max(0.001);
+            let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes: *cpu_session_total, threads, duty, target_height });
+        }
         if gpu_enabled {
             let _ = gpu_hash_counter.swap(0, Ordering::Relaxed);
         }
@@ -12189,7 +12587,7 @@ fn run_pool_miner_inner(
             let active_chain = load_or_init_chain(&settings)?;
             let active_hash_at_height = active_chain.blocks.get(height as usize).map(|block| block.block_hash());
             if active_hash_at_height == Some(hash) {
-                let _ = events.send(MinerEvent::BlockFound { height, hash: hash.to_string(), txs, reward });
+                let _ = events.send(MinerEvent::BlockFound { height, hash: hash.to_string(), txs, reward, mode: pool_mode.label().to_string() });
             } else {
                 let winner_hash = active_hash_at_height
                     .map(|h| h.to_string())
@@ -12213,12 +12611,12 @@ fn run_miner_inner(
     gpu_device_selector: String,
     _pace_to_target_spacing: bool,
     events: &mpsc::Sender<MinerEvent>,
+    cpu_session_total: &mut u64,
+    gpu_session_totals: GpuSessionTotals,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let logical = logical_cpus();
     let (threads, duty) = resource_plan(logical, cpu_percent, cpu_worker_override);
-    let mut total_hashes = 0u64;
-    let mut gpu_total_hashes = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
@@ -12274,7 +12672,6 @@ fn run_miner_inner(
             target_height.saturating_sub(1),
             shorten_hash(&candidate_parts.prev_block_hash.to_string())
         )));
-        let round_started = Instant::now();
         let round_stop = Arc::new(AtomicBool::new(false));
         let hash_counter = Arc::new(AtomicU64::new(0));
         let (found_tx, found_rx) = mpsc::channel::<Block>();
@@ -12322,14 +12719,12 @@ fn run_miner_inner(
                 let _ = join.join();
             }
             let _ = events.send(MinerEvent::Status(message.clone()));
-            anyhow::bail!(message);
+            return Err(permanent_miner_plan_error(message));
         }
 
         let gpu_hash_counter = Arc::new(AtomicU64::new(0));
         let gpu_enabled = gpu_percent > 0;
         let gpu_selectors = if gpu_enabled { gpu_device_selectors_for_mining(&gpu_device_selector) } else { Vec::new() };
-        let gpu_device_count = if gpu_enabled { gpu_selectors.len().max(1) } else { 0 };
-        let gpu_total_lanes = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override).saturating_mul(gpu_device_count);
         if gpu_enabled {
             for (gpu_index, gpu_selector) in gpu_selectors.into_iter().enumerate() {
                 let gpu_parts = candidate_parts.clone();
@@ -12339,6 +12734,7 @@ fn run_miner_inner(
                 let gpu_stop = stop.clone();
                 let gpu_round_stop = round_stop.clone();
                 let gpu_hashes = gpu_hash_counter.clone();
+                let gpu_totals = gpu_session_totals.clone();
                 match thread::Builder::new()
                     .name(format!("qub-solo-gpu-{gpu_index}"))
                     .spawn(move || {
@@ -12351,6 +12747,7 @@ fn run_miner_inner(
                             gpu_index,
                             target_height,
                             gpu_hashes,
+                            gpu_totals,
                             gpu_found_tx,
                             gpu_events,
                             gpu_stop,
@@ -12370,7 +12767,7 @@ fn run_miner_inner(
         if joins.is_empty() {
             let message = "No CPU/GPU mining worker could be started. Reduce manual worker/work-item overrides or inspect system, driver, memory, and thread limits.";
             let _ = events.send(MinerEvent::Status(message.to_string()));
-            anyhow::bail!(message);
+            return Err(permanent_miner_plan_error(message));
         }
         let _ = events.send(MinerEvent::Started { threads, duty, target_height });
         drop(found_tx);
@@ -12414,8 +12811,8 @@ fn run_miner_inner(
             if last_tick.elapsed() >= Duration::from_secs(1) {
                 let elapsed = last_tick.elapsed().as_secs_f64().max(0.001);
                 let delta = hash_counter.swap(0, Ordering::Relaxed);
-                total_hashes = total_hashes.saturating_add(delta);
-                let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes, threads, duty, target_height });
+                *cpu_session_total = (*cpu_session_total).saturating_add(delta);
+                let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes: *cpu_session_total, threads, duty, target_height });
                 if gpu_enabled {
                     // Per-device GPU workers now report their own measured rates.
                     // Drain the aggregate counter so it cannot overwrite the faster
@@ -12429,9 +12826,11 @@ fn run_miner_inner(
         round_stop.store(true, Ordering::Relaxed);
         for join in joins { let _ = join.join(); }
         let delta = hash_counter.swap(0, Ordering::Relaxed);
-        total_hashes = total_hashes.saturating_add(delta);
-        let elapsed = round_started.elapsed().as_secs_f64().max(0.001);
-        let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes, threads, duty, target_height });
+        *cpu_session_total = (*cpu_session_total).saturating_add(delta);
+        if delta > 0 {
+            let elapsed = last_tick.elapsed().as_secs_f64().max(0.001);
+            let _ = events.send(MinerEvent::Hashrate { hps: delta as f64 / elapsed, total_hashes: *cpu_session_total, threads, duty, target_height });
+        }
         if gpu_enabled {
             let _ = gpu_hash_counter.swap(0, Ordering::Relaxed);
         }
@@ -12484,7 +12883,7 @@ fn run_miner_inner(
             let active_chain = load_or_init_chain(&settings)?;
             let active_hash_at_height = active_chain.blocks.get(height as usize).map(|block| block.block_hash());
             if active_hash_at_height == Some(hash) {
-                let _ = events.send(MinerEvent::BlockFound { height, hash: hash.to_string(), txs, reward });
+                let _ = events.send(MinerEvent::BlockFound { height, hash: hash.to_string(), txs, reward, mode: "solo".to_string() });
             } else {
                 let winner_hash = active_hash_at_height
                     .map(|h| h.to_string())
@@ -12511,23 +12910,193 @@ fn hf124_solo_block_from_parts(
     Ok(block_from_candidate_parts(parts, coinbase))
 }
 
-fn hf124_pool_block_from_parts(
+fn hf128_pool_block_from_parts(
     parts: &CandidateBlockParts,
     outputs: &[TxOut],
     pool_id: Hash256,
     extra_nonce: u64,
+    mode: PoolCandidateMode,
 ) -> Block {
-    let coinbase = Transaction {
-        version: 1,
-        inputs: vec![TxIn {
-            previous_output: OutPoint::null(),
-            signature_script: pool_block_marker_script(parts.height, extra_nonce, pool_id),
-            sequence: u32::MAX,
-        }],
-        outputs: outputs.to_vec(),
-        locktime: 0,
-    };
+    let coinbase = create_pool_candidate_coinbase(parts, outputs, pool_id, extra_nonce, mode);
     block_from_candidate_parts(parts, coinbase)
+}
+
+const HF128_GPU_TUNE_SAMPLES_PER_BATCH: u8 = 3;
+
+fn gpu_tuned_batch_cache() -> &'static Mutex<HashMap<String, usize>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct GpuBatchTuner {
+    device: String,
+    cache_result: bool,
+    candidates: Vec<usize>,
+    index: usize,
+    warmup_pending: bool,
+    samples: u8,
+    sample_hashes: u64,
+    sample_secs: f64,
+    best_batch: usize,
+    best_hps: f64,
+}
+
+impl GpuBatchTuner {
+    fn new(device: &str, gpu_percent: u8, work_items_override: usize) -> (Self, bool) {
+        if work_items_override == 0 {
+            if let Ok(cache) = gpu_tuned_batch_cache().lock() {
+                if let Some(batch) = cache.get(device).copied() {
+                    return (
+                        Self {
+                            device: device.to_string(),
+                            cache_result: true,
+                            candidates: Vec::new(),
+                            index: 0,
+                            warmup_pending: false,
+                            samples: 0,
+                            sample_hashes: 0,
+                            sample_secs: 0.0,
+                            best_batch: batch,
+                            best_hps: 0.0,
+                        },
+                        true,
+                    );
+                }
+            }
+        }
+        let mut candidates = gpu_miner::tuning_work_item_candidates(
+            gpu_percent,
+            work_items_override,
+        );
+        if candidates.is_empty() {
+            candidates.push(gpu_miner::initial_work_items(
+                gpu_percent,
+                work_items_override,
+            ));
+        }
+        let best_batch = gpu_miner::interruptible_work_items(candidates[0]);
+        (
+            Self {
+                device: device.to_string(),
+                cache_result: work_items_override == 0,
+                candidates,
+                index: 0,
+                warmup_pending: true,
+                samples: 0,
+                sample_hashes: 0,
+                sample_secs: 0.0,
+                best_batch,
+                best_hps: 0.0,
+            },
+            false,
+        )
+    }
+
+    fn preferred_batch(&self) -> usize {
+        self.candidates
+            .get(self.index)
+            .copied()
+            .map(gpu_miner::interruptible_work_items)
+            .unwrap_or(self.best_batch)
+    }
+
+    fn observe(
+        &mut self,
+        batch: usize,
+        hashes: u64,
+        elapsed_secs: f64,
+        nonce_range_capped: bool,
+    ) -> Option<(usize, f64)> {
+        if self.candidates.is_empty() || nonce_range_capped || hashes == 0 {
+            return None;
+        }
+        if self.warmup_pending {
+            self.warmup_pending = false;
+            return None;
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.sample_hashes = self.sample_hashes.saturating_add(hashes);
+        self.sample_secs += elapsed_secs.max(0.000_001);
+        if self.samples < HF128_GPU_TUNE_SAMPLES_PER_BATCH {
+            return None;
+        }
+
+        let hps = self.sample_hashes as f64 / self.sample_secs.max(0.000_001);
+        if hps > self.best_hps {
+            self.best_hps = hps;
+            self.best_batch = batch;
+        }
+        self.index = self.index.saturating_add(1);
+        self.warmup_pending = true;
+        self.samples = 0;
+        self.sample_hashes = 0;
+        self.sample_secs = 0.0;
+
+        if self.index >= self.candidates.len() {
+            self.candidates.clear();
+            if self.cache_result {
+                if let Ok(mut cache) = gpu_tuned_batch_cache().lock() {
+                    cache.insert(self.device.clone(), self.best_batch);
+                }
+            }
+            return Some((self.best_batch, self.best_hps));
+        }
+        None
+    }
+}
+
+fn gpu_interruptible_duty_sleep(
+    gpu_percent: u8,
+    work_elapsed: Duration,
+    stop: &AtomicBool,
+    round_stop: &AtomicBool,
+) {
+    let percent = gpu_percent.clamp(1, 100);
+    if percent >= 100 {
+        return;
+    }
+    let sleep_secs = work_elapsed.as_secs_f64()
+        * ((100.0 - percent as f64) / percent as f64);
+    let deadline = Instant::now() + Duration::from_secs_f64(sleep_secs.max(0.0));
+    while Instant::now() < deadline
+        && !stop.load(Ordering::Relaxed)
+        && !round_stop.load(Ordering::Relaxed)
+    {
+        let left = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(left.min(Duration::from_millis(10)));
+    }
+}
+
+type GpuSessionTotals = Arc<Mutex<HashMap<String, u64>>>;
+
+fn gpu_session_total(totals: &GpuSessionTotals, device: &str) -> u64 {
+    totals
+        .lock()
+        .ok()
+        .and_then(|map| map.get(device).copied())
+        .unwrap_or(0)
+}
+
+fn add_gpu_session_hashes(totals: &GpuSessionTotals, device: &str, hashes: u64) -> u64 {
+    let Ok(mut map) = totals.lock() else {
+        return hashes;
+    };
+    let total = map.entry(device.to_string()).or_insert(0);
+    *total = total.saturating_add(hashes);
+    *total
+}
+
+struct GpuWorkerExitGuard {
+    device: String,
+    events: mpsc::Sender<MinerEvent>,
+}
+
+impl Drop for GpuWorkerExitGuard {
+    fn drop(&mut self) {
+        let _ = self.events.send(MinerEvent::GpuStopped {
+            device: self.device.clone(),
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12540,6 +13109,7 @@ fn gpu_mine_worker(
     gpu_index: usize,
     target_height: u32,
     hash_counter: Arc<AtomicU64>,
+    session_totals: GpuSessionTotals,
     found_tx: mpsc::Sender<Block>,
     events: mpsc::Sender<MinerEvent>,
     stop: Arc<AtomicBool>,
@@ -12556,17 +13126,23 @@ fn gpu_mine_worker(
     let device = backend.device_name().to_string();
     let workers = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let _ = events.send(MinerEvent::GpuStarted { device: device.clone(), workers, power: gpu_percent, target_height });
+    let _exit_guard = GpuWorkerExitGuard {
+        device: device.clone(),
+        events: events.clone(),
+    };
 
     let mut extra_nonce = 9_000_000_000u64.saturating_add((gpu_index as u64).saturating_mul(100_000_000));
-    let mut local_total_hashes = 0u64;
     let mut last_report = Instant::now();
-    let mut last_report_total = 0u64;
-    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent, gpu_work_items_override);
-    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override)); }
-    let mut tune_index = 0usize;
-    let mut best_batch = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
-    let mut best_hps = 0.0f64;
-    let mut tuning_announced = false;
+    let mut last_report_total = gpu_session_total(&session_totals, &device);
+    let (mut tuner, reused_tuning) =
+        GpuBatchTuner::new(&device, gpu_percent, gpu_work_items_override);
+    if reused_tuning {
+        let _ = events.send(MinerEvent::GpuStatus(format!(
+            "GPU reused the session-tuned {} work-item batch on {}.",
+            tuner.preferred_batch(),
+            device
+        )));
+    }
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
         let mut block = match hf124_solo_block_from_parts(&candidate_parts, &miner, extra_nonce) {
             Ok(block) => block,
@@ -12594,45 +13170,31 @@ fn gpu_mine_worker(
         let mut start_nonce = 0u64;
         while start_nonce <= u32::MAX as u64 && !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
             let remaining = (u32::MAX as u64 + 1).saturating_sub(start_nonce);
-            let preferred_batch = if tune_index < tune_candidates.len() { tune_candidates[tune_index] } else { best_batch };
-            let batch = preferred_batch.min(remaining as usize).max(1);
-            let batch_was_capped = batch < preferred_batch;
+            let dispatch_batch = tuner.preferred_batch();
+            let batch = dispatch_batch.min(remaining as usize).max(1);
+            let nonce_range_capped = batch < dispatch_batch;
             let scan_started = Instant::now();
             match backend.scan_nonce_range(&prefix, &target, start_nonce, batch) {
                 Ok(scan) => {
-                    let scan_elapsed = scan_started.elapsed().as_secs_f64().max(0.001);
-                    let instant_hps = scan.hashes as f64 / scan_elapsed;
-                    if scan.hashes > 0 && !batch_was_capped {
-                        if tune_index < tune_candidates.len() {
-                            if instant_hps > best_hps {
-                                best_hps = instant_hps;
-                                best_batch = batch;
-                            }
-                            tune_index = tune_index.saturating_add(1);
-                            if tune_index >= tune_candidates.len() && !tuning_announced {
-                                tuning_announced = true;
-                                let _ = events.send(MinerEvent::GpuStatus(format!("GPU auto-tune selected {} work items on {} (observed {}).", best_batch, device, format_hps(best_hps))));
-                            }
-                        } else if instant_hps > best_hps * 1.12 {
-                            best_hps = instant_hps;
-                            best_batch = batch;
-                        }
+                    let scan_duration = scan_started.elapsed();
+                    let scan_elapsed = scan_duration.as_secs_f64().max(0.000_001);
+                    if let Some((best_batch, best_hps)) = tuner.observe(
+                        batch,
+                        scan.hashes,
+                        scan_elapsed,
+                        nonce_range_capped,
+                    ) {
+                        let _ = events.send(MinerEvent::GpuStatus(format!(
+                            "GPU stable auto-tune selected {} work items on {} from {} measured sample(s) per candidate (observed {}).",
+                            best_batch,
+                            device,
+                            HF128_GPU_TUNE_SAMPLES_PER_BATCH,
+                            format_hps(best_hps)
+                        )));
                     }
                     hash_counter.fetch_add(scan.hashes, Ordering::Relaxed);
-                    local_total_hashes = local_total_hashes.saturating_add(scan.hashes);
-                    if scan.hashes > 0 && (last_report_total == 0 || last_report.elapsed() >= Duration::from_millis(250)) {
-                        let elapsed = last_report.elapsed().as_secs_f64().max(scan_elapsed).max(0.001);
-                        let delta = local_total_hashes.saturating_sub(last_report_total).max(scan.hashes);
-                        last_report_total = local_total_hashes;
-                        last_report = Instant::now();
-                        let _ = events.send(MinerEvent::GpuHashrate {
-                            hps: delta as f64 / elapsed,
-                            total_hashes: local_total_hashes,
-                            workers: batch,
-                            device: device.clone(),
-                            target_height,
-                        });
-                    }
+                    let session_total =
+                        add_gpu_session_hashes(&session_totals, &device, scan.hashes);
                     if let Some(nonce) = scan.nonce {
                         block.header.nonce = nonce;
                         match verify_header_pow(&block.header) {
@@ -12650,6 +13212,28 @@ fn gpu_mine_worker(
                         }
                     }
                     start_nonce = start_nonce.saturating_add(scan.hashes);
+                    gpu_interruptible_duty_sleep(
+                        gpu_percent,
+                        scan_duration,
+                        stop.as_ref(),
+                        round_stop.as_ref(),
+                    );
+                    if scan.hashes > 0
+                        && (last_report_total == 0
+                            || last_report.elapsed() >= Duration::from_millis(250))
+                    {
+                        let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
+                        let delta = session_total.saturating_sub(last_report_total);
+                        last_report_total = session_total;
+                        last_report = Instant::now();
+                        let _ = events.send(MinerEvent::GpuHashrate {
+                            hps: delta as f64 / elapsed,
+                            total_hashes: session_total,
+                            workers: batch,
+                            device: device.clone(),
+                            target_height,
+                        });
+                    }
                 }
                 Err(err) => {
                     let _ = events.send(MinerEvent::GpuStatus(format!("OpenCL scan failed; CPU mining continues. {err:#}")));
@@ -12735,7 +13319,12 @@ fn mine_worker(
             if batch_hashes >= batch_size {
                 hash_counter.fetch_add(batch_hashes, Ordering::Relaxed);
                 batch_hashes = 0;
-                throttle_batch(duty, batch_start.elapsed());
+                throttle_batch(
+                    duty,
+                    batch_start.elapsed(),
+                    stop.as_ref(),
+                    round_stop.as_ref(),
+                );
                 batch_start = Instant::now();
             }
             if nonce == u32::MAX { break; }
@@ -12752,12 +13341,14 @@ fn gpu_pool_mine_worker(
     candidate_parts: Arc<CandidateBlockParts>,
     pool_outputs: Arc<Vec<TxOut>>,
     pool_id: Hash256,
+    pool_mode: PoolCandidateMode,
     gpu_percent: u8,
     gpu_work_items_override: usize,
     gpu_selector: String,
     gpu_index: usize,
     target_height: u32,
     hash_counter: Arc<AtomicU64>,
+    session_totals: GpuSessionTotals,
     found_tx: mpsc::Sender<Block>,
     events: mpsc::Sender<MinerEvent>,
     stop: Arc<AtomicBool>,
@@ -12774,23 +13365,30 @@ fn gpu_pool_mine_worker(
     let device = backend.device_name().to_string();
     let workers = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
     let _ = events.send(MinerEvent::GpuStarted { device: device.clone(), workers, power: gpu_percent, target_height });
+    let _exit_guard = GpuWorkerExitGuard {
+        device: device.clone(),
+        events: events.clone(),
+    };
 
     let mut extra_nonce = 12_000_000_000u64.saturating_add((gpu_index as u64).saturating_mul(100_000_000));
-    let mut local_total_hashes = 0u64;
     let mut last_report = Instant::now();
-    let mut last_report_total = 0u64;
-    let mut tune_candidates = gpu_miner::tuning_work_item_candidates(gpu_percent, gpu_work_items_override);
-    if tune_candidates.is_empty() { tune_candidates.push(gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override)); }
-    let mut tune_index = 0usize;
-    let mut best_batch = gpu_miner::initial_work_items(gpu_percent, gpu_work_items_override);
-    let mut best_hps = 0.0f64;
-    let mut tuning_announced = false;
+    let mut last_report_total = gpu_session_total(&session_totals, &device);
+    let (mut tuner, reused_tuning) =
+        GpuBatchTuner::new(&device, gpu_percent, gpu_work_items_override);
+    if reused_tuning {
+        let _ = events.send(MinerEvent::GpuStatus(format!(
+            "GPU reused the session-tuned {} work-item batch on {}.",
+            tuner.preferred_batch(),
+            device
+        )));
+    }
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = hf124_pool_block_from_parts(
+        let mut block = hf128_pool_block_from_parts(
             &candidate_parts,
             pool_outputs.as_slice(),
             pool_id,
             extra_nonce,
+            pool_mode,
         );
 
         let serialized = block.header.serialize();
@@ -12811,45 +13409,31 @@ fn gpu_pool_mine_worker(
         let mut start_nonce = 0u64;
         while start_nonce <= u32::MAX as u64 && !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
             let remaining = (u32::MAX as u64 + 1).saturating_sub(start_nonce);
-            let preferred_batch = if tune_index < tune_candidates.len() { tune_candidates[tune_index] } else { best_batch };
-            let batch = preferred_batch.min(remaining as usize).max(1);
-            let batch_was_capped = batch < preferred_batch;
+            let dispatch_batch = tuner.preferred_batch();
+            let batch = dispatch_batch.min(remaining as usize).max(1);
+            let nonce_range_capped = batch < dispatch_batch;
             let scan_started = Instant::now();
             match backend.scan_nonce_range(&prefix, &target, start_nonce, batch) {
                 Ok(scan) => {
-                    let scan_elapsed = scan_started.elapsed().as_secs_f64().max(0.001);
-                    let instant_hps = scan.hashes as f64 / scan_elapsed;
-                    if scan.hashes > 0 && !batch_was_capped {
-                        if tune_index < tune_candidates.len() {
-                            if instant_hps > best_hps {
-                                best_hps = instant_hps;
-                                best_batch = batch;
-                            }
-                            tune_index = tune_index.saturating_add(1);
-                            if tune_index >= tune_candidates.len() && !tuning_announced {
-                                tuning_announced = true;
-                                let _ = events.send(MinerEvent::GpuStatus(format!("GPU auto-tune selected {} work items on {} (observed {}).", best_batch, device, format_hps(best_hps))));
-                            }
-                        } else if instant_hps > best_hps * 1.12 {
-                            best_hps = instant_hps;
-                            best_batch = batch;
-                        }
+                    let scan_duration = scan_started.elapsed();
+                    let scan_elapsed = scan_duration.as_secs_f64().max(0.000_001);
+                    if let Some((best_batch, best_hps)) = tuner.observe(
+                        batch,
+                        scan.hashes,
+                        scan_elapsed,
+                        nonce_range_capped,
+                    ) {
+                        let _ = events.send(MinerEvent::GpuStatus(format!(
+                            "GPU stable auto-tune selected {} work items on {} from {} measured sample(s) per candidate (observed {}).",
+                            best_batch,
+                            device,
+                            HF128_GPU_TUNE_SAMPLES_PER_BATCH,
+                            format_hps(best_hps)
+                        )));
                     }
                     hash_counter.fetch_add(scan.hashes, Ordering::Relaxed);
-                    local_total_hashes = local_total_hashes.saturating_add(scan.hashes);
-                    if scan.hashes > 0 && (last_report_total == 0 || last_report.elapsed() >= Duration::from_millis(250)) {
-                        let elapsed = last_report.elapsed().as_secs_f64().max(scan_elapsed).max(0.001);
-                        let delta = local_total_hashes.saturating_sub(last_report_total).max(scan.hashes);
-                        last_report_total = local_total_hashes;
-                        last_report = Instant::now();
-                        let _ = events.send(MinerEvent::GpuHashrate {
-                            hps: delta as f64 / elapsed,
-                            total_hashes: local_total_hashes,
-                            workers: batch,
-                            device: device.clone(),
-                            target_height,
-                        });
-                    }
+                    let session_total =
+                        add_gpu_session_hashes(&session_totals, &device, scan.hashes);
                     if let Some(nonce) = scan.nonce {
                         block.header.nonce = nonce;
                         match verify_header_pow(&block.header) {
@@ -12867,6 +13451,28 @@ fn gpu_pool_mine_worker(
                         }
                     }
                     start_nonce = start_nonce.saturating_add(scan.hashes);
+                    gpu_interruptible_duty_sleep(
+                        gpu_percent,
+                        scan_duration,
+                        stop.as_ref(),
+                        round_stop.as_ref(),
+                    );
+                    if scan.hashes > 0
+                        && (last_report_total == 0
+                            || last_report.elapsed() >= Duration::from_millis(250))
+                    {
+                        let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
+                        let delta = session_total.saturating_sub(last_report_total);
+                        last_report_total = session_total;
+                        last_report = Instant::now();
+                        let _ = events.send(MinerEvent::GpuHashrate {
+                            hps: delta as f64 / elapsed,
+                            total_hashes: session_total,
+                            workers: batch,
+                            device: device.clone(),
+                            target_height,
+                        });
+                    }
                 }
                 Err(err) => {
                     let _ = events.send(MinerEvent::GpuStatus(format!("OpenCL pool scan failed; CPU pool mining continues. {err:#}")));
@@ -12885,6 +13491,7 @@ fn pool_mine_worker(
     candidate_parts: Arc<CandidateBlockParts>,
     pool_outputs: Arc<Vec<TxOut>>,
     pool_id: Hash256,
+    pool_mode: PoolCandidateMode,
     hash_counter: Arc<AtomicU64>,
     found_tx: mpsc::Sender<Block>,
     events: mpsc::Sender<MinerEvent>,
@@ -12896,11 +13503,12 @@ fn pool_mine_worker(
     let batch_size = 8_192u64;
 
     while !stop.load(Ordering::Relaxed) && !round_stop.load(Ordering::Relaxed) {
-        let mut block = hf124_pool_block_from_parts(
+        let mut block = hf128_pool_block_from_parts(
             &candidate_parts,
             pool_outputs.as_slice(),
             pool_id,
             extra_nonce,
+            pool_mode,
         );
         let target = match target_from_compact(block.header.bits) {
             Ok(target) => target,
@@ -12950,7 +13558,12 @@ fn pool_mine_worker(
             if batch_hashes >= batch_size {
                 hash_counter.fetch_add(batch_hashes, Ordering::Relaxed);
                 batch_hashes = 0;
-                throttle_batch(duty, batch_start.elapsed());
+                throttle_batch(
+                    duty,
+                    batch_start.elapsed(),
+                    stop.as_ref(),
+                    round_stop.as_ref(),
+                );
                 batch_start = Instant::now();
             }
             if nonce == u32::MAX { break; }
@@ -12992,7 +13605,7 @@ fn benchmark_hashing(config_path: &str, payout: &str, seconds: u64) -> Result<(f
         let mut header_bytes = header_bytes_for_mining(&block.header)?;
         for nonce in 0..=u32::MAX {
             header_bytes[76..80].copy_from_slice(&nonce.to_le_bytes());
-            let _ = mining_header_meets_target(&header_bytes, &pow_target);
+            std::hint::black_box(mining_header_meets_target(&header_bytes, &pow_target));
             hashes = hashes.saturating_add(1);
             if hashes % 65_536 == 0 && started.elapsed() >= target { break; }
         }
@@ -13018,20 +13631,44 @@ fn resource_plan(
     let cpu_percent_u8 = cpu_percent.clamp(1, 100);
     let cpu_percent = cpu_percent_u8 as f32;
     let logical = logical_cpus.max(1);
-    let desired_capacity = (logical as f32 * cpu_percent / 100.0).max(0.05);
-    let threads = desired_capacity.ceil().clamp(1.0, logical as f32) as usize;
+    // HF128 restores HF126's proven full-power nonce-lane saturation plan.
+    // HF127 accidentally removed the 2x lane branch, halving the user's
+    // automatic worker count exactly at 100%. There is no fixed 256-worker
+    // ceiling: these are independent nonce lanes and all remain continuous at
+    // 100%; lower percentages retain the ordinary logical-CPU capacity plan.
+    let worker_capacity = if cpu_percent_u8 >= 100 {
+        logical.saturating_mul(2).max(1)
+    } else {
+        logical
+    };
+    let desired_capacity = (worker_capacity as f32 * cpu_percent / 100.0).max(0.05);
+    let threads = desired_capacity
+        .ceil()
+        .clamp(1.0, worker_capacity as f32) as usize;
     let duty = ((desired_capacity / threads as f32) * 100.0)
         .round()
         .clamp(1.0, 100.0) as u8;
     (threads.max(1), duty.max(1))
 }
 
-fn throttle_batch(duty: u8, work_elapsed: Duration) {
+fn throttle_batch(
+    duty: u8,
+    work_elapsed: Duration,
+    stop: &AtomicBool,
+    round_stop: &AtomicBool,
+) {
     if duty >= 100 { return; }
     let duty = duty.max(1) as f64;
     let sleep_secs = work_elapsed.as_secs_f64() * ((100.0 - duty) / duty);
     if sleep_secs > 0.000_5 {
-        thread::sleep(Duration::from_secs_f64(sleep_secs.min(0.25)));
+        let deadline = Instant::now() + Duration::from_secs_f64(sleep_secs);
+        while Instant::now() < deadline
+            && !stop.load(Ordering::Relaxed)
+            && !round_stop.load(Ordering::Relaxed)
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(left.min(Duration::from_millis(10)));
+        }
     }
 }
 
@@ -14011,21 +14648,80 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 #[cfg(target_os = "windows")]
 fn powershell_json(command: &str) -> Result<serde_json::Value> {
+    powershell_json_bounded(command, Duration::from_secs(45))
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_json_bounded(
+    command: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    use std::io::Read as _;
+
+    const POWERSHELL_CAPTURE_MAX_BYTES: u64 = 2 * 1024 * 1024;
     let mut powershell = Command::new("powershell.exe");
     powershell.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]);
+    powershell.stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_command_window(&mut powershell);
-    let out = powershell.output().context("spawn powershell")?;
-    if !out.status.success() {
-        anyhow::bail!("PowerShell command failed: {}", String::from_utf8_lossy(&out.stderr));
+    let mut child = powershell.spawn().context("spawn powershell")?;
+    let stdout = child.stdout.take().context("capture powershell stdout")?;
+    let stderr = child.stderr.take().context("capture powershell stderr")?;
+    let stdout_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stdout
+            .take(POWERSHELL_CAPTURE_MAX_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    let stderr_reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        stderr
+            .take(POWERSHELL_CAPTURE_MAX_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll powershell")? {
+            break status;
+        }
+        if started.elapsed() >= timeout.max(Duration::from_secs(1)) {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().context("reap timed-out powershell")?;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("powershell stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("powershell stderr reader panicked"))??;
+    if timed_out {
+        anyhow::bail!(
+            "PowerShell command timed out after {} seconds",
+            timeout.as_secs().max(1)
+        );
     }
-    let stdout = String::from_utf8(out.stdout).context("powershell stdout utf8")?;
+    if stdout.len() as u64 > POWERSHELL_CAPTURE_MAX_BYTES
+        || stderr.len() as u64 > POWERSHELL_CAPTURE_MAX_BYTES
+    {
+        anyhow::bail!("PowerShell output exceeded the 2 MiB safety limit");
+    }
+    if !status.success() {
+        anyhow::bail!("PowerShell command failed: {}", String::from_utf8_lossy(&stderr));
+    }
+    let stdout = String::from_utf8(stdout).context("powershell stdout utf8")?;
     let cleaned = stdout
         .trim()
         .trim_start_matches('\u{feff}')
         .trim_start();
     let json_start = cleaned
         .find(|c| c == '{' || c == '[')
-        .ok_or_else(|| anyhow::anyhow!("PowerShell returned no JSON. stdout='{}' stderr='{}'", cleaned, String::from_utf8_lossy(&out.stderr)))?;
+        .ok_or_else(|| anyhow::anyhow!("PowerShell returned no JSON. stdout='{}' stderr='{}'", cleaned, String::from_utf8_lossy(&stderr)))?;
     let json = &cleaned[json_start..];
     Ok(serde_json::from_str(json).context("parse powershell json")?)
 }
@@ -14033,19 +14729,363 @@ fn powershell_json(command: &str) -> Result<serde_json::Value> {
 #[cfg(target_os = "windows")]
 fn windows_check_and_stage_update(url: &str, current_version: &str, last_signature: &str, allow_unsigned_update: bool) -> Result<UpdateEvent> {
     let update_url = url.trim();
-    if update_url.to_ascii_lowercase().ends_with(".json") {
+    let update_path = update_url
+        .split(|ch: char| matches!(ch, '?' | '#'))
+        .next()
+        .unwrap_or(update_url);
+    if update_path.to_ascii_lowercase().ends_with(".json") {
         return windows_check_and_stage_manifest_update(update_url, current_version, last_signature, allow_unsigned_update);
     }
     windows_check_and_stage_legacy_exe_update(update_url, current_version, last_signature, allow_unsigned_update)
 }
 
 #[cfg(target_os = "windows")]
-fn windows_check_and_stage_manifest_update(manifest_url: &str, current_version: &str, last_signature: &str, allow_unsigned_update: bool) -> Result<UpdateEvent> {
-    let manifest_cmd = format!(
-        "$r = Invoke-WebRequest -Uri '{}' -UseBasicParsing; [string]$r.Content",
-        manifest_url.replace("'", "''")
+fn hf128_https_origin(url: &str, label: &str) -> Result<String> {
+    let value = url.trim();
+    let scheme_end = value
+        .find("://")
+        .ok_or_else(|| anyhow::anyhow!("{} must be an absolute HTTPS URL", label))?;
+    if !value[..scheme_end].eq_ignore_ascii_case("https") {
+        anyhow::bail!("{} must use HTTPS", label);
+    }
+    let remainder = &value[scheme_end.saturating_add(3)..];
+    let authority_end = remainder
+        .find(|ch: char| matches!(ch, '/' | '?' | '#'))
+        .unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains('\\')
+        || authority.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        anyhow::bail!("{} contains an invalid HTTPS authority", label);
+    }
+
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| anyhow::anyhow!("{} contains an invalid IPv6 authority", label))?;
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close.saturating_add(1)..];
+        let port = if suffix.is_empty() {
+            443
+        } else {
+            suffix
+                .strip_prefix(':')
+                .context("invalid HTTPS IPv6 port separator")?
+                .parse::<u16>()
+                .with_context(|| format!("{} contains an invalid HTTPS port", label))?
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|ch| ch.is_ascii_hexdigit() || matches!(ch, ':' | '.'))
+        {
+            anyhow::bail!("{} contains an invalid IPv6 host", label);
+        }
+        (format!("[{host}]"), port)
+    } else {
+        if authority.matches(':').count() > 1 {
+            anyhow::bail!("{} must bracket an IPv6 host", label);
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, raw_port)) => (
+                host,
+                raw_port
+                    .parse::<u16>()
+                    .with_context(|| format!("{} contains an invalid HTTPS port", label))?,
+            ),
+            None => (authority, 443),
+        };
+        let host = host.to_ascii_lowercase();
+        if host.is_empty()
+            || host.starts_with('.')
+            || host.ends_with('.')
+            || host.contains("..")
+            || !host
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+        {
+            anyhow::bail!("{} contains an invalid HTTPS host", label);
+        }
+        (host, port)
+    };
+    if port == 0 {
+        anyhow::bail!("{} contains an invalid HTTPS port", label);
+    }
+    Ok(format!("https://{host}:{port}"))
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_official_update_origin() -> &'static str {
+    "https://download.qubit-coin.io:443"
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_unique_update_temp(prefix: &str, suffix: &str) -> PathBuf {
+    let nonce = HF128_UPDATE_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    app_write_path(&format!(
+        "data/updater/{}-{}-{}-{}.{}",
+        hf128_safe_update_component(prefix),
+        std::process::id(),
+        hf85_now_ms(),
+        nonce,
+        suffix.trim_start_matches('.')
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_curl_download(
+    url: &str,
+    destination: &Path,
+    max_time_secs: u64,
+    max_bytes: u64,
+    required_effective_origin: Option<&str>,
+) -> Result<()> {
+    let requested_origin = hf128_https_origin(url, "Update URL")?;
+    if let Some(required) = required_effective_origin {
+        if requested_origin != required {
+            anyhow::bail!("Update URL origin mismatch: got {}, expected {}", requested_origin, required);
+        }
+    }
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut failures = Vec::new();
+    let max_time = max_time_secs.max(30).to_string();
+    let max_filesize = max_bytes.max(1).to_string();
+    for attempt in 1..=3 {
+        let _ = std::fs::remove_file(destination);
+        let mut curl = Command::new("curl.exe");
+        curl.args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "--max-redirs",
+            "5",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            &max_time,
+            "--max-filesize",
+            &max_filesize,
+            "--write-out",
+            "%{url_effective}",
+            "--output",
+        ])
+        .arg(destination)
+        .arg(url);
+        hide_command_window(&mut curl);
+        match curl.output() {
+            Ok(output) if output.status.success() => {
+                let effective_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let effective_origin = hf128_https_origin(
+                    &effective_url,
+                    "Effective update download URL",
+                );
+                match (required_effective_origin, effective_origin) {
+                    (Some(required), Ok(origin)) if origin == required => return Ok(()),
+                    (Some(required), Ok(origin)) => failures.push(format!(
+                        "attempt {attempt}: redirect origin {} did not match required {}",
+                        origin, required
+                    )),
+                    (Some(_), Err(err)) => failures.push(format!(
+                        "attempt {attempt}: could not verify redirect origin: {err:#}"
+                    )),
+                    (None, _) => return Ok(()),
+                }
+            }
+            Ok(output) => failures.push(format!(
+                "attempt {attempt}: curl exit {}; {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(err) => failures.push(format!("attempt {attempt}: could not start curl.exe: {err}")),
+        }
+        if attempt < 3 {
+            thread::sleep(Duration::from_secs(attempt));
+        }
+    }
+    let _ = std::fs::remove_file(destination);
+    anyhow::bail!("Update download failed after 3 bounded attempts: {}", failures.join(" | "))
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open staged update {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_safe_update_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') { ch } else { '_' })
+        .collect::<String>();
+    if sanitized.is_empty() { "unknown".to_string() } else { sanitized }
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_validate_update_file_size(path: &Path, expected: Option<u64>, max: u64) -> Result<u64> {
+    let bytes = std::fs::metadata(path)
+        .with_context(|| format!("stat staged update {}", path.display()))?
+        .len();
+    if bytes == 0 || bytes > max {
+        anyhow::bail!("Staged update has invalid size: {} bytes", bytes);
+    }
+    if let Some(expected) = expected.filter(|value| *value > 0) {
+        if bytes != expected {
+            anyhow::bail!("Staged update size mismatch: got {}, expected {} bytes", bytes, expected);
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_staged_file_matches(
+    path: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> bool {
+    hf128_validate_update_file_size(
+        path,
+        Some(expected_bytes),
+        UPDATE_INSTALLER_MAX_BYTES,
+    )
+    .is_ok()
+        && hf128_sha256_file(path)
+            .map(|hash| hash == expected_sha256)
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_commit_verified_staged_file(
+    part: &Path,
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> Result<()> {
+    if destination.exists()
+        && hf128_staged_file_matches(destination, expected_bytes, expected_sha256)
+    {
+        let _ = std::fs::remove_file(part);
+        return Ok(());
+    }
+    if destination.exists() {
+        if let Err(err) = std::fs::remove_file(destination) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err).with_context(|| {
+                    format!("remove invalid staged update {}", destination.display())
+                });
+            }
+        }
+    }
+    match std::fs::rename(part, destination) {
+        Ok(()) => Ok(()),
+        Err(_rename_error)
+            if destination.exists()
+                && hf128_staged_file_matches(
+                    destination,
+                    expected_bytes,
+                    expected_sha256,
+                ) =>
+        {
+            // Another bounded updater worker committed the exact same verified
+            // artifact after our existence check. Its file is equally valid.
+            let _ = std::fs::remove_file(part);
+            Ok(())
+        }
+        Err(rename_error) => Err(rename_error)
+            .with_context(|| format!("commit verified staged update {}", destination.display())),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_installer_metadata(path: &Path) -> Result<(String, String, String)> {
+    let escaped = path.display().to_string().replace('\'', "''");
+    let command = format!(
+        "$item=Get-Item '{}'; $sig=Get-AuthenticodeSignature -FilePath '{}'; [pscustomobject]@{{version=[string]$item.VersionInfo.ProductVersion; signature_status=[string]$sig.Status; signer=if($sig.SignerCertificate){{$sig.SignerCertificate.Subject}}else{{''}}}} | ConvertTo-Json -Compress",
+        escaped, escaped
     );
-    let manifest = powershell_json(&manifest_cmd)?;
+    let metadata = powershell_json_bounded(&command, Duration::from_secs(45))?;
+    Ok((
+        metadata.get("version").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string(),
+        metadata.get("signature_status").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string(),
+        metadata.get("signer").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string(),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn hf128_validate_installer_signature(status: &str, signer: &str, allow_unsigned_update: bool) -> Result<()> {
+    if status == "Valid" {
+        if !signer.contains("Alexander Proestakis") {
+            anyhow::bail!("Downloaded installer signer mismatch: {}", signer);
+        }
+        return Ok(());
+    }
+    if allow_unsigned_update && status == "NotSigned" && signer.trim().is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Downloaded installer signature is {}; expected a Valid pinned signature{}",
+        status,
+        if allow_unsigned_update {
+            " or a genuinely unsigned official private build"
+        } else {
+            ""
+        }
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_check_and_stage_manifest_update(manifest_url: &str, current_version: &str, last_signature: &str, allow_unsigned_update: bool) -> Result<UpdateEvent> {
+    let manifest_origin = hf128_https_origin(manifest_url, "Update manifest URL")?;
+    let manifest_required_origin = if allow_unsigned_update
+        && manifest_origin == hf128_official_update_origin()
+    {
+        Some(manifest_origin.as_str())
+    } else {
+        None
+    };
+    let manifest_path = hf128_unique_update_temp("manifest-download", "json.part");
+    hf128_curl_download(
+        manifest_url,
+        &manifest_path,
+        60,
+        UPDATE_MANIFEST_MAX_BYTES,
+        manifest_required_origin,
+    )?;
+    let manifest_read = (|| -> Result<(u64, String)> {
+        let bytes = hf128_validate_update_file_size(
+            &manifest_path,
+            None,
+            UPDATE_MANIFEST_MAX_BYTES,
+        )?;
+        let body = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read update manifest {}", manifest_path.display()))?;
+        Ok((bytes, body))
+    })();
+    let _ = std::fs::remove_file(&manifest_path);
+    let (manifest_bytes, manifest_body) = manifest_read?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_body)
+        .context("parse update manifest JSON")?;
     let version = manifest.get("version").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
     let artifact_url = manifest.get("url").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
     let sha256 = manifest.get("sha256").and_then(|v| v.as_str()).unwrap_or_default().trim().to_ascii_lowercase();
@@ -14059,15 +15099,27 @@ fn windows_check_and_stage_manifest_update(manifest_url: &str, current_version: 
     if artifact_url.is_empty() {
         anyhow::bail!("Update manifest is missing installer URL");
     }
+    let artifact_origin = hf128_https_origin(&artifact_url, "Update installer URL")?;
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("Update manifest must contain a 64-character SHA256 digest");
+    }
     let expected_channel = format!("{}-windows-x64", build_channel());
-    if !channel.is_empty() && channel != expected_channel {
+    if channel != expected_channel {
         anyhow::bail!("Update manifest channel mismatch: {}, expected {}", channel, expected_channel);
     }
-    if !network.is_empty() && network != build_channel() {
+    if network != build_channel() {
         anyhow::bail!("Update manifest network mismatch: {}, expected {}", network, build_channel());
     }
 
-    let signature = format!("manifest|{}|{}|{}|{}", channel, version, sha256, published_at);
+    // The temporary private-build exception is deliberately narrow: both the
+    // manifest and its artifact must come from the exact official HTTPS origin.
+    // Custom URLs remain available, but their installers must pass the pinned
+    // Authenticode signer check before they can enter Ready state.
+    let installer_allow_unsigned = allow_unsigned_update
+        && manifest_origin == hf128_official_update_origin()
+        && artifact_origin == manifest_origin;
+
+    let signature = format!("manifest|{}|{}|{}|{}|{}", channel, version, sha256, published_at, manifest_bytes);
     if !signature.is_empty() && signature == last_signature && compare_versions(&version, current_version) != std::cmp::Ordering::Greater {
         return Ok(UpdateEvent::UpToDate { signature, message: format!("Current version {} is up to date.", current_version) });
     }
@@ -14075,95 +15127,167 @@ fn windows_check_and_stage_manifest_update(manifest_url: &str, current_version: 
         return Ok(UpdateEvent::UpToDate { signature, message: format!("Current version {} is up to date.", current_version) });
     }
 
-    let dest = app_write_path(UPDATE_DOWNLOAD_PATH);
-    if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
-
-    let dl_cmd = format!(
-        "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; $item = Get-Item '{}'; $hash = (Get-FileHash -Algorithm SHA256 '{}').Hash.ToLowerInvariant(); $sig = Get-AuthenticodeSignature -FilePath '{}'; [pscustomobject]@{{version=$item.VersionInfo.ProductVersion; sha256=$hash; signature_status=[string]$sig.Status; signer=if($sig.SignerCertificate){{$sig.SignerCertificate.Subject}}else{{''}}}} | ConvertTo-Json -Compress",
-        artifact_url.replace("'", "''"),
-        dest.display().to_string().replace("'", "''"),
-        dest.display().to_string().replace("'", "''"),
-        dest.display().to_string().replace("'", "''"),
-        dest.display().to_string().replace("'", "''")
+    let expected_bytes = manifest.get("size").and_then(|value| value.as_u64())
+        .or_else(|| manifest.get("bytes").and_then(|value| value.as_u64()));
+    let file_name = format!(
+        "QUB-Core-{}-{}.exe",
+        hf128_safe_update_component(&version),
+        &sha256[..12]
     );
-    let downloaded = powershell_json(&dl_cmd)?;
-    let downloaded_version = downloaded.get("version").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
-    let downloaded_sha = downloaded.get("sha256").and_then(|v| v.as_str()).unwrap_or_default().trim().to_ascii_lowercase();
-    let sig_status = downloaded.get("signature_status").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let signer = downloaded.get("signer").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-
-    if !sha256.is_empty() && downloaded_sha != sha256 {
-        anyhow::bail!("Downloaded installer SHA256 mismatch: got {}, expected {}", downloaded_sha, sha256);
+    let dest = app_write_path(&format!("data/updater/{file_name}"));
+    let mut staged_bytes = None;
+    if dest.exists() {
+        let size = hf128_validate_update_file_size(
+            &dest,
+            expected_bytes,
+            UPDATE_INSTALLER_MAX_BYTES,
+        )
+        .ok();
+        let hash_ok = size.is_some()
+            && hf128_sha256_file(&dest)
+                .map(|hash| hash == sha256)
+                .unwrap_or(false);
+        if hash_ok {
+            staged_bytes = size;
+        } else {
+            std::fs::remove_file(&dest)
+                .with_context(|| format!("remove invalid staged update {}", dest.display()))?;
+        }
     }
-    if !downloaded_version.is_empty() && compare_versions(&downloaded_version, &version) != std::cmp::Ordering::Equal {
+    if staged_bytes.is_none() {
+        let part = hf128_unique_update_temp("installer-download", "exe.part");
+        let staged_result = (|| -> Result<u64> {
+            hf128_curl_download(
+                &artifact_url,
+                &part,
+                4 * 60,
+                UPDATE_INSTALLER_MAX_BYTES,
+                if installer_allow_unsigned {
+                    Some(artifact_origin.as_str())
+                } else {
+                    None
+                },
+            )?;
+            let bytes = hf128_validate_update_file_size(
+                &part,
+                expected_bytes,
+                UPDATE_INSTALLER_MAX_BYTES,
+            )?;
+            let downloaded_sha = hf128_sha256_file(&part)?;
+            if downloaded_sha != sha256 {
+                anyhow::bail!(
+                    "Downloaded installer SHA256 mismatch: got {}, expected {}",
+                    downloaded_sha,
+                    sha256
+                );
+            }
+            hf128_commit_verified_staged_file(&part, &dest, bytes, &sha256)?;
+            Ok(bytes)
+        })();
+        if staged_result.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        staged_bytes = Some(staged_result?);
+    }
+    let staged_bytes = staged_bytes.context("verified installer size unavailable")?;
+
+    let (downloaded_version, sig_status, signer) = hf128_installer_metadata(&dest)?;
+    if downloaded_version.is_empty() {
+        anyhow::bail!("Downloaded installer is missing ProductVersion metadata");
+    }
+    if compare_versions(&downloaded_version, &version) != std::cmp::Ordering::Equal {
         anyhow::bail!("Downloaded installer version mismatch: got {}, manifest says {}", downloaded_version, version);
     }
-
-    if !allow_unsigned_update {
-        if sig_status != "Valid" {
-            anyhow::bail!("Downloaded installer signature is {}, expected Valid", sig_status);
-        }
-        if !signer.contains("Alexander Proestakis") {
-            anyhow::bail!("Downloaded installer signer mismatch: {}", signer);
-        }
-    }
+    hf128_validate_installer_signature(&sig_status, &signer, installer_allow_unsigned)?;
 
     Ok(UpdateEvent::Ready {
         version: version.clone(),
         installer_path: dest.to_string_lossy().to_string(),
+        installer_sha256: sha256.clone(),
+        installer_bytes: staged_bytes,
+        installer_allow_unsigned,
         signature,
         message: format!(
-            "QUB Core {} was verified by update manifest and is ready to install{}.",
+            "QUB Core {} was staged atomically and verified against manifest SHA256{}.",
             version,
-            if allow_unsigned_update && sig_status != "Valid" { " (unsigned private build accepted)" } else { "" }
+            if installer_allow_unsigned && sig_status != "Valid" { " (unsigned private build accepted from the official origin)" } else { "" }
         ),
     })
 }
 
 #[cfg(target_os = "windows")]
-fn windows_check_and_stage_legacy_exe_update(url: &str, current_version: &str, last_signature: &str, allow_unsigned_update: bool) -> Result<UpdateEvent> {
+fn windows_check_and_stage_legacy_exe_update(url: &str, current_version: &str, _last_signature: &str, allow_unsigned_update: bool) -> Result<UpdateEvent> {
+    let update_origin = hf128_https_origin(url, "Legacy update URL")?;
+    let installer_allow_unsigned =
+        allow_unsigned_update && update_origin == hf128_official_update_origin();
     let head_cmd = format!(
-        "$r = Invoke-WebRequest -Uri '{}' -Method Head -UseBasicParsing; $etag=[string]$r.Headers['ETag']; $lm=[string]$r.Headers['Last-Modified']; $len=[string]$r.Headers['Content-Length']; if([string]::IsNullOrWhiteSpace($len)){{$len='0'}}; [pscustomobject]@{{signature=($etag+'|'+$lm+'|'+$len); bytes=[int64]$len}} | ConvertTo-Json -Compress",
+        "$r = Invoke-WebRequest -Uri '{}' -Method Head -UseBasicParsing -TimeoutSec 30; $etag=[string]$r.Headers['ETag']; $lm=[string]$r.Headers['Last-Modified']; $len=[string]$r.Headers['Content-Length']; if([string]::IsNullOrWhiteSpace($len)){{$len='0'}}; [pscustomobject]@{{signature=($etag+'|'+$lm+'|'+$len); bytes=[int64]$len}} | ConvertTo-Json -Compress",
         url.replace("'", "''")
     );
-    let head = powershell_json(&head_cmd)?;
+    let head = powershell_json_bounded(&head_cmd, Duration::from_secs(45))?;
     let signature = head.get("signature").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    if !signature.is_empty() && signature == last_signature {
-        return Ok(UpdateEvent::UpToDate { signature, message: format!("Current version {} is up to date.", current_version) });
+
+    let expected_bytes = head.get("bytes").and_then(|value| value.as_u64());
+    let part = hf128_unique_update_temp("legacy-installer-download", "exe.part");
+    let stage_result = (|| -> Result<(u64, String, String, String, String)> {
+        hf128_curl_download(
+            url,
+            &part,
+            4 * 60,
+            UPDATE_INSTALLER_MAX_BYTES,
+            if installer_allow_unsigned {
+                Some(update_origin.as_str())
+            } else {
+                None
+            },
+        )?;
+        let bytes = hf128_validate_update_file_size(
+            &part,
+            expected_bytes,
+            UPDATE_INSTALLER_MAX_BYTES,
+        )?;
+        let sha256 = hf128_sha256_file(&part)?;
+        let (version, sig_status, signer) = hf128_installer_metadata(&part)?;
+        Ok((bytes, sha256, version, sig_status, signer))
+    })();
+    if stage_result.is_err() {
+        let _ = std::fs::remove_file(&part);
     }
-
-    let dest = app_write_path(UPDATE_DOWNLOAD_PATH);
-    if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
-
-    let dl_cmd = format!(
-        "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing; $item = Get-Item '{}'; $sig = Get-AuthenticodeSignature -FilePath '{}'; [pscustomobject]@{{version=$item.VersionInfo.ProductVersion; signature_status=[string]$sig.Status; signer=if($sig.SignerCertificate){{$sig.SignerCertificate.Subject}}else{{''}}}} | ConvertTo-Json -Compress",
-        url.replace("'", "''"),
-        dest.display().to_string().replace("'", "''"),
-        dest.display().to_string().replace("'", "''"),
-        dest.display().to_string().replace("'", "''")
-    );
-    let downloaded = powershell_json(&dl_cmd)?;
-    let version = downloaded.get("version").and_then(|v| v.as_str()).unwrap_or_default().trim().to_string();
-    let sig_status = downloaded.get("signature_status").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let signer = downloaded.get("signer").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let (staged_bytes, sha256, version, sig_status, signer) = stage_result?;
+    if version.is_empty() {
+        let _ = std::fs::remove_file(&part);
+        anyhow::bail!("Downloaded legacy installer is missing ProductVersion metadata");
+    }
     if compare_versions(&version, current_version) != std::cmp::Ordering::Greater {
+        let _ = std::fs::remove_file(&part);
         return Ok(UpdateEvent::UpToDate { signature, message: format!("Current version {} is up to date.", current_version) });
     }
-
-    if !allow_unsigned_update {
-        if sig_status != "Valid" {
-            anyhow::bail!("Downloaded installer signature is {}, expected Valid", sig_status);
-        }
-        if !signer.contains("Alexander Proestakis") {
-            anyhow::bail!("Downloaded installer signer mismatch: {}", signer);
-        }
+    if let Err(err) =
+        hf128_validate_installer_signature(&sig_status, &signer, installer_allow_unsigned)
+    {
+        let _ = std::fs::remove_file(&part);
+        return Err(err);
+    }
+    let dest = app_write_path(&format!(
+        "data/updater/QUB-Core-legacy-{}-{}.exe",
+        hf128_safe_update_component(&version),
+        &sha256[..12]
+    ));
+    if let Err(err) =
+        hf128_commit_verified_staged_file(&part, &dest, staged_bytes, &sha256)
+    {
+        let _ = std::fs::remove_file(&part);
+        return Err(err);
     }
 
     Ok(UpdateEvent::Ready {
-        version: if version.is_empty() { "unknown".to_string() } else { version.clone() },
+        version: version.clone(),
         installer_path: dest.to_string_lossy().to_string(),
+        installer_sha256: sha256,
+        installer_bytes: staged_bytes,
+        installer_allow_unsigned,
         signature,
-        message: format!("QUB Core {} was downloaded successfully and is ready to install{}.", version, if allow_unsigned_update && sig_status != "Valid" { " (unsigned private build accepted)" } else { "" }),
+        message: format!("QUB Core {} was downloaded successfully and is ready to install{}.", version, if installer_allow_unsigned && sig_status != "Valid" { " (unsigned private build accepted from the official origin)" } else { "" }),
     })
 }
 
@@ -14184,7 +15308,7 @@ mod tests {
         for logical in 1..=128 {
             for pct in 1..=100 {
                 let (threads, duty) = resource_plan(logical, pct, 0);
-                assert!(threads >= 1 && threads <= logical);
+                assert!(threads >= 1 && threads <= logical.saturating_mul(2));
                 assert!((1..=100).contains(&duty));
             }
         }
@@ -14193,7 +15317,7 @@ mod tests {
     #[test]
     fn resource_plan_uses_all_workers_at_full_power() {
         let (threads, duty) = resource_plan(8, 100, 0);
-        assert_eq!(threads, 8);
+        assert_eq!(threads, 16);
         assert_eq!(duty, 100);
     }
 

@@ -414,9 +414,20 @@ fn pool_create_share_and_payout_are_consensus_valid() {
     let share_txid = share_tx.txid();
     chain.accept_transaction_to_mempool(share_tx, &s).unwrap();
 
-    let b = mine_next_block(&chain, &s, &manager, opts).unwrap();
-    assert!(b.transactions.iter().any(|tx| tx.txid() == share_txid));
-    chain.connect_block(b, &s).unwrap();
+    // HF128 must bootstrap the first share without waiting for a solo miner.
+    // The markerless block remains valid under unchanged HF127 consensus and
+    // confirms the share that enables ordinary marked PPLNS on the next tip.
+    let bootstrap = mine_next_pool_block(&chain, &s, pool_id, opts).unwrap();
+    assert_eq!(parse_pool_block_marker(&bootstrap), None);
+    assert_eq!(
+        parse_pool_compatibility_marker(&bootstrap),
+        Some((pool_id, "share-bootstrap".to_string()))
+    );
+    assert!(bootstrap
+        .transactions
+        .iter()
+        .any(|tx| tx.txid() == share_txid));
+    chain.connect_block(bootstrap, &s).unwrap();
 
     let pool_block = mine_next_pool_block(&chain, &s, pool_id, opts).unwrap();
     assert_eq!(parse_pool_block_marker(&pool_block), Some(pool_id));
@@ -1101,6 +1112,11 @@ fn hf123_fast_storage_truncates_uncommitted_suffix_and_recovers_previous_pointer
     let loaded = load_committed_chain(&s, true).unwrap();
     assert_eq!(loaded.height(), 2);
     assert_eq!(loaded.tip_hash(), chain.tip_hash());
+    let (atomic_loaded, atomic_identity) =
+        load_committed_chain_with_identity(&s, true).unwrap();
+    let atomic_identity = atomic_identity.expect("Fast Chain identity accompanies exact load");
+    assert_eq!(atomic_identity.committed_height, atomic_loaded.height());
+    assert_eq!(atomic_identity.tip_hash, atomic_loaded.tip_hash());
 
     // A syntactically valid CURRENT pointer with a corrupt/missing state must
     // also recover through PREVIOUS, not only a malformed CURRENT.json file.
@@ -1267,6 +1283,483 @@ fn hf124_make_pool_shares(
         }
     }
     out
+}
+
+fn hf128_synthetic_mainnet_block(
+    settings: &Settings,
+    prior_blocks: &[Block],
+    height: u32,
+    mut extra_transactions: Vec<Transaction>,
+) -> Block {
+    assert_eq!(prior_blocks.len(), height as usize);
+    let coinbase = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::null(),
+            signature_script: ScriptBuf(height.to_le_bytes().to_vec()),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        locktime: 0,
+    };
+    let mut transactions = Vec::with_capacity(extra_transactions.len().saturating_add(1));
+    transactions.push(coinbase);
+    transactions.append(&mut extra_transactions);
+    let merkle_root = merkle_root(
+        &transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>(),
+    );
+    Block {
+        header: BlockHeader {
+            version: expected_block_version(settings, height),
+            prev_block_hash: prior_blocks.last().unwrap().block_hash(),
+            merkle_root,
+            time: settings.consensus.genesis_time.saturating_add(
+                height.saturating_mul(settings.consensus.target_spacing_secs),
+            ),
+            bits: settings.pow_bits().unwrap(),
+            nonce: 0,
+        },
+        transactions,
+    }
+}
+
+#[test]
+fn hf128_pool_candidate_planner_enforces_all_pool_gates() {
+    let settings = regtest();
+    let chain = ChainState::new_with_genesis(&settings).unwrap();
+    let unknown_pool_id = Hash256::double_sha256(b"hf128 unknown pool");
+
+    let mut disabled = settings.clone();
+    disabled.pools.enabled = false;
+    assert!(build_pool_candidate_plan(&chain, &disabled, unknown_pool_id)
+        .unwrap_err()
+        .to_string()
+        .contains("disabled"));
+
+    let mut pre_activation = settings.clone();
+    pre_activation.pools.activation_height = 2;
+    assert!(build_pool_candidate_plan(&chain, &pre_activation, unknown_pool_id)
+        .unwrap_err()
+        .to_string()
+        .contains("activates at block #2"));
+
+    assert!(build_pool_candidate_plan(&chain, &settings, unknown_pool_id)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown pool_id"));
+}
+
+#[test]
+fn hf128_empty_pool_bootstrap_reserves_target_share_before_global_cap() {
+    let (
+        mut settings,
+        mut chain,
+        manager_wallet,
+        manager,
+        distractor_pool_id,
+        distractor_key,
+        options,
+    ) = hf124_pool_fixture();
+    settings.pools.max_share_txs_per_block = 4;
+
+    // Mature enough additional subsidy for the same manager wallet to create
+    // a second pool without depending on fixture-specific coin selection.
+    for _ in 0..5 {
+        let block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+        chain.connect_block(block, &settings).unwrap();
+    }
+
+    let create_target = manager_wallet
+        .create_pool_create_transaction(
+            &chain,
+            &settings,
+            "HF128 Bootstrap Target",
+            &manager,
+            500,
+            settings.pools.base_capacity_slots,
+            Amount::from_str("0.00001").unwrap(),
+        )
+        .unwrap();
+    let target_pool_id = create_target.txid();
+    chain
+        .accept_transaction_to_mempool(create_target, &settings)
+        .unwrap();
+    let create_block = mine_next_block(&chain, &settings, &manager, options).unwrap();
+    chain.connect_block(create_block, &settings).unwrap();
+
+    let mut target_wallet = WalletFile::new(&settings.network.name);
+    let target_key = target_wallet
+        .create_key(&settings, "hf128-bootstrap-target", 0)
+        .unwrap();
+    let target_address =
+        Address::parse_with_prefix(&target_key.address, &settings.network.address_prefix).unwrap();
+
+    let mut distractor_nonce = 0u64;
+    let distractors = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        distractor_pool_id,
+        &distractor_key,
+        settings.pools.max_share_txs_per_block,
+        &mut distractor_nonce,
+    );
+    assert_eq!(
+        chain
+            .accept_transactions_to_mempool_batch(distractors, &settings)
+            .unwrap()
+            .len(),
+        settings.pools.max_share_txs_per_block
+    );
+
+    // Advance the parent without selecting the pending distractor shares. They
+    // remain valid within the stale horizon but now sort strictly before the
+    // target pool's newer share, independent of txid randomness.
+    let empty_height = chain.height().saturating_add(1);
+    let empty_parts = CandidateBlockParts {
+        height: empty_height,
+        prev_block_hash: chain.tip_hash(),
+        time: unix_time_u32(),
+        bits: required_work_bits(&settings, &chain.blocks, empty_height).unwrap(),
+        version: expected_block_version(&settings, empty_height),
+        reward_atoms: block_subsidy(empty_height as u64, &settings),
+        non_coinbase_transactions: Vec::new(),
+        legacy_pool_marker_compatible: true,
+    };
+    let empty_coinbase =
+        create_coinbase(empty_height, empty_parts.reward_atoms, &manager, 0).unwrap();
+    let mut empty_block = block_from_candidate_parts(&empty_parts, empty_coinbase);
+    while !verify_header_pow(&empty_block.header).unwrap() {
+        empty_block.header.nonce = empty_block.header.nonce.wrapping_add(1);
+    }
+    chain.connect_block(empty_block, &settings).unwrap();
+    assert_eq!(
+        chain
+            .mempool
+            .iter()
+            .filter(|tx| is_pool_share_transaction(tx))
+            .count(),
+        settings.pools.max_share_txs_per_block
+    );
+
+    let mut target_nonce = 0u64;
+    let target_share = hf124_make_pool_shares(
+        &settings,
+        &chain,
+        target_pool_id,
+        &target_key,
+        1,
+        &mut target_nonce,
+    )
+    .pop()
+    .unwrap();
+    let target_share_txid = target_share.txid();
+    chain
+        .accept_transaction_to_mempool(target_share, &settings)
+        .unwrap();
+
+    let plan = build_pool_candidate_plan(&chain, &settings, target_pool_id).unwrap();
+    assert_eq!(plan.mode, PoolCandidateMode::ShareBootstrapCompatibility);
+    let selected_shares = plan
+        .parts
+        .non_coinbase_transactions
+        .iter()
+        .filter(|tx| is_pool_share_transaction(tx))
+        .collect::<Vec<_>>();
+    assert_eq!(selected_shares.len(), settings.pools.max_share_txs_per_block);
+    assert!(selected_shares
+        .iter()
+        .any(|tx| tx.txid() == target_share_txid));
+    assert!(plan
+        .outputs
+        .iter()
+        .any(|output| output.script_pubkey == target_address.script_pubkey()));
+
+    let coinbase = create_pool_candidate_coinbase(
+        &plan.parts,
+        &plan.outputs,
+        target_pool_id,
+        0,
+        plan.mode,
+    );
+    let mut bootstrap = block_from_candidate_parts(&plan.parts, coinbase);
+    while !verify_header_pow(&bootstrap.header).unwrap() {
+        bootstrap.header.nonce = bootstrap.header.nonce.wrapping_add(1);
+    }
+    assert_eq!(parse_pool_block_marker(&bootstrap), None);
+    chain.connect_block(bootstrap, &settings).unwrap();
+}
+
+#[test]
+fn hf128_confirmed_pool_melt_uses_compatibility_and_defers_native_jin_fee() {
+    let mut settings = regtest();
+    // Exercise the real mainnet-only QUB/JIN infusion activation while keeping
+    // regtest's easy PoW target and deterministic local protocol addresses.
+    settings.network.name = "mainnet".to_string();
+
+    let mut manager_wallet = WalletFile::new(&settings.network.name);
+    let manager_key = manager_wallet
+        .create_key(&settings, "hf128-melt-manager", 0)
+        .unwrap();
+    let manager =
+        Address::parse_with_prefix(&manager_key.address, &settings.network.address_prefix).unwrap();
+
+    let pool_create = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::double_sha256(b"hf128 synthetic pool create input"),
+                vout: 0,
+            },
+            signature_script: ScriptBuf::empty(),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_atoms(settings.pools.marker_output_atoms).unwrap(),
+            script_pubkey: pool_create_marker_script(
+                "HF128 Melt Pool",
+                &manager,
+                500,
+                settings.pools.base_capacity_slots,
+                &settings,
+            )
+            .unwrap(),
+        }],
+        locktime: 0,
+    };
+    let pool_id = pool_create.txid();
+
+    let mut share_wallet = WalletFile::new(&settings.network.name);
+    let share_key = share_wallet
+        .create_key(&settings, "hf128-melt-share", 0)
+        .unwrap();
+
+    let mut jin_wallet = WalletFile::new(&settings.network.name);
+    let jin_key = jin_wallet
+        .create_key(&settings, "hf128-jin-fee-source", 0)
+        .unwrap();
+    let jin_source =
+        Address::parse_with_prefix(&jin_key.address, &settings.network.address_prefix).unwrap();
+    let jin_protocol = Address::parse_with_prefix(
+        &settings.jin.protocol_address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let jin_funding = Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Hash256::double_sha256(b"hf128 synthetic JIN funding input"),
+                vout: 0,
+            },
+            signature_script: ScriptBuf::empty(),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_atoms(settings.jin.marker_output_atoms).unwrap(),
+            script_pubkey: jin_marker_script_transfer(
+                &settings,
+                &jin_protocol,
+                &jin_source,
+                10 * JIN_UNITS_PER_COIN,
+                0,
+                "QUB",
+            )
+            .unwrap(),
+        }],
+        locktime: 0,
+    };
+
+    let mut blocks = vec![genesis_block(&settings).unwrap()];
+    for height in 1..=MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT.saturating_sub(1) {
+        let extra = match height {
+            1 => vec![pool_create.clone()],
+            2 => vec![jin_funding.clone()],
+            _ => Vec::new(),
+        };
+        let block = hf128_synthetic_mainnet_block(&settings, &blocks, height, extra);
+        blocks.push(block);
+    }
+
+    let share_parent_height = MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT.saturating_sub(1);
+    let share_parent_hash = blocks.last().unwrap().block_hash();
+    let mut share_nonce = 0u64;
+    while !pool_share_meets_target(
+        &settings,
+        pool_id,
+        &share_key.address,
+        share_parent_height,
+        share_parent_hash,
+        share_nonce,
+    )
+    .unwrap()
+    {
+        share_nonce = share_nonce.wrapping_add(1);
+    }
+    let confirmed_share = create_pool_share_transaction(
+        &settings,
+        pool_id,
+        &share_key,
+        share_parent_height,
+        share_parent_hash,
+        share_nonce,
+    )
+    .unwrap();
+    let activation_block = hf128_synthetic_mainnet_block(
+        &settings,
+        &blocks,
+        MAINNET_QUB_JIN_INFUSION_ACTIVATION_HEIGHT,
+        vec![confirmed_share],
+    );
+    blocks.push(activation_block);
+
+    let mut melt_wallet = WalletFile::new(&settings.network.name);
+    let melt_key = melt_wallet
+        .create_key(&settings, "hf128-melt-source", 0)
+        .unwrap();
+    let melt_source =
+        Address::parse_with_prefix(&melt_key.address, &settings.network.address_prefix).unwrap();
+    let melt_outpoint = OutPoint {
+        txid: Hash256::double_sha256(b"hf128 melt source UTXO"),
+        vout: 0,
+    };
+    let jin_outpoint = OutPoint {
+        txid: Hash256::double_sha256(b"hf128 JIN source UTXO"),
+        vout: 0,
+    };
+    let mut utxos = std::collections::HashMap::new();
+    utxos.insert(
+        melt_outpoint,
+        CoinRecord {
+            tx_out: TxOut {
+                value: Amount::from_atoms(2 * ATOMS_PER_QUB).unwrap(),
+                script_pubkey: melt_source.script_pubkey(),
+            },
+            height: 1,
+            is_coinbase: false,
+        },
+    );
+    utxos.insert(
+        jin_outpoint,
+        CoinRecord {
+            tx_out: TxOut {
+                value: Amount::from_atoms(ATOMS_PER_QUB).unwrap(),
+                script_pubkey: jin_source.script_pubkey(),
+            },
+            height: 1,
+            is_coinbase: false,
+        },
+    );
+    let mut chain = ChainState {
+        network: settings.network.name.clone(),
+        blocks: std::sync::Arc::new(blocks),
+        utxos: std::sync::Arc::new(utxos),
+        mempool: std::sync::Arc::new(Vec::new()),
+    };
+
+    assert_eq!(
+        pool_share_scores_from_blocks(&settings, &chain.blocks, chain.height() + 1, pool_id)
+            .values()
+            .copied()
+            .sum::<u128>(),
+        1
+    );
+    let melt_amount = Amount::from_str("1").unwrap();
+    let melt_fee = Amount::from_str("0.00001").unwrap();
+    assert_eq!(
+        qub_jin_melt_payout_units_for_atoms(&settings, &chain, melt_amount.atoms()).unwrap(),
+        2 * JIN_UNITS_PER_COIN
+    );
+    let melt = melt_wallet
+        .create_qub_melt_for_jin_transaction(
+            &chain,
+            &settings,
+            melt_amount,
+            melt_fee,
+            2 * JIN_UNITS_PER_COIN,
+        )
+        .unwrap();
+    let melt_txid = melt.txid();
+    chain
+        .accept_transaction_to_mempool(melt, &settings)
+        .unwrap();
+
+    let mut recipient_wallet = WalletFile::new(&settings.network.name);
+    let recipient_key = recipient_wallet
+        .create_key(&settings, "hf128-jin-fee-recipient", 0)
+        .unwrap();
+    let recipient = Address::parse_with_prefix(
+        &recipient_key.address,
+        &settings.network.address_prefix,
+    )
+    .unwrap();
+    let jin_fee_units = parse_jin_units_raw(&settings.jin.default_fee_units).unwrap();
+    let native_jin_fee = jin_wallet
+        .create_jin_transfer_transaction(
+            &chain,
+            &settings,
+            &recipient,
+            JIN_UNITS_PER_COIN,
+            Amount::from_atoms(0).unwrap(),
+            jin_fee_units,
+            "JIN",
+        )
+        .unwrap();
+    let native_jin_fee_txid = native_jin_fee.txid();
+    assert_eq!(
+        transaction_jin_fee_units(&settings, &native_jin_fee),
+        jin_fee_units
+    );
+    chain
+        .accept_transaction_to_mempool(native_jin_fee, &settings)
+        .unwrap();
+
+    let plan = build_pool_candidate_plan(&chain, &settings, pool_id).unwrap();
+    assert_eq!(plan.mode, PoolCandidateMode::MeltCompatibility);
+    assert_eq!(
+        plan.parts.reward_atoms,
+        block_subsidy(plan.parts.height as u64, &settings) + melt_fee.atoms()
+    );
+    assert!(plan
+        .parts
+        .non_coinbase_transactions
+        .iter()
+        .any(|tx| tx.txid() == melt_txid));
+    assert!(!plan
+        .parts
+        .non_coinbase_transactions
+        .iter()
+        .any(|tx| tx.txid() == native_jin_fee_txid));
+
+    let coinbase =
+        create_pool_candidate_coinbase(&plan.parts, &plan.outputs, pool_id, 0, plan.mode);
+    let mut block = block_from_candidate_parts(&plan.parts, coinbase);
+    while !verify_header_pow(&block.header).unwrap() {
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    assert_eq!(parse_pool_block_marker(&block), None);
+    assert_eq!(
+        parse_pool_compatibility_marker(&block),
+        Some((pool_id, "melt".to_string()))
+    );
+    chain.connect_block(block, &settings).unwrap();
+
+    assert!(!chain.mempool.iter().any(|tx| tx.txid() == melt_txid));
+    assert!(chain
+        .mempool
+        .iter()
+        .any(|tx| tx.txid() == native_jin_fee_txid));
+    let stats = mining_stats_json(&settings, &chain.blocks, 1);
+    assert_eq!(
+        stats["distribution"][0]["label"].as_str().unwrap(),
+        format!("pool:{}", pool_id)
+    );
+    assert_eq!(
+        stats["distribution"][0]["label_type"].as_str(),
+        Some("pool")
+    );
 }
 
 #[test]

@@ -72,35 +72,41 @@ pub fn recommended_work_items(gpu_percent: u8) -> usize {
     align_work_items(work.max(min).min(max))
 }
 
-pub fn initial_work_items(gpu_percent: u8, work_items_override: usize) -> usize {
+pub fn initial_work_items(_gpu_percent: u8, work_items_override: usize) -> usize {
     if work_items_override > 0 {
-        return align_work_items(work_items_override.max(1));
+        return interruptible_work_items(work_items_override);
     }
-    recommended_work_items(gpu_percent)
-        .min(HF76_FAST_WORK_ITEMS)
-        .max(MIN_GPU_WORK_ITEMS)
+    // Power percentage is implemented by duty cycling, not by shrinking the
+    // dispatch. Keep initial telemetry and the first real auto-tune dispatch
+    // on the same percentage-independent efficiency policy.
+    tuning_work_item_candidates(100, 0)
+        .first()
+        .copied()
+        .map(interruptible_work_items)
+        .unwrap_or(MIN_GPU_WORK_ITEMS)
 }
 
 pub fn tuning_work_item_candidates(
-    gpu_percent: u8,
+    _gpu_percent: u8,
     work_items_override: usize,
 ) -> Vec<usize> {
     if work_items_override > 0 {
         return vec![align_work_items(work_items_override.max(1))];
     }
-    let pct = gpu_percent.clamp(1, 100) as usize;
+    // HF128 uses percentage strictly as an interruptible duty cycle. Kernel
+    // efficiency tuning is deliberately percentage-independent, otherwise a
+    // low-power session can cache a small batch and pin a later 100% session
+    // to low throughput even though the GUI accepted the new setting.
+    let requested = recommended_work_items(100);
     let mut candidates = vec![
-        HF76_FAST_WORK_ITEMS,
-        HF76_FAST_WORK_ITEMS / 2,
-        HF76_FAST_WORK_ITEMS.saturating_mul(3) / 2,
-        HF76_FAST_WORK_ITEMS.saturating_mul(2),
+        requested / 2,
+        requested.saturating_mul(3) / 4,
+        requested,
+        requested.saturating_mul(5) / 4,
+        requested.saturating_mul(3) / 2,
     ];
-    if pct >= 90 {
-        candidates.push(HF76_FAST_WORK_ITEMS.saturating_mul(3));
-        candidates.push(AUTO_MAX_GPU_WORK_ITEMS);
-    }
-    let requested = recommended_work_items(gpu_percent);
-    candidates.push(requested);
+    candidates.push(HF76_FAST_WORK_ITEMS.saturating_mul(3));
+    candidates.push(AUTO_MAX_GPU_WORK_ITEMS);
     let mut out = Vec::new();
     for candidate in candidates {
         let aligned = align_work_items(candidate.max(MIN_GPU_WORK_ITEMS).min(AUTO_MAX_GPU_WORK_ITEMS));
@@ -109,6 +115,13 @@ pub fn tuning_work_item_candidates(
         }
     }
     out
+}
+
+/// Bound one uninterruptible OpenCL dispatch, not total work or hashrate.
+/// Oversized manual ranges are scanned as consecutive chunks so 100% remains
+/// continuous while Stop/tip changes are observed between kernels.
+pub fn interruptible_work_items(requested: usize) -> usize {
+    align_work_items(requested.max(1).min(AUTO_MAX_GPU_WORK_ITEMS))
 }
 
 pub fn align_work_items(work_items: usize) -> usize {
@@ -698,15 +711,31 @@ mod hf127_tests {
     use super::*;
 
     #[test]
-    fn explicit_work_item_override_is_not_auto_capped() {
+    fn explicit_work_item_override_is_split_into_interruptible_dispatches() {
         let requested = AUTO_MAX_GPU_WORK_ITEMS.saturating_mul(8);
-        assert_eq!(initial_work_items(100, requested), align_work_items(requested));
-        assert_eq!(tuning_work_item_candidates(100, requested), vec![align_work_items(requested)]);
+        assert_eq!(initial_work_items(100, requested), AUTO_MAX_GPU_WORK_ITEMS);
+        assert_eq!(
+            tuning_work_item_candidates(100, requested),
+            vec![align_work_items(requested)]
+        );
+        assert_eq!(interruptible_work_items(requested), AUTO_MAX_GPU_WORK_ITEMS);
     }
 
     #[test]
     fn work_item_alignment_does_not_apply_a_hidden_ceiling() {
         let requested = AUTO_MAX_GPU_WORK_ITEMS.saturating_mul(16) + 123;
         assert!(align_work_items(requested) > AUTO_MAX_GPU_WORK_ITEMS);
+    }
+
+    #[test]
+    fn percentage_changes_duty_not_efficiency_candidates() {
+        assert!(recommended_work_items(1) < recommended_work_items(25));
+        assert!(recommended_work_items(25) < recommended_work_items(50));
+        assert!(recommended_work_items(50) < recommended_work_items(100));
+        assert_eq!(tuning_work_item_candidates(1, 0), tuning_work_item_candidates(100, 0));
+        assert_eq!(
+            initial_work_items(1, 0),
+            interruptible_work_items(tuning_work_item_candidates(100, 0)[0])
+        );
     }
 }

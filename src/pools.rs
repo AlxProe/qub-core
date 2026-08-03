@@ -1616,13 +1616,23 @@ pub fn pool_payout_plan(
     total_amount: u128,
 ) -> Result<PoolPayoutPlan> {
     let height = prior_blocks.len() as u32;
+    let scores = pool_share_scores_from_blocks(settings, prior_blocks, height, pool_id)
+        .into_iter()
+        .collect::<Vec<_>>();
+    pool_payout_plan_from_scores(settings, prior_blocks, pool_id, total_amount, scores)
+}
+
+fn pool_payout_plan_from_scores(
+    settings: &Settings,
+    prior_blocks: &[Block],
+    pool_id: Hash256,
+    total_amount: u128,
+    scores: Vec<(String, u128)>,
+) -> Result<PoolPayoutPlan> {
     let registry = cached_pools_registry_from_blocks(settings, prior_blocks)?;
     let pool = registry
         .get(&pool_id)
         .context("unknown pool_id for payout")?;
-    let scores = pool_share_scores_from_blocks(settings, prior_blocks, height, pool_id)
-        .into_iter()
-        .collect::<Vec<_>>();
     let total_score: u128 = scores.iter().map(|(_, s)| *s).sum();
     let (commission_amount, miner_amount, entries) = split_amount(
         total_amount,
@@ -1641,16 +1651,7 @@ pub fn pool_payout_plan(
     })
 }
 
-pub fn expected_pool_coinbase_outputs(
-    settings: &Settings,
-    prior_blocks: &[Block],
-    pool_id: Hash256,
-    total_reward_atoms: u128,
-) -> Result<Vec<TxOut>> {
-    if total_reward_atoms > u64::MAX as u128 {
-        bail!("pool reward overflow");
-    }
-    let plan = pool_payout_plan(settings, prior_blocks, pool_id, total_reward_atoms)?;
+fn pool_outputs_from_plan(settings: &Settings, plan: PoolPayoutPlan) -> Result<Vec<TxOut>> {
     let mut outputs = Vec::new();
     if plan.commission_amount > 0 {
         let manager =
@@ -1674,6 +1675,95 @@ pub fn expected_pool_coinbase_outputs(
         bail!("pool payout produced no outputs");
     }
     Ok(outputs)
+}
+
+pub fn expected_pool_coinbase_outputs(
+    settings: &Settings,
+    prior_blocks: &[Block],
+    pool_id: Hash256,
+    total_reward_atoms: u128,
+) -> Result<Vec<TxOut>> {
+    if total_reward_atoms > u64::MAX as u128 {
+        bail!("pool reward overflow");
+    }
+    let plan = pool_payout_plan(settings, prior_blocks, pool_id, total_reward_atoms)?;
+    pool_outputs_from_plan(settings, plan)
+}
+
+/// Policy-only deterministic payouts for a markerless HF128 compatibility
+/// block. Confirmed PPLNS scores are preferred. If the window is empty, valid
+/// current-parent share transactions selected into this exact block bootstrap
+/// the first deterministic payout and become confirmed scores for the next
+/// ordinary consensus-marked pool block.
+pub fn expected_pool_compatibility_coinbase_outputs(
+    settings: &Settings,
+    prior_blocks: &[Block],
+    pool_id: Hash256,
+    total_reward_atoms: u128,
+    selected_transactions: &[Transaction],
+) -> Result<Vec<TxOut>> {
+    if total_reward_atoms > u64::MAX as u128 {
+        bail!("pool reward overflow");
+    }
+    let height = prior_blocks.len() as u32;
+    let confirmed = pool_share_scores_from_blocks(settings, prior_blocks, height, pool_id);
+    let confirmed_total = confirmed.values().copied().fold(0u128, u128::saturating_add);
+    let scores = if confirmed_total > 0 {
+        confirmed.into_iter().collect::<Vec<_>>()
+    } else {
+        let mut pending = HashMap::<String, u128>::new();
+        for tx in selected_transactions {
+            let Some(share) = parse_pool_share_tx(tx) else {
+                continue;
+            };
+            if share.pool_id == pool_id {
+                let score = pending.entry(share.miner_address).or_insert(0);
+                *score = score.saturating_add(1);
+            }
+        }
+        pending.into_iter().collect::<Vec<_>>()
+    };
+    let plan = pool_payout_plan_from_scores(
+        settings,
+        prior_blocks,
+        pool_id,
+        total_reward_atoms,
+        scores,
+    )?;
+    pool_outputs_from_plan(settings, plan)
+}
+
+const POOL_COMPAT_PREFIX: &[u8] = b"POOLCOMPAT1|";
+
+pub fn pool_compatibility_marker_script(
+    height: u32,
+    extra_nonce: u64,
+    pool_id: Hash256,
+    reason: &str,
+) -> ScriptBuf {
+    let mut sig = Vec::new();
+    sig.extend_from_slice(&height.to_le_bytes());
+    sig.extend_from_slice(&extra_nonce.to_le_bytes());
+    sig.extend_from_slice(b"/QUB Core v1.8.4/");
+    sig.extend_from_slice(POOL_COMPAT_PREFIX);
+    sig.extend_from_slice(pool_id.to_string().as_bytes());
+    sig.push(b'|');
+    sig.extend_from_slice(reason.as_bytes());
+    ScriptBuf(sig)
+}
+
+/// Display/diagnostics parser only. Consensus deliberately ignores this tag.
+pub fn parse_pool_compatibility_marker(block: &Block) -> Option<(Hash256, String)> {
+    let coinbase = block.transactions.first()?;
+    let script = coinbase.inputs.first()?.signature_script.as_bytes();
+    let pos = script
+        .windows(POOL_COMPAT_PREFIX.len())
+        .position(|window| window == POOL_COMPAT_PREFIX)?;
+    let rest = std::str::from_utf8(&script[pos + POOL_COMPAT_PREFIX.len()..]).ok()?;
+    let mut parts = rest.split('|');
+    let pool_id = Hash256::from_hex(parts.next()?.trim()).ok()?;
+    let reason = parts.next().unwrap_or_default().trim().to_string();
+    Some((pool_id, reason))
 }
 
 pub fn pool_block_marker_script(height: u32, extra_nonce: u64, pool_id: Hash256) -> ScriptBuf {
