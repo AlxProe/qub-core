@@ -28,6 +28,11 @@ fn run() -> Result<()> {
         help(&config_path);
         return Ok(());
     }
+    // Finite commands must not exit with detached maintenance holding a lease.
+    // The GUI is a separate binary; persistent services keep background work.
+    if !matches!(args[0].as_str(), "node" | "rpc-api" | "explorer-api") {
+        use_inline_storage_maintenance_for_cli();
+    }
     match args[0].as_str() {
         "init" => cmd_init(&settings),
         "info" => cmd_info(&settings),
@@ -176,6 +181,7 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         let mut value = serde_json::json!({
             "ok": false,
             "mode": "status-fast",
+            "version": "1.8.6",
             "network": settings.network.name,
             "chain_file_exists": false,
             "fast_storage_exists": false,
@@ -196,8 +202,21 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
             "hf128_self_alias_quarantine": true,
             "hf128_atomic_explorer_snapshot": true,
             "hf128_updater_recovery": true,
+            "hf129_post_commit_live_first": true,
+            "hf129_detached_legacy_export": true,
+            "hf129_priority_sync_writer": true,
+            "hf129_typed_sync_outcomes": true,
+            "hf129_stale_http_tip_rejected": true,
+            "hf129_monotonic_gui_snapshots": true,
+            "hf129_typed_mining_resume": true,
+            "hf129_explorer_latest_wins": true,
+            "hf129_fce_only_snapshot_publisher": true,
             "protocol_epoch_2_activation_height": protocol_epoch_2_activation_height(settings),
             "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
+            "hf133_asert_mtp": settings.network.name == "mainnet",
+            "daa_v3_activation_height": if settings.network.name == "mainnet" { Some(MAINNET_DAA_V3_ACTIVATION_HEIGHT) } else { None },
+            "daa_v3_half_life_secs": DAA_V3_HALF_LIFE_SECS,
+            "protocol_epoch_3_block_version": PROTOCOL_EPOCH_3_BLOCK_VERSION,
             "hf121_status_fast": true,
             "hf121_r2_bounded_memory": true,
             "hf123_single_canonical_owner": live_chain_arc(settings).is_some(),
@@ -244,6 +263,7 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
     let mut value = serde_json::json!({
         "ok": true,
         "mode": "status-fast",
+        "version": "1.8.6",
         "status_source": source_name,
         "network": status.network,
         "storage_engine": status.storage_engine,
@@ -265,9 +285,14 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "tip_tx_count": status.tip_tx_count,
         "next_height": next_height,
         "next_block_expected_version": expected_block_version(settings, next_height),
+        "daa_v3_active_next_block": daa_v3_active(settings, next_height),
         "protocol_epoch_2_activation_height": epoch_height,
         "protocol_epoch_2_active_next_block": protocol_epoch_2_active(settings, next_height),
         "post_activation_block_version": PROTOCOL_EPOCH_2_BLOCK_VERSION,
+            "hf133_asert_mtp": settings.network.name == "mainnet",
+            "daa_v3_activation_height": if settings.network.name == "mainnet" { Some(MAINNET_DAA_V3_ACTIVATION_HEIGHT) } else { None },
+            "daa_v3_half_life_secs": DAA_V3_HALF_LIFE_SECS,
+            "protocol_epoch_3_block_version": PROTOCOL_EPOCH_3_BLOCK_VERSION,
         "hf120_protocol_epoch_2_unchanged": epoch_height == MAINNET_PROTOCOL_EPOCH_2_ACTIVATION_HEIGHT || settings.network.name != "mainnet",
         "hf121_status_fast": true,
         "hf121_r2_bounded_memory": true,
@@ -288,6 +313,15 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         "hf128_self_alias_quarantine": true,
         "hf128_atomic_explorer_snapshot": true,
         "hf128_updater_recovery": true,
+        "hf129_post_commit_live_first": true,
+        "hf129_detached_legacy_export": true,
+        "hf129_priority_sync_writer": true,
+        "hf129_typed_sync_outcomes": true,
+        "hf129_stale_http_tip_rejected": true,
+        "hf129_monotonic_gui_snapshots": true,
+        "hf129_typed_mining_resume": true,
+        "hf129_explorer_latest_wins": true,
+        "hf129_fce_only_snapshot_publisher": true,
         "generated_at_unix": now,
         "status_generated_at_unix": status.generated_at_unix,
         "warning": "status-fast is an operational liveness view, not full consensus replay validation; use validate/preflight outside hot deploy paths"
@@ -332,17 +366,22 @@ fn cmd_export_chain_json(settings: &Settings, output: Option<&str>) -> Result<()
     let target = output
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.data_dir.join("chain-export.json"));
-    let (height, tip_hash, bytes) = export_chain_json(settings, &target)?;
+    let report = export_chain_json_report(settings, &target)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "ok": true,
             "network": settings.network.name,
-            "height": height,
-            "tip_hash": tip_hash.to_string(),
-            "bytes": bytes,
+            "height": report.height,
+            "tip_hash": report.tip_hash.to_string(),
+            "bytes": report.bytes,
             "output": target.display().to_string(),
-            "storage_engine": HF123_FAST_STORAGE_MAGIC,
+            "source": report.source,
+            "storage_engine": report.storage_engine,
+            "generation": report.generation,
+            "state_revision": report.state_revision,
+            "committed_at_unix": report.committed_at_unix,
+            "recovered_from_previous": report.recovered_from_previous,
         }))?
     );
     Ok(())
@@ -1785,68 +1824,12 @@ fn cmd_mine(settings: &Settings, blocks: u32, address: Option<&str>) -> Result<(
     }
     Ok(())
 }
-fn merge_cli_sync_report(into: &mut p2p::P2PSyncReport, other: p2p::P2PSyncReport) {
-    into.peers_contacted = into.peers_contacted.saturating_add(other.peers_contacted);
-    into.peer_errors = into.peer_errors.saturating_add(other.peer_errors);
-    into.best_peer_height = into.best_peer_height.max(other.best_peer_height);
-    into.chains_adopted = into.chains_adopted.saturating_add(other.chains_adopted);
-    into.blocks_connected = into.blocks_connected.saturating_add(other.blocks_connected);
-    into.txs_accepted = into.txs_accepted.saturating_add(other.txs_accepted);
-    if other.height > into.height
-        || (other.height == into.height && !other.tip_hash.trim().is_empty())
-    {
-        into.height = other.height;
-        into.tip_hash = other.tip_hash;
-    }
-}
-
 fn cmd_sync(settings: &Settings) -> Result<()> {
-    // HF82/v1.6.2: manual Sync uses the same single-flight catch-up path as
-    // GUI/mining. It keeps retrying bounded official/direct catch-up before it
-    // falls back to heavier snapshot repair.
-    let mut report = p2p::hf82_manual_catchup(settings, 45_000)?;
-    let local_after_suffix = load_or_init_chain(settings)?;
-    let official_tip = p2p::official_http_tip(settings, 3_000).ok().flatten();
-    let official_h = official_tip
-        .as_ref()
-        .map(|(h, _)| *h)
-        .unwrap_or(report.best_peer_height);
-    let official_hash = official_tip
-        .as_ref()
-        .map(|(_, h)| h.clone())
-        .unwrap_or_default();
-    let local_suffix_hash = local_after_suffix.tip_hash().to_string();
-    let same_height_wrong_tip = official_h == local_after_suffix.height()
-        && !official_hash.trim().is_empty()
-        && official_hash != local_suffix_hash;
-    if official_h > local_after_suffix.height() || same_height_wrong_tip {
-        if let Ok(tail) = p2p::sync_official_http_tail(settings, 20_000) {
-            merge_cli_sync_report(&mut report, tail);
-        }
-    }
-    let local_after_tail = load_or_init_chain(settings)?;
-    if report.best_peer_height == 0 || local_after_tail.height() < report.best_peer_height {
-        let followup = p2p::sync_quick(settings, 2, 4_000)?;
-        merge_cli_sync_report(&mut report, followup);
-    }
-    let local_after_quick = load_or_init_chain(settings)?;
-    let official_h = official_tip
-        .as_ref()
-        .map(|(h, _)| *h)
-        .unwrap_or(report.best_peer_height);
-    let official_hash = official_tip
-        .as_ref()
-        .map(|(_, h)| h.clone())
-        .unwrap_or_default();
-    let quick_hash = local_after_quick.tip_hash().to_string();
-    let still_wrong_tip = official_h == local_after_quick.height()
-        && !official_hash.trim().is_empty()
-        && official_hash != quick_hash;
-    if official_h > local_after_quick.height() || still_wrong_tip {
-        if let Ok(full) = p2p::sync_official_http_snapshot(settings, 30_000) {
-            merge_cli_sync_report(&mut report, full);
-        }
-    }
+    // HF129: one coordinated manual writer owns discovery, suffix/tail repair
+    // and full official fallback. Running extra state-changing stages outside
+    // that coordinator could overlap the embedded node and made the final typed
+    // outcome contradict the actual work.
+    let report = p2p::hf90_manual_catchup(settings, 420_000)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -2137,6 +2120,9 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
                 && settings.pools.enabled,
             "Pools mainnet activation must be #9999 and enabled by consensus override".to_string(),
         );
+        add_preflight_check(&mut checks, &mut ok_all, "mainnet_hf133_asert_mtp_parameters",
+            MAINNET_DAA_V3_ACTIVATION_HEIGHT == 100_000 && DAA_V3_HALF_LIFE_SECS == 3_600 && DAA_V3_TARGET_SPACING_SECS == 60 && DAA_V3_POW_LIMIT_BITS == 0x1d07ffff && PROTOCOL_EPOCH_3_BLOCK_VERSION == 3,
+            format!("HF133 mainnet upgrade at #{}; ASERT-MTP with 1h half-life; block version 3", MAINNET_DAA_V3_ACTIVATION_HEIGHT));
         let checkpoint_ok = chain
             .blocks
             .get(MAINNET_FORK_SAFETY_CHECKPOINT_HEIGHT as usize)
@@ -2231,8 +2217,8 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
                 "mainnet_protocol_epoch_2_blocks_versioned",
                 post_epoch_versions_ok,
                 format!(
-                    "all blocks from #{} onward must use block version {}",
-                    epoch2_activation, PROTOCOL_EPOCH_2_BLOCK_VERSION
+                    "historical version {} starts at #{}; HF133 version {} starts at #{}",
+                    PROTOCOL_EPOCH_2_BLOCK_VERSION, epoch2_activation, PROTOCOL_EPOCH_3_BLOCK_VERSION, MAINNET_DAA_V3_ACTIVATION_HEIGHT
                 ),
             );
         }
@@ -2274,22 +2260,16 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
                     .unwrap_or(false),
             hf116_activation_detail,
         );
-        let bootstrap_reserve_ok = if current_height < hf116_activation {
-            jin_ledger_from_blocks(settings, &chain.blocks)
-                .map(|ledger| {
-                    ledger
-                        .get(&settings.jin.protocol_address)
-                        .copied()
-                        .unwrap_or(0)
-                        >= qub_jin_bootstrap_units(settings)
-                })
-                .unwrap_or(false)
-        } else {
-            qub_jin_infusion_state(settings, &chain)
-                .map(|st| st.lifetime_infused_jin_units >= qub_jin_bootstrap_units(settings))
-                .unwrap_or(false)
-        };
-        add_preflight_check(&mut checks, &mut ok_all, "mainnet_qub_jin_bootstrap_protocol_reserve", bootstrap_reserve_ok, "protocol JIN reserve must cover the 42,000,000 JIN HF116 bootstrap before activation, or chain state must already show the bootstrap after activation".to_string());
+        let bootstrap_reserve = hf131_mainnet_bootstrap_preflight(settings, &chain);
+        if !bootstrap_reserve.ok {
+            ok_all = false;
+        }
+        checks.push(serde_json::json!({
+            "name": "mainnet_qub_jin_bootstrap_protocol_reserve",
+            "ok": bootstrap_reserve.ok,
+            "applicable": bootstrap_reserve.applicable,
+            "detail": bootstrap_reserve.detail,
+        }));
         add_preflight_check(
             &mut checks,
             &mut ok_all,
@@ -2412,6 +2392,182 @@ fn cmd_preflight(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+// This is a CLI diagnostic only. The ledger and infusion replay below remain
+// the consensus implementations; no synthetic reserve is created at genesis.
+struct Hf131BootstrapPreflight {
+    ok: bool,
+    applicable: bool,
+    detail: String,
+}
+
+fn hf131_mainnet_bootstrap_preflight(
+    settings: &Settings,
+    chain: &ChainState,
+) -> Hf131BootstrapPreflight {
+    hf131_bootstrap_reserve_preflight(
+        chain.height(),
+        settings.jin.activation_height,
+        qub_jin_infusion_activation_height(settings),
+        qub_jin_bootstrap_units(settings),
+        || {
+            jin_ledger_from_blocks(settings, &chain.blocks).map(|ledger| {
+                ledger.get(&settings.jin.protocol_address).copied().unwrap_or(0)
+            })
+        },
+        || {
+            qub_jin_infusion_state(settings, chain)
+                .map(|state| state.lifetime_infused_jin_units)
+        },
+    )
+}
+
+fn hf131_bootstrap_reserve_preflight(
+    current_height: u32,
+    jin_activation: u32,
+    bootstrap_activation: u32,
+    required_units: u128,
+    protocol_reserve: impl FnOnce() -> Result<u128>,
+    infused_total: impl FnOnce() -> Result<u128>,
+) -> Hf131BootstrapPreflight {
+    if jin_activation >= bootstrap_activation || required_units == 0 {
+        return Hf131BootstrapPreflight {
+            ok: false,
+            applicable: true,
+            detail: "invalid JIN/infusion activation order or bootstrap amount".to_string(),
+        };
+    }
+    if current_height < jin_activation {
+        return Hf131BootstrapPreflight {
+            ok: true,
+            applicable: false,
+            detail: format!(
+                "not yet applicable at #{current_height}: native JIN activates at #{jin_activation}; no JIN reserve exists before activation"
+            ),
+        };
+    }
+    let (observed, requirement) = if current_height < bootstrap_activation {
+        (protocol_reserve(), "protocol JIN reserve")
+    } else {
+        (infused_total(), "replayed lifetime JIN bootstrap/infusion")
+    };
+    match observed {
+        Ok(units) => Hf131BootstrapPreflight {
+            ok: units >= required_units,
+            applicable: true,
+            detail: format!(
+                "{requirement} at #{current_height}: {units} JIN units; required at least {required_units} JIN units for the HF116 bootstrap"
+            ),
+        },
+        Err(error) => Hf131BootstrapPreflight {
+            ok: false,
+            applicable: true,
+            detail: format!("cannot verify {requirement} at #{current_height}: {error:#}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod hf131_preflight_tests {
+    use super::*;
+
+    const REQUIRED: u128 = 42_000_000 * JIN_UNITS_PER_COIN;
+
+    #[test]
+    fn hf131_preflight_reserve_is_not_applicable_before_jin() {
+        for height in [0, 5554] {
+            let result = hf131_bootstrap_reserve_preflight(
+                height, 5555, 16777, REQUIRED,
+                || panic!("reserve must not be required before JIN activation"),
+                || panic!("bootstrap must not be required before activation"),
+            );
+            assert!(result.ok);
+            assert!(!result.applicable);
+            assert!(result.detail.contains("not yet applicable"));
+            assert!(result.detail.contains("#5555"));
+        }
+    }
+
+    #[test]
+    fn hf131_preflight_reserve_is_enforced_from_jin_activation() {
+        for height in [5555, 16666, 16776] {
+            for units in [0, REQUIRED - 1, REQUIRED, REQUIRED + 1] {
+                let result = hf131_bootstrap_reserve_preflight(
+                    height, 5555, 16777, REQUIRED, || Ok(units),
+                    || panic!("reserve stage must inspect the actual protocol ledger"),
+                );
+                assert!(result.applicable);
+                assert_eq!(result.ok, units >= REQUIRED, "height={height} units={units}");
+            }
+        }
+    }
+
+    #[test]
+    fn hf131_preflight_bootstrap_is_enforced_from_infusion_activation() {
+        for height in [16777, 70318] {
+            for units in [0, REQUIRED - 1, REQUIRED, REQUIRED + 1] {
+                let result = hf131_bootstrap_reserve_preflight(
+                    height, 5555, 16777, REQUIRED,
+                    || panic!("the reserve may already be debited after bootstrap"),
+                    || Ok(units),
+                );
+                assert!(result.applicable);
+                assert_eq!(result.ok, units >= REQUIRED, "height={height} units={units}");
+            }
+        }
+    }
+
+    #[test]
+    fn hf131_preflight_history_errors_fail_closed() {
+        for height in [5555, 16776, 16777, 70318] {
+            let error = || Err(std::io::Error::other("injected history error").into());
+            let result = hf131_bootstrap_reserve_preflight(
+                height, 5555, 16777, REQUIRED, error, error,
+            );
+            assert!(!result.ok);
+            assert!(result.applicable);
+            assert!(result.detail.contains("injected history error"));
+        }
+    }
+
+    #[test]
+    fn hf131_preflight_invalid_bootstrap_parameters_fail_closed() {
+        for (jin_activation, bootstrap_activation, required) in [
+            (16777, 16777, REQUIRED), (16778, 16777, REQUIRED), (5555, 16777, 0),
+        ] {
+            let result = hf131_bootstrap_reserve_preflight(
+                0, jin_activation, bootstrap_activation, required,
+                || panic!("invalid schedule must fail before reading state"),
+                || panic!("invalid schedule must fail before reading state"),
+            );
+            assert!(!result.ok);
+            assert!(result.applicable);
+        }
+    }
+}
+
+#[cfg(test)]
+mod hf131_mainnet_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn hf131_preflight_mainnet_genesis_retains_an_empty_jin_ledger() {
+        let settings: Settings = toml::from_str(include_str!("../config/mainnet.toml")).unwrap();
+        let chain = ChainState::new_with_genesis(&settings).unwrap();
+        chain.validate_all(&settings).unwrap();
+        assert_eq!(chain.height(), 0);
+        assert_eq!(settings.jin.activation_height, 5555);
+        assert_eq!(qub_jin_infusion_activation_height(&settings), 16777);
+        assert_eq!(qub_jin_bootstrap_units(&settings), 42_000_000 * JIN_UNITS_PER_COIN);
+        assert!(jin_ledger_from_blocks(&settings, &chain.blocks).unwrap().is_empty());
+
+        let result = hf131_mainnet_bootstrap_preflight(&settings, &chain);
+        assert!(result.ok);
+        assert!(!result.applicable);
+        assert!(result.detail.contains("no JIN reserve exists before activation"));
+        assert!(jin_ledger_from_blocks(&settings, &chain.blocks).unwrap().is_empty());
+    }
+}
+
 fn add_preflight_check(
     checks: &mut Vec<serde_json::Value>,
     ok_all: &mut bool,
@@ -2490,6 +2646,8 @@ fn read_http_header(stream: &mut TcpStream, max_bytes: usize) -> Result<String> 
 }
 
 const EXPLORER_MAX_ACTIVE_CONNECTIONS: usize = 32;
+const EXPLORER_PRIORITY_CONNECTION_RESERVE: usize = 8;
+const EXPLORER_PRIORITY_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 struct ExplorerChainCacheEntry {
@@ -2505,6 +2663,19 @@ fn explorer_chain_cache() -> &'static StdMutex<HashMap<String, ExplorerChainCach
 fn explorer_chain_load_lock() -> &'static StdMutex<()> {
     static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+fn explorer_same_canonical_commit(
+    left: &FastStorageIdentity,
+    right: &FastStorageIdentity,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.magic == right.magic
+        && left.network == right.network
+        && left.generation == right.generation
+        && left.committed_height == right.committed_height
+        && left.tip_hash == right.tip_hash
+        && left.total_work_hex == right.total_work_hex
 }
 
 fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
@@ -2539,6 +2710,35 @@ fn explorer_chain_snapshot(settings: &Settings) -> Result<Arc<ChainState>> {
             if let Some(entry) = cache.get(&key) {
                 if entry.identity == identity {
                     return Ok(Arc::clone(&entry.chain));
+                }
+            }
+        }
+
+        // HF129: a same-tip state revision is normally mempool-only. Refresh
+        // that small overlay from the exact state file and retain the immutable
+        // block/UTXO snapshot instead of reloading the complete journal.
+        let cached_same_tip = explorer_chain_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&key).cloned())
+            .filter(|entry| explorer_same_canonical_commit(&entry.identity, &identity));
+        if let Some(entry) = cached_same_tip {
+            let (mempool, exact_identity) = load_committed_mempool_with_identity(settings)?;
+            if let Some(exact_identity) = exact_identity {
+                if explorer_same_canonical_commit(&entry.identity, &exact_identity) {
+                    let mut overlay = entry.chain.as_ref().clone();
+                    overlay.mempool = Arc::new(mempool);
+                    let chain = Arc::new(overlay);
+                    if let Ok(mut cache) = explorer_chain_cache().lock() {
+                        cache.insert(
+                            key,
+                            ExplorerChainCacheEntry {
+                                identity: exact_identity,
+                                chain: Arc::clone(&chain),
+                            },
+                        );
+                    }
+                    return Ok(chain);
                 }
             }
         }
@@ -2590,7 +2790,10 @@ fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
         match stream {
             Ok(mut stream) => {
                 let previous = active.fetch_add(1, Ordering::AcqRel);
-                if previous >= EXPLORER_MAX_ACTIVE_CONNECTIONS {
+                if previous
+                    >= EXPLORER_MAX_ACTIVE_CONNECTIONS
+                        .saturating_add(EXPLORER_PRIORITY_CONNECTION_RESERVE)
+                {
                     active.fetch_sub(1, Ordering::AcqRel);
                     let _ = stream.set_write_timeout(Some(RPC_WRITE_TIMEOUT));
                     let _ = write_json_value(
@@ -2603,9 +2806,10 @@ fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
 
                 let settings = settings.clone();
                 let active = Arc::clone(&active);
+                let priority_only = previous >= EXPLORER_MAX_ACTIVE_CONNECTIONS;
                 thread::spawn(move || {
                     let _guard = ActiveConnectionGuard { active };
-                    if let Err(err) = handle_explorer_http(stream, &settings) {
+                    if let Err(err) = handle_explorer_http(stream, &settings, priority_only) {
                         eprintln!("explorer api request error: {err:#}");
                     }
                 });
@@ -2616,8 +2820,18 @@ fn cmd_explorer_api(settings: &Settings, bind: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_explorer_http(mut stream: TcpStream, settings: &Settings) -> Result<()> {
-    stream.set_read_timeout(Some(RPC_READ_TIMEOUT))?;
+fn handle_explorer_http(
+    mut stream: TcpStream,
+    settings: &Settings,
+    priority_only: bool,
+) -> Result<()> {
+    // Reserved status/health slots must not be held for the normal five-second
+    // header window by slow clients before their route can be classified.
+    stream.set_read_timeout(Some(if priority_only {
+        EXPLORER_PRIORITY_HEADER_TIMEOUT
+    } else {
+        RPC_READ_TIMEOUT
+    }))?;
     stream.set_write_timeout(Some(RPC_WRITE_TIMEOUT))?;
 
     let request = match read_http_header(&mut stream, RPC_MAX_HEADER_BYTES) {
@@ -2658,6 +2872,18 @@ fn handle_explorer_http(mut stream: TcpStream, settings: &Settings) -> Result<()
         );
     }
     let (path, query) = split_path_query(target);
+    if priority_only
+        && !matches!(
+            path.trim_end_matches('/'),
+            "/status-fast" | "/api/v1/status-fast" | "/health" | "/api/v1/health"
+        )
+    {
+        return write_json_value(
+            &mut stream,
+            503,
+            serde_json::json!({"error":"server_busy","priority_lane":"status-fast"}),
+        );
+    }
     match explorer_route(settings, &path, &query) {
         Ok(value) => write_json_value(&mut stream, 200, value),
         Err(err) => write_json_value(
@@ -2677,11 +2903,10 @@ fn explorer_route(
     if path == "/status-fast" || path == "/api/v1/status-fast" {
         return status_fast_json(settings, false);
     }
-    let chain = explorer_chain_snapshot(settings)?;
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.4",
+            "version": "1.8.6",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -2702,10 +2927,18 @@ fn explorer_route(
         }));
     }
     if path == "/health" || path == "/api/v1/health" {
-        return Ok(
-            serde_json::json!({"ok": true, "network": settings.network.name, "height": chain.height(), "bestblockhash": chain.tip_hash().to_string()}),
-        );
+        let status = status_fast_json(settings, false)?;
+        return Ok(serde_json::json!({
+            "ok": status.get("ok").cloned().unwrap_or(serde_json::Value::Bool(false)),
+            "network": settings.network.name,
+            "height": status.get("height").cloned().unwrap_or(serde_json::Value::Null),
+            "bestblockhash": status.get("tip_hash").cloned().unwrap_or(serde_json::Value::Null),
+            "tip_age_secs": status.get("tip_age_secs").cloned().unwrap_or(serde_json::Value::Null),
+            "status_generated_at_unix": status.get("status_generated_at_unix").cloned().unwrap_or(serde_json::Value::Null),
+            "source": "status-fast",
+        }));
     }
+    let chain = explorer_chain_snapshot(settings)?;
     if path == "/api/v1/summary" {
         return Ok(explorer_summary(settings, &chain));
     }
@@ -3521,5 +3754,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.4\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.6\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

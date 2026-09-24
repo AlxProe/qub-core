@@ -3,9 +3,21 @@ download.qubit-coin.io {
     root * /srv/qub-updates
     header {
         X-Content-Type-Options "nosniff"
-        Cache-Control "public, max-age=60"
         Access-Control-Allow-Origin "*"
         Access-Control-Allow-Methods "GET, HEAD, OPTIONS"
     }
+    @tip path */tip.json */tip.json.sha256
+    header @tip Cache-Control "no-store, max-age=0"
+
+    @tails path_regexp tails ^/.*/tail-(64|256|1024|2048|4096)\.json(\.sha256)?$
+    # Mutable URLs must not keep an older payload after .current changes.
+    # A client still verifies identity/checksums across separate requests.
+    header @tails Cache-Control "no-store, max-age=0"
+
+    @chain path /mainnet/snapshots/chain.json /mainnet/snapshots/chain.json.sha256 /mainnet/canonical-chain.json /mainnet/canonical-chain.json.sha256
+    header @chain Cache-Control "no-store, max-age=0"
+
+    @bulk not path */tip.json */tip.json.sha256 */tail-64.json */tail-64.json.sha256 */tail-256.json */tail-256.json.sha256 */tail-1024.json */tail-1024.json.sha256 */tail-2048.json */tail-2048.json.sha256 */tail-4096.json */tail-4096.json.sha256 /mainnet/snapshots/chain.json /mainnet/snapshots/chain.json.sha256 /mainnet/canonical-chain.json /mainnet/canonical-chain.json.sha256
+    header @bulk Cache-Control "public, max-age=60"
     file_server
 }

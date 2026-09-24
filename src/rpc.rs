@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.8.4";
+const RPC_VERSION: &str = "1.8.6";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;
@@ -44,10 +44,15 @@ impl RpcBackend {
     ) -> Result<T> {
         match self {
             Self::Embedded(chain) => {
-                let guard = chain
+                // HF132: capture the immutable view under the canonical mutex,
+                // then release it before deriving templates/stats or scanning
+                // transactions. Submission still checks the current parent
+                // through with_chain_write before accepting any candidate.
+                let snapshot = chain
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("chain mutex poisoned"))?;
-                f(&guard)
+                    .map_err(|_| anyhow::anyhow!("chain mutex poisoned"))?
+                    .clone();
+                f(&snapshot)
             }
             Self::StandaloneReadOnly => {
                 let chain = load_or_init_chain_for_ui_fast(settings)?;
@@ -281,7 +286,7 @@ pub fn start_embedded(settings: Settings, chain: Arc<Mutex<ChainState>>) -> Resu
     let bind = settings.rpc.bind.clone();
     let listener = prepare_listener(&settings, &bind)?;
     let state = Arc::new(build_server_state(settings, RpcBackend::Embedded(chain))?);
-    println!("QUB HF128 embedded RPC listening on http://{bind}");
+    println!("QUB HF130 embedded RPC listening on http://{bind}");
     println!(
         "RPC mode={} remote={} state_changes=true mining_templates=true",
         state.backend.mode_name(),
@@ -303,7 +308,7 @@ pub fn run_standalone(settings: Settings, bind_override: Option<&str>) -> Result
         settings,
         RpcBackend::StandaloneReadOnly,
     )?);
-    println!("QUB HF128 standalone read-only RPC listening on http://{bind}");
+    println!("QUB HF130 standalone read-only RPC listening on http://{bind}");
     println!("State-changing endpoints require embedded `qubd node` mode.");
     serve(listener, state);
     Ok(())
@@ -979,15 +984,17 @@ fn mining_stats_value(state: &Arc<RpcServerState>, window: usize) -> Result<Valu
         }
     }
 
-    let value = state.backend.with_chain_read(&state.settings, |chain| {
-        Ok(mining_stats_json(&state.settings, &chain.blocks, window))
+    let (computed_tip, value) = state.backend.with_chain_read(&state.settings, |chain| {
+        Ok((chain.tip_hash().to_string(), mining_stats_json(&state.settings, &chain.blocks, window)))
     })?;
 
     if let Ok(mut cache) = state.mining_stats_cache.lock() {
         if cache.len() >= 16 && !cache.contains_key(&window) {
             cache.clear();
         }
-        cache.insert(window, (tip_hash, value.clone()));
+        // The tip can advance after the cache lookup. Bind the cached result
+        // to the same immutable chain view that actually produced its values.
+        cache.insert(window, (computed_tip, value.clone()));
     }
 
     Ok(value)
@@ -1172,6 +1179,28 @@ struct SubmitBlockRequest {
     nonce: u32,
 }
 
+fn block_relay_outcome(
+    result: Result<crate::p2p::BlockRelayReport>,
+    block_hash: Hash256,
+    height: u32,
+) -> (crate::p2p::BlockRelayReport, Option<String>) {
+    match result {
+        Ok(report) => (report, None),
+        Err(err) => (
+            crate::p2p::BlockRelayReport {
+                block_hash: block_hash.to_string(),
+                height,
+                // This means retry is required. The error may precede the
+                // durable outbox write, so persistence is reported separately
+                // as unknown; it must never be presented as delivered.
+                pending_retry: true,
+                ..crate::p2p::BlockRelayReport::default()
+            },
+            Some(format!("{err:#}")),
+        ),
+    }
+}
+
 fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)> {
     let request: SubmitBlockRequest =
         serde_json::from_slice(body).context("invalid submit-block JSON")?;
@@ -1228,10 +1257,27 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
         }
         Err(err) => return Err(err),
     };
-    let relay_report = if accepted {
-        crate::p2p::broadcast_block_confirmed(&state.settings, &block).unwrap_or_default()
+    let (relay_report, relay_error) = if accepted {
+        block_relay_outcome(
+            crate::p2p::broadcast_block_confirmed(&state.settings, &block),
+            block_hash,
+            job.height,
+        )
     } else {
-        crate::p2p::BlockRelayReport::default()
+        (crate::p2p::BlockRelayReport::default(), None)
+    };
+    if let Some(error) = &relay_error {
+        eprintln!(
+            "warning: block #{0} {block_hash} is accepted locally, but relay failed; retry persistence is unknown: {error}",
+            job.height
+        );
+    }
+    let relay_retry_persistence = if relay_error.is_some() {
+        "unknown"
+    } else if relay_report.pending_retry {
+        "persisted"
+    } else {
+        "not-required"
     };
     if let Ok(mut jobs) = state.jobs.lock() {
         jobs.invalidate_parent(job.parent_hash);
@@ -1250,9 +1296,36 @@ fn submit_block(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)
             "payout_label":job.payout_label,
             "relay_acknowledged":relay_report.acknowledged(),
             "relay_pending_retry":relay_report.pending_retry,
+            "relay_error":relay_error,
+            "relay_retry_persistence":relay_retry_persistence,
             "relay_report":relay_report,
         }),
     ))
+}
+
+fn accept_rpc_transaction_with_persistence(
+    settings: &Settings,
+    chain: &mut ChainState,
+    transaction: &Transaction,
+    persist: impl FnOnce(&ChainState) -> Result<()>,
+) -> Result<&'static str> {
+    let txid = transaction.txid();
+    if chain.tx_confirmations(txid).is_some() {
+        return Ok("already_confirmed");
+    }
+    if chain.tx_in_mempool(txid) {
+        return Ok("already_known");
+    }
+    // A failed commit must leave the live mempool unchanged. Otherwise a
+    // retry sees already_known and skips the very save that failed.
+    let mut candidate = chain.clone();
+    let accepted_txid = candidate.accept_transaction_to_mempool(transaction.clone(), settings)?;
+    if accepted_txid != txid {
+        bail!("transaction ID mismatch");
+    }
+    persist(&candidate)?;
+    *chain = candidate;
+    Ok("accepted")
 }
 
 fn submit_transaction(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, Value)> {
@@ -1267,19 +1340,12 @@ fn submit_transaction(state: &Arc<RpcServerState>, body: &[u8]) -> Result<(u16, 
     // misleading 422 error. Only a genuinely new transaction mutates/persists
     // the canonical mempool.
     let local_status = state.backend.with_chain_write(&state.settings, |chain| {
-        if chain.tx_confirmations(txid).is_some() {
-            return Ok("already_confirmed");
-        }
-        if chain.tx_in_mempool(txid) {
-            return Ok("already_known");
-        }
-        let accepted_txid =
-            chain.accept_transaction_to_mempool(transaction.clone(), &state.settings)?;
-        if accepted_txid != txid {
-            bail!("transaction ID mismatch");
-        }
-        save_chain(&state.settings, chain)?;
-        Ok("accepted")
+        accept_rpc_transaction_with_persistence(
+            &state.settings,
+            chain,
+            &transaction,
+            |candidate| save_chain(&state.settings, candidate),
+        )
     });
     let local_status = match local_status {
         Ok(status) => status,
@@ -1508,6 +1574,136 @@ fn write_json(stream: &mut TcpStream, status: u16, value: Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hf132_rpc_slow_reader_releases_writer_and_keeps_captured_parent() {
+        let settings: Settings = toml::from_str(include_str!("../config/regtest.toml")).unwrap();
+        let genesis = ChainState::new_with_genesis(&settings).unwrap();
+        let original_tip = genesis.tip_hash();
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let key = wallet.create_key(&settings, "HF132 snapshot reader", 0).unwrap();
+        let payout = Address::parse_with_prefix(&key.address, &settings.network.address_prefix).unwrap();
+        let block = mine_next_block(&genesis, &settings, &payout, MiningOptions {
+            duty_cycle_percent: 100,
+            max_hashes: Some(5_000_000),
+        }).unwrap();
+        let next_tip = block.block_hash();
+        let live = Arc::new(Mutex::new(genesis));
+        let backend = RpcBackend::Embedded(Arc::clone(&live));
+        let reader_settings = settings.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || backend.with_chain_read(&reader_settings, |captured| {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok((captured.height(), captured.tip_hash()))
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let written = live.try_lock().map(|mut chain| chain.connect_block(block, &settings));
+        // Always release/join the reader before asserting the writer result;
+        // a regression must not leave a detached blocked test thread behind.
+        resume_tx.send(()).unwrap();
+        let captured = reader.join().unwrap().unwrap();
+        written.expect("RPC derivation monopolized the canonical writer").unwrap();
+        assert_eq!(captured, (0, original_tip));
+        let current = live.lock().unwrap();
+        assert_eq!((current.height(), current.tip_hash()), (1, next_tip));
+        current.validate_all(&settings).unwrap();
+    }
+
+    #[test]
+    fn hf131_rpc_block_relay_failure_preserves_identity_and_requires_retry() {
+        let block_hash = Hash256::double_sha256(b"HF131 committed block");
+        let (report, error) = block_relay_outcome(
+            Err(anyhow::anyhow!("injected outbox write failure")),
+            block_hash,
+            123,
+        );
+        assert_eq!(report.block_hash, block_hash.to_string());
+        assert_eq!(report.height, 123);
+        assert!(report.pending_retry);
+        assert!(!report.delivered());
+        assert_eq!(report.acknowledged(), 0);
+        assert!(error.unwrap().contains("outbox write failure"));
+    }
+
+    #[test]
+    fn hf131_rpc_block_relay_success_retains_ack_evidence() {
+        let block_hash = Hash256::double_sha256(b"HF131 delivered block");
+        let source = crate::p2p::BlockRelayReport {
+            block_hash: block_hash.to_string(),
+            height: 124,
+            accepted: 1,
+            official_acknowledgements: 1,
+            pending_retry: false,
+            ..crate::p2p::BlockRelayReport::default()
+        };
+        let (report, error) = block_relay_outcome(Ok(source), block_hash, 124);
+        assert!(error.is_none());
+        assert!(report.delivered());
+        assert!(!report.pending_retry);
+        assert_eq!(report.acknowledged(), 1);
+    }
+
+    #[test]
+    fn hf131_rpc_transaction_failed_persistence_keeps_live_state_retryable() {
+        // This is an in-memory fixture inside the normal native test suite;
+        // it starts no node, GUI, network connection, or manual LAN lab.
+        let settings: Settings = toml::from_str(include_str!("../config/regtest.toml")).unwrap();
+        let mut chain = ChainState::new_with_genesis(&settings).unwrap();
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let key = wallet.create_key(&settings, "HF131 RPC test", 0).unwrap();
+        let address = Address::parse_with_prefix(&key.address, &settings.network.address_prefix).unwrap();
+        for _ in 0..3 {
+            let block = mine_next_block(&chain, &settings, &address, MiningOptions {
+                duty_cycle_percent: 100,
+                max_hashes: Some(5_000_000),
+            }).unwrap();
+            chain.connect_block(block, &settings).unwrap();
+        }
+        let transaction = wallet.create_signed_transaction(
+            &chain,
+            &settings,
+            &address,
+            Amount::from_atoms(ATOMS_PER_QUB).unwrap(),
+            Amount::from_atoms(1_000).unwrap(),
+        ).unwrap();
+        let txid = transaction.txid();
+        let before_tip = chain.tip_hash();
+        let before_mempool = Arc::clone(&chain.mempool);
+        let before_utxos = Arc::clone(&chain.utxos);
+        let failed = accept_rpc_transaction_with_persistence(
+            &settings, &mut chain, &transaction,
+            |candidate| {
+                assert!(candidate.tx_in_mempool(txid));
+                bail!("HF131 injected persistence failure")
+            },
+        );
+        assert!(failed.unwrap_err().to_string().contains("injected persistence failure"));
+        assert!(!chain.tx_in_mempool(txid));
+        assert_eq!(chain.tip_hash(), before_tip);
+        assert!(Arc::ptr_eq(&chain.mempool, &before_mempool));
+        assert!(Arc::ptr_eq(&chain.utxos, &before_utxos));
+
+        let mut persisted = false;
+        let retried = accept_rpc_transaction_with_persistence(
+            &settings, &mut chain, &transaction,
+            |candidate| {
+                assert!(candidate.tx_in_mempool(txid));
+                persisted = true;
+                Ok(())
+            },
+        ).unwrap();
+        assert_eq!(retried, "accepted");
+        assert!(persisted);
+        assert!(chain.tx_in_mempool(txid));
+        assert_eq!(chain.tip_hash(), before_tip);
+        let duplicate = accept_rpc_transaction_with_persistence(
+            &settings, &mut chain, &transaction,
+            |_| panic!("an already persisted transaction was saved twice"),
+        ).unwrap();
+        assert_eq!(duplicate, "already_known");
+    }
 
     #[test]
     fn constant_time_token_comparison_is_strict() {

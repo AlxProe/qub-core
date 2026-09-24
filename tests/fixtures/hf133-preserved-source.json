@@ -1,0 +1,11 @@
+{
+  "normalization": "Replace 1.8.6 with 1.8.5 before hashing; HF132 memory-r1 reference",
+  "files": {
+    "src/bin/qub_rpc_miner.rs": "289decb80c0d8a35955428208d5e611d5149c8f9775a94ec808bc3ec444daf6c",
+    "src/fast_storage.rs": "0a0048c5fbe3304766a73d907948ed34ce1586ca1b571d3f7b9516c2ee0eac17",
+    "src/gpu_miner.rs": "75849063733f2c2c35c9d62ad83d7fa705fab84cefb1450896a5a4da928080d9",
+    "src/p2p.rs": "2da0337dc2880537e92dec66fc0da6620f2f1c6bc1982e5bcb8cf427b9bebb40",
+    "src/pools.rs": "066d5135831e7701903433140c47c388024648f55d07dfcbeac597ba2add66a3",
+    "src/rpc.rs": "e9851be033f0e1ad2834e8a123dd8579ae3e544eb991f3547fccb339dc215253"
+  }
+}

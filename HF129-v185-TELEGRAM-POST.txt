@@ -1,0 +1,35 @@
+QUB Core v1.8.5 / HF129 is ready — mandatory reliability update
+
+HF129 focuses on canonical freshness, synchronization and mining-resume safety. It does not change consensus, PoW, DAA, rewards, activation heights, pool payouts or the chain format.
+
+What was fixed:
+• The periodic full legacy chain export no longer blocks canonical block commits or live-tip publication.
+• Manual Sync/Repair now reaches the real single writer and cannot be consumed as a false completion.
+• Auto-sync retains verified no-progress state and escalates safely instead of restarting its stall clock on every pulse.
+• Pool mining paused by Sync/Repair can resume only the exact same Pool and controller generation — never Solo.
+• GUI snapshots are latest-canonical-capture-wins, and Recent Blocks keeps refreshing during detached catch-up.
+• Snapshot publication is FCE-only, exact-height/hash verified and fail-closed; Explorer API freshness/load handling is improved.
+
+Preserved from HF128:
+• full CPU/GPU mining plan and OpenCL duty behavior
+• pool compatibility and deterministic payouts
+• acknowledged block/transaction delivery and retry
+• mainnet Epoch 2 at block #24000, block version 2
+• QUB-FCE-1 chain format
+
+Release verification completed:
+<INSERT_FINAL_NATIVE_CANARY_WINDOWS_AND_6H_SOAK_RESULT>
+
+Download:
+<RELEASE_URL>
+
+Windows installer SHA256:
+<INSTALLER_SHA256>
+
+Source ZIP SHA256:
+<SOURCE_ZIP_SHA256>
+
+Please install v1.8.5 before mining. Keep your wallet/data directory; do not delete wallet.json or chain-v2. If Sync pauses mining, the acknowledged Solo/Pool mode resumes safely after the canonical gate. Manual Stop always cancels a pending resume.
+
+Full release notes and verification details:
+<RELEASE_NOTES_URL>

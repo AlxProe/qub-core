@@ -1,0 +1,35 @@
+[Unit]
+Description=QUB mainnet atomic snapshot publisher (HF130)
+After=network-online.target qub-seed-mainnet.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+Group=deploy
+RuntimeDirectory=qub-snapshot-publisher
+RuntimeDirectoryMode=0750
+Environment=CFG=/opt/qub/mainnet/mainnet-seed.toml
+# Keep the exact HF130 exporter available if the seed daemon is rolled back:
+# HF128's CLI lacks the fail-closed export report identity fields.
+Environment=BIN=/opt/qub/bin/qubd-snapshot-export-hf130
+Environment=OUT_DIR=/srv/qub-updates/mainnet/snapshots
+Environment=ALT=/srv/qub-updates/mainnet/canonical-chain.json
+Environment=LOCK_FILE=/run/qub-snapshot-publisher/publish.lock
+Environment=ALLOW_LEGACY_SOURCE=0
+Environment=ALLOW_PREVIOUS_RECOVERY=0
+ExecStart=/opt/qub/bin/publish-mainnet-snapshot.sh
+TimeoutStartSec=20min
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/qub
+ReadWritePaths=/srv/qub-updates /run/qub-snapshot-publisher
+
+[Install]
+WantedBy=multi-user.target

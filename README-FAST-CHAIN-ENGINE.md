@@ -32,8 +32,11 @@ A normal append commit performs this sequence:
 5. Write and synchronize an immutable state snapshot.
 6. Write `PREVIOUS.json` from the old committed pointer.
 7. Atomically replace `CURRENT.json` with the new pointer.
-8. Refresh small operational metadata.
-9. Periodically refresh the compatibility `chain.json` export.
+8. Publish the committed live chain after releasing the canonical storage lock.
+9. Run derived status/cleanup maintenance after live publication. Desktop Core
+   and persistent node/API services use detached workers and schedule periodic
+   compatibility exports. Finite qubd commands finish a non-fatal maintenance
+   pass in their own thread and use explicit full-chain exports when needed.
 
 A branch replacement creates a new journal generation rather than overwriting the current committed branch.
 
@@ -44,6 +47,12 @@ When `chain-v2/` does not exist but a legacy `chain.json` exists:
 1. QUB Core fully validates the legacy chain.
 2. It creates the initial Fast Chain Engine generation.
 3. The original `chain.json` remains available as the first compatibility export.
+
+A successful finite `init` requires CURRENT and its referenced committed state
+and journal. `chain-status.json` is derived metadata; `status-fast` can reconstruct
+it. `chain.json` is an optional compatibility export. Do not wait for detached
+threads after a CLI process has exited or treat either derived file as the
+canonical initialization marker.
 
 Migration is local storage work only. It does not change block hashes, transaction IDs, consensus state or wallet keys.
 

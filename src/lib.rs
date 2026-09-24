@@ -16,7 +16,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod daa_v3;
 mod fast_storage;
+pub use daa_v3::{asert_target_bits, daa_v3_active, median_time_past, DAA_V3_HALF_LIFE_SECS, DAA_V3_MTP_WINDOW, DAA_V3_POW_LIMIT_BITS, DAA_V3_TARGET_SPACING_SECS, MAINNET_DAA_V3_ACTIVATION_HEIGHT, PROTOCOL_EPOCH_3_BLOCK_VERSION};
 pub mod p2p;
 pub mod pools;
 pub mod rpc;
@@ -1168,7 +1170,9 @@ pub fn protocol_epoch_2_active(settings: &Settings, height: u32) -> bool {
 }
 
 pub fn expected_block_version(settings: &Settings, height: u32) -> u32 {
-    if protocol_epoch_2_active(settings, height) {
+    if daa_v3_active(settings, height) {
+        PROTOCOL_EPOCH_3_BLOCK_VERSION
+    } else if protocol_epoch_2_active(settings, height) {
         PROTOCOL_EPOCH_2_BLOCK_VERSION
     } else {
         settings.consensus.version
@@ -1176,7 +1180,9 @@ pub fn expected_block_version(settings: &Settings, height: u32) -> u32 {
 }
 
 pub fn protocol_epoch_name(settings: &Settings, height: u32) -> &'static str {
-    if protocol_epoch_2_active(settings, height) {
+    if daa_v3_active(settings, height) {
+        "Protocol Epoch 3"
+    } else if protocol_epoch_2_active(settings, height) {
         "Protocol Epoch 2"
     } else {
         "Protocol Epoch 1"
@@ -1223,6 +1229,7 @@ impl ChainState {
     }
 
     pub fn from_blocks(blocks: Vec<Block>, settings: &Settings) -> Result<Self> {
+        p2p::hf132_check_sync_budget()?;
         if blocks.is_empty() {
             bail!("empty candidate chain");
         }
@@ -1231,6 +1238,7 @@ impl ChainState {
         }
         let mut chain = Self::new_with_genesis(settings)?;
         for block in blocks.into_iter().skip(1) {
+            p2p::hf132_check_sync_budget()?;
             chain.connect_block(block, settings)?;
         }
         Ok(chain)
@@ -1341,13 +1349,16 @@ impl ChainState {
     }
 
     pub fn validate_all(&self, settings: &Settings) -> Result<()> {
+        p2p::hf132_check_sync_budget()?;
         if self.blocks.first() != Some(&genesis_block(settings)?) {
             bail!("genesis mismatch");
         }
         let mut utxos = HashMap::new();
         let mut prev = self.blocks[0].block_hash();
         for (i, block) in self.blocks.iter().enumerate().skip(1) {
+            p2p::hf132_check_sync_budget()?;
             let required_bits = required_work_bits(settings, &self.blocks[..i], i as u32)?;
+            daa_v3::validate_daa_v3_timestamp(settings, &self.blocks[..i], i as u32, block.header.time)?;
             validate_block(block, &utxos, prev, i as u32, required_bits, settings)?;
             validate_qns_block(block, &self.blocks[..i], i as u32, settings)?;
             validate_jin_block(block, &self.blocks[..i], &utxos, i as u32, settings)?;
@@ -1385,7 +1396,26 @@ impl ChainState {
         settings: &Settings,
         prefer_peer_on_equal_work: bool,
     ) -> Result<bool> {
-        let mut candidate = Self::from_blocks(blocks, settings)?;
+        let candidate = Self::from_blocks(blocks, settings)?;
+        self.try_adopt_validated_peer_chain(candidate, settings, prefer_peer_on_equal_work)
+    }
+
+    /// Adopt a candidate whose exact blocks and UTXOs have already been
+    /// validated by `from_blocks` or by connecting every new block to a
+    /// validated chain. Internal sync callers must retain that candidate;
+    /// manually constructed/untrusted ChainState values must use from_blocks.
+    /// Keeping this crate-private avoids a second full replay of HTTP sync
+    /// candidates without changing the public peer-chain validation contract.
+    /// As with from_blocks, a peer's snapshot mempool is discarded; adoption
+    /// restores only local pending/disconnected transactions below.
+    pub(crate) fn try_adopt_validated_peer_chain(
+        &mut self,
+        mut candidate: ChainState,
+        settings: &Settings,
+        prefer_peer_on_equal_work: bool,
+    ) -> Result<bool> {
+        p2p::hf132_check_sync_budget()?;
+        candidate.mempool = Arc::new(Vec::new());
         let candidate_work = chain_work_for_blocks(&candidate.blocks)?;
         let current_work = chain_work_for_blocks(&self.blocks)?;
         let candidate_height = candidate.height();
@@ -1450,6 +1480,12 @@ impl ChainState {
         candidate: &ChainState,
     ) -> Vec<Transaction> {
         let common = self.common_prefix_height_with(candidate);
+        // Extensions and same-tip mempool publications disconnect no blocks.
+        // Avoid hashing every confirmed transaction into a set in that common
+        // case; fork recovery below retains the existing filtering/order.
+        if common == self.height() {
+            return Vec::new();
+        }
         let candidate_canonical_txids = candidate
             .blocks
             .iter()
@@ -1898,6 +1934,7 @@ impl ChainState {
     pub fn connect_block(&mut self, block: Block, settings: &Settings) -> Result<Hash256> {
         let height = self.height() + 1;
         let required_bits = required_work_bits(settings, &self.blocks, height)?;
+        daa_v3::validate_daa_v3_timestamp(settings, &self.blocks, height, block.header.time)?;
         let txids = validate_block(
             &block,
             &self.utxos,
@@ -3871,7 +3908,7 @@ fn build_candidate_block_parts_with_policy(
     Ok(CandidateBlockParts {
         height,
         prev_block_hash: chain.tip_hash(),
-        time: unix_time_u32(),
+        time: daa_v3::candidate_timestamp(settings, &chain.blocks, height, unix_time_u32())?,
         bits: required_work_bits(settings, &chain.blocks, height)?,
         version: expected_block_version(settings, height),
         reward_atoms,
@@ -4336,6 +4373,9 @@ pub fn required_work_bits(
     chain_blocks: &[Block],
     next_height: u32,
 ) -> Result<u32> {
+    if daa_v3_active(settings, next_height) {
+        return daa_v3::required_work_bits_v3(chain_blocks, next_height);
+    }
     if next_height == 0 || chain_blocks.is_empty() {
         return settings.genesis_bits();
     }
@@ -6431,6 +6471,19 @@ fn storage_lock() -> &'static StdMutex<()> {
     LOCK.get_or_init(|| StdMutex::new(()))
 }
 
+fn lock_storage_for_sync() -> Result<std::sync::MutexGuard<'static, ()>> {
+    loop {
+        p2p::hf132_check_sync_budget()?;
+        match storage_lock().try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => bail!("storage mutex poisoned"),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 fn unix_time_parts(time: SystemTime) -> (u64, u32) {
     time.duration_since(UNIX_EPOCH)
         .map(|d| (d.as_secs(), d.subsec_nanos()))
@@ -6698,9 +6751,11 @@ pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
     if let Some(chain) = live_chain_snapshot(settings) {
         return Ok(chain);
     }
-    let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
+    // Committed FCE files are captured by immutable identity and open journal
+    // handle. Replay must never hold the writer mutex: at a mature chain it can
+    // take far longer than a normal catch-up commit.
     if paths.fast_storage_exists() {
         // QUB-FCE-1 is authoritative once present. CURRENT/PREVIOUS recovery is
         // internal to the engine; never silently replace it from a potentially
@@ -6709,14 +6764,28 @@ pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
             .map(|(chain, _)| chain)
             .context("Fast Chain Engine load failed; explicit operator recovery is required");
     }
+    let _guard = lock_storage_for_sync()?;
+    // Another initializer may have published CURRENT while we waited.
+    if paths.fast_storage_exists() {
+        drop(_guard);
+        return fast_storage::load_fast_chain(settings, &paths, true)
+            .map(|(chain, _)| chain)
+            .context("Fast Chain Engine load failed; explicit operator recovery is required");
+    }
     if paths.chain_file.exists() {
         let raw = fs::read_to_string(&paths.chain_file)?;
         let chain = ChainState::from_persisted(serde_json::from_str(&raw)?, settings)?;
         fast_storage::migrate_legacy_chain(settings, &paths, &chain)?;
+        drop(_guard);
+        fast_storage::publish_live_chain(settings, &chain);
+        fast_storage::schedule_post_commit_maintenance(settings);
         Ok(chain)
     } else {
         let chain = ChainState::new_with_genesis(settings)?;
         fast_storage::initialize_new_chain(settings, &paths, &chain)?;
+        drop(_guard);
+        fast_storage::publish_live_chain(settings, &chain);
+        fast_storage::schedule_post_commit_maintenance(settings);
         Ok(chain)
     }
 }
@@ -6727,10 +6796,9 @@ pub fn load_or_init_chain(settings: &Settings) -> Result<ChainState> {
 /// still supported for the first paint; the validated node startup performs the
 /// one-time migration afterward.
 pub fn load_or_init_chain_for_ui_fast(settings: &Settings) -> Result<ChainState> {
-    if let Some(chain) = live_chain_snapshot(settings) {
+    if let Some(chain) = try_live_chain_snapshot(settings)? {
         return Ok(chain);
     }
-    let _guard = storage_lock().lock().expect("storage mutex poisoned");
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
     if paths.fast_storage_exists() {
@@ -6742,8 +6810,26 @@ pub fn load_or_init_chain_for_ui_fast(settings: &Settings) -> Result<ChainState>
         let raw = fs::read_to_string(&paths.chain_file)?;
         ChainState::from_persisted_unchecked_for_ui(serde_json::from_str(&raw)?, settings)
     } else {
+        // The first paint can create genesis, but it must defer when another
+        // initializer/writer already owns storage rather than queue behind it.
+        let _guard = storage_lock().try_lock()
+            .map_err(|_| anyhow::anyhow!("chain initialization is busy; retry UI snapshot"))?;
+        if paths.fast_storage_exists() {
+            drop(_guard);
+            return fast_storage::load_fast_chain(settings, &paths, false)
+                .map(|(chain, _)| chain)
+                .context("Fast Chain Engine UI load failed; refusing stale legacy fallback");
+        }
+        if paths.chain_file.exists() {
+            drop(_guard);
+            let raw = fs::read_to_string(&paths.chain_file)?;
+            return ChainState::from_persisted_unchecked_for_ui(serde_json::from_str(&raw)?, settings);
+        }
         let chain = ChainState::new_with_genesis(settings)?;
         fast_storage::initialize_new_chain(settings, &paths, &chain)?;
+        drop(_guard);
+        fast_storage::publish_live_chain(settings, &chain);
+        fast_storage::schedule_post_commit_maintenance(settings);
         Ok(chain)
     }
 }
@@ -6765,20 +6851,29 @@ pub fn connect_block_persist_atomic(
 }
 
 pub fn save_chain(settings: &Settings, chain: &ChainState) -> Result<()> {
-    let _guard = storage_lock().lock().expect("storage mutex poisoned");
-    let paths = NodePaths::from_settings(settings);
-    paths.ensure_dirs()?;
-    if !paths.fast_storage_exists() {
-        chain.validate_all(settings)?;
-        if paths.chain_file.exists() {
-            fast_storage::migrate_legacy_chain(settings, &paths, chain)?;
+    {
+        let _guard = lock_storage_for_sync()?;
+        let paths = NodePaths::from_settings(settings);
+        paths.ensure_dirs()?;
+        // Cancellation is safe before writing; once a commit starts its
+        // CURRENT publication and live update must run to completion.
+        p2p::hf132_check_sync_budget()?;
+        if !paths.fast_storage_exists() {
+            chain.validate_all(settings)?;
+            p2p::hf132_check_sync_budget()?;
+            if paths.chain_file.exists() {
+                fast_storage::migrate_legacy_chain(settings, &paths, chain)?;
+            } else {
+                fast_storage::initialize_new_chain(settings, &paths, chain)?;
+            }
         } else {
-            fast_storage::initialize_new_chain(settings, &paths, chain)?;
+            fast_storage::commit_chain(settings, &paths, chain)?;
         }
-    } else {
-        fast_storage::commit_chain(settings, &paths, chain)?;
     }
+    // HF130: no cleanup/status/export I/O is allowed between CURRENT and live
+    // publication. The detached scheduler itself performs no filesystem reads.
     fast_storage::publish_live_chain(settings, chain);
+    fast_storage::schedule_post_commit_maintenance(settings);
     Ok(())
 }
 
@@ -6794,15 +6889,17 @@ pub fn save_chain_verified_equal_work_reanchor(
     }
     chain.validate_all(settings)?;
     {
-        let _guard = storage_lock().lock().expect("storage mutex poisoned");
+        let _guard = lock_storage_for_sync()?;
         let paths = NodePaths::from_settings(settings);
         paths.ensure_dirs()?;
         if !paths.fast_storage_exists() {
             bail!("verified equal-work re-anchor requires an initialized Fast Chain Engine");
         }
+        p2p::hf132_check_sync_budget()?;
         fast_storage::commit_chain_verified_equal_work_reanchor(settings, &paths, chain)?;
     }
     fast_storage::publish_live_chain_verified_equal_work_reanchor(settings, chain)?;
+    fast_storage::schedule_post_commit_maintenance(settings);
     Ok(())
 }
 

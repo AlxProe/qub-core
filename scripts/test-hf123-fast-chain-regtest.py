@@ -4,6 +4,8 @@
 This test uses an isolated regtest data directory and a real qubd binary. It
 verifies one-time initialization, append-only commits, crash-suffix truncation,
 CURRENT/PREVIOUS recovery, explicit legacy export, and consensus validation.
+HF130 checks committed FCE files independently of derived status/legacy files,
+and exercises repeated finite CLI saves across the cleanup retention boundary.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ import tempfile
 
 def run(command: list[str], *, expect: int = 0) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(command), flush=True)
-    result = subprocess.run(command, text=True, capture_output=True)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=120)
     if result.stdout:
         print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
     if result.stderr:
@@ -90,6 +92,64 @@ def block_hash(block: dict) -> str:
     return hashlib.sha256(hashlib.sha256(raw).digest()).hexdigest()
 
 
+def committed_pointer(fast_dir: Path, height: int) -> dict:
+    current_path = fast_dir / "CURRENT.json"
+    if not current_path.is_file():
+        raise RuntimeError(f"missing committed CURRENT pointer: {current_path}")
+    pointer = json.loads(current_path.read_text(encoding="utf-8"))
+    if not isinstance(pointer, dict) or (
+        pointer.get("schema_version"), pointer.get("magic"),
+        pointer.get("network"), pointer.get("committed_height"),
+    ) != (1, "QUB-FCE-1", "regtest", height):
+        raise RuntimeError("unexpected committed CURRENT identity")
+    files = {}
+    for key in ("state_file", "blocks_file"):
+        name = pointer.get(key)
+        if not isinstance(name, str) or not name or name in (".", "..") or any(c in name for c in "/\\:"):
+            raise RuntimeError(f"invalid committed filename: {key}")
+        path = fast_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"missing or non-regular committed file: {path}")
+        files[key] = path
+    state_bytes = files["state_file"].read_bytes()
+    if hashlib.sha256(state_bytes).hexdigest() != pointer.get("state_sha256"):
+        raise RuntimeError("committed state checksum mismatch")
+    state = json.loads(state_bytes)
+    for key in ("schema_version", "magic", "network", "generation", "state_revision",
+                "committed_height", "tip_hash", "tip_header", "tip_tx_count",
+                "journal_bytes", "mempool_digest", "total_work_hex"):
+        if not isinstance(state, dict) or key not in pointer or state.get(key) != pointer[key]:
+            raise RuntimeError(f"CURRENT/state mismatch: {key}")
+    journal_bytes = files["blocks_file"].read_bytes()
+    if len(journal_bytes) != pointer["journal_bytes"]:
+        raise RuntimeError("journal length differs from committed prefix")
+    blocks = [json.loads(line) for line in journal_bytes.splitlines()]
+    if len(blocks) != height + 1 or block_hash(blocks[-1]) != pointer["tip_hash"]:
+        raise RuntimeError("committed journal height/tip mismatch")
+    if block_hash({"header": pointer["tip_header"]}) != pointer["tip_hash"]:
+        raise RuntimeError("committed pointer header/hash mismatch")
+    return pointer
+
+
+def check_status_commit(status: dict, pointer: dict) -> None:
+    if status.get("ok") is not True or status.get("fast_storage_exists") is not True:
+        raise RuntimeError("status-fast did not load initialized FCE storage")
+    for key, expected in {
+        "network": "regtest", "storage_engine": "QUB-FCE-1",
+        "status_source": "fast-chain-engine-metadata",
+        "height": pointer["committed_height"], "tip_hash": pointer["tip_hash"],
+        "storage_generation": pointer["generation"], "state_revision": pointer["state_revision"],
+    }.items():
+        if status.get(key) != expected:
+            raise RuntimeError(f"status-fast/CURRENT mismatch: {key}")
+
+
+def check_closed_cli_leases(fast_dir: Path) -> None:
+    for name in ("WRITE.lock", "LEGACY-EXPORT.lock"):
+        if (fast_dir / name).exists():
+            raise RuntimeError(f"completed finite CLI command left a storage lease: {name}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--qubd", required=True, help="Path to qubd/qubd.exe")
@@ -125,21 +185,21 @@ def main() -> int:
         fast_dir = data_dir / "chain-v2"
         current_path = fast_dir / "CURRENT.json"
         previous_path = fast_dir / "PREVIOUS.json"
-        status_path = data_dir / "chain-status.json"
-        legacy_path = data_dir / "chain.json"
-        for required in (current_path, status_path, legacy_path):
-            if not required.is_file():
-                raise RuntimeError(f"missing initialized artifact: {required}")
-
+        # CURRENT and its referenced state/journal are the initialization
+        # contract. Derived files are optional; do not wait for a process that
+        # has already exited or create an export to hide an incomplete commit.
+        pointer0 = committed_pointer(fast_dir, 0)
+        check_closed_cli_leases(fast_dir)
         initial = run_json(base + ["status-fast"])
-        if initial.get("storage_engine") != "QUB-FCE-1" or int(initial.get("height", -1)) != 0:
-            raise RuntimeError(f"unexpected initialized status: {initial}")
+        check_status_commit(initial, pointer0)
 
         run(base + ["mine", "3"])
+        check_closed_cli_leases(fast_dir)
         status3 = run_json(base + ["status-fast"])
         if int(status3.get("height", -1)) != 3:
             raise RuntimeError("height did not reach 3")
-        pointer3 = json.loads(current_path.read_text(encoding="utf-8"))
+        pointer3 = committed_pointer(fast_dir, 3)
+        check_status_commit(status3, pointer3)
         if int(pointer3["committed_height"]) != 3:
             raise RuntimeError("CURRENT pointer height is not 3")
         journal = fast_dir / pointer3["blocks_file"]
@@ -156,10 +216,12 @@ def main() -> int:
             raise RuntimeError("could not append synthetic crash suffix")
 
         run(base + ["mine", "1"])
+        check_closed_cli_leases(fast_dir)
         status4 = run_json(base + ["status-fast"])
         if int(status4.get("height", -1)) != 4:
             raise RuntimeError("height did not reach 4 after suffix recovery")
-        pointer4 = json.loads(current_path.read_text(encoding="utf-8"))
+        pointer4 = committed_pointer(fast_dir, 4)
+        check_status_commit(status4, pointer4)
         committed4 = int(pointer4["journal_bytes"])
         current_journal = fast_dir / pointer4["blocks_file"]
         if current_journal.stat().st_size != committed4:
@@ -196,6 +258,16 @@ def main() -> int:
         restored = run_json(base + ["status-fast"])
         if int(restored.get("height", -1)) != 4 or restored.get("tip_hash") != status4.get("tip_hash"):
             raise RuntimeError("CURRENT pointer restoration failed")
+
+        # Exercise cleanup in a multi-save CLI process, then immediately start
+        # another writer. A detached worker killed at CLI exit must not strand
+        # WRITE.lock or a legacy-export lease and block the next command.
+        for count, height in ((4, 8), (1, 9)):
+            run(base + ["mine", str(count)])
+            check_closed_cli_leases(fast_dir)
+            pointer = committed_pointer(fast_dir, height)
+            check_status_commit(run_json(base + ["status-fast"]), pointer)
+        run(base + ["validate"])
 
         print("HF123 FAST CHAIN ENGINE REGTEST E2E: PASS")
         print(f"temporary data: {temp_root}")

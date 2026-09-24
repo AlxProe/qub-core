@@ -1,0 +1,16 @@
+QUB Core v1.8.5 is available.
+
+This update focuses on catching up with the chain and keeping Solo/Pool mining
+running reliably. It reduces repeated synchronization work, improves recovery
+when peers are slow, and keeps your mining selection while catch-up completes.
+It also includes CPU/GPU worker and resource cleanup fixes and clearer sync status.
+
+Compatible with the existing v1.8.4 network. No chain upgrade or wallet reset.
+If you have been offline, allow synchronization to finish before expecting work
+on the current network parent. Keep your wallet backup and close QUB before updating.
+
+Download: https://download.qubit-coin.io/mainnet/QUB-Core-Latest.exe
+Release notes/source: https://github.com/AlxProe/qub-core/releases/tag/v1.8.5-hf132
+
+If mining or synchronization gets stuck, please report the requested Solo/Pool
+mode, CPU/GPU device, local/observed heights and the relevant GUI logs.

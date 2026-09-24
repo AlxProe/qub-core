@@ -1,0 +1,16 @@
+{
+  "status": "native-candidate-not-for-publication",
+  "version": "1.8.6",
+  "hotfix": "HF133",
+  "network": "mainnet",
+  "mandatory": true,
+  "chain_upgrade": true,
+  "activation_feature": "asert_mtp",
+  "activation_height": 100000,
+  "activation_height_final": false,
+  "target_spacing_secs": 60,
+  "half_life_secs": 3600,
+  "median_time_window": 11,
+  "post_activation_block_version": 3,
+  "public_release_approved": false
+}

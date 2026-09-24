@@ -11,6 +11,9 @@ use anyhow::{anyhow, bail, Result};
 use std::ffi::{c_char, c_void};
 use std::ptr;
 
+#[cfg(any(target_os = "windows", test))]
+use std::sync::Arc;
+
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 
@@ -18,6 +21,7 @@ use std::os::windows::ffi::OsStrExt;
 unsafe extern "system" {
     fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const c_char) -> *mut c_void;
+    fn FreeLibrary(h_module: *mut c_void) -> i32;
 }
 
 type ClInt = i32;
@@ -32,6 +36,67 @@ type ClProgram = *mut c_void;
 type ClKernel = *mut c_void;
 type ClMem = *mut c_void;
 type ClEvent = *mut c_void;
+
+// HF131: the same guard owns both OpenCL allocations and the loaded DLL.
+// Raw handles in OpenClGpuMiner borrow from _allocations; they never release
+// independently. Retaining the DLL also keeps every release function callable.
+#[cfg(any(target_os = "windows", test))]
+struct OpenClOwnedHandle {
+    raw: *mut c_void,
+    release: unsafe extern "system" fn(*mut c_void) -> ClInt,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl Drop for OpenClOwnedHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let _ = (self.release)(self.raw);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+struct OpenClAllocations {
+    handles: Vec<OpenClOwnedHandle>,
+    _library: Arc<OpenClOwnedHandle>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl OpenClAllocations {
+    fn new(library: Arc<OpenClOwnedHandle>) -> Self {
+        Self {
+            handles: Vec::with_capacity(8),
+            _library: library,
+        }
+    }
+
+    // The caller transfers one owned reference with its matching release
+    // function. Register it before checking the accompanying OpenCL status so
+    // a non-null allocation cannot leak on a later error or early return.
+    unsafe fn track(
+        &mut self,
+        raw: *mut c_void,
+        release: unsafe extern "system" fn(*mut c_void) -> ClInt,
+    ) -> *mut c_void {
+        if !raw.is_null() {
+            self.handles.push(OpenClOwnedHandle { raw, release });
+        }
+        raw
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl Drop for OpenClAllocations {
+    fn drop(&mut self) {
+        // Buffers, kernel, program, queue, context; only then can _library drop.
+        // A driver release error must not prevent the remaining releases.
+        while let Some(handle) = self.handles.pop() {
+            drop(handle);
+        }
+    }
+}
 
 const CL_SUCCESS: ClInt = 0;
 const CL_TRUE: ClUInt = 1;
@@ -151,10 +216,9 @@ impl OpenClGpuMiner {
 
 #[cfg(target_os = "windows")]
 pub struct OpenClGpuMiner {
+    _allocations: OpenClAllocations,
     api: OpenClApi,
-    context: ClContext,
     queue: ClCommandQueue,
-    program: ClProgram,
     kernel: ClKernel,
     midstate_mem: ClMem,
     tail_mem: ClMem,
@@ -196,19 +260,29 @@ impl OpenClGpuMiner {
             let selected_device = selected.device;
             let display_name = selected.display_name;
 
+            let mut allocations = OpenClAllocations::new(Arc::clone(&api._lib));
             let mut err: ClInt = 0;
-            let context = (api.cl_create_context)(ptr::null(), 1, &selected_device, None, ptr::null_mut(), &mut err);
+            let context = allocations.track(
+                (api.cl_create_context)(ptr::null(), 1, &selected_device, None, ptr::null_mut(), &mut err),
+                api.cl_release_context,
+            );
             check(err, "clCreateContext")?;
             if context.is_null() { bail!("clCreateContext returned null"); }
 
-            let queue = (api.cl_create_command_queue)(context, selected_device, 0, &mut err);
+            let queue = allocations.track(
+                (api.cl_create_command_queue)(context, selected_device, 0, &mut err),
+                api.cl_release_command_queue,
+            );
             check(err, "clCreateCommandQueue")?;
             if queue.is_null() { bail!("clCreateCommandQueue returned null"); }
 
             let src = OPENCL_KERNEL.as_bytes();
             let src_ptr = src.as_ptr() as *const c_char;
             let src_len = src.len();
-            let program = (api.cl_create_program_with_source)(context, 1, &src_ptr, &src_len, &mut err);
+            let program = allocations.track(
+                (api.cl_create_program_with_source)(context, 1, &src_ptr, &src_len, &mut err),
+                api.cl_release_program,
+            );
             check(err, "clCreateProgramWithSource")?;
             if program.is_null() { bail!("clCreateProgramWithSource returned null"); }
 
@@ -220,20 +294,22 @@ impl OpenClGpuMiner {
             }
 
             let kernel_name = b"scan_qub_fullsha\0";
-            let kernel = (api.cl_create_kernel)(program, kernel_name.as_ptr() as *const c_char, &mut err);
+            let kernel = allocations.track(
+                (api.cl_create_kernel)(program, kernel_name.as_ptr() as *const c_char, &mut err),
+                api.cl_release_kernel,
+            );
             check(err, "clCreateKernel")?;
             if kernel.is_null() { bail!("clCreateKernel returned null"); }
 
-            let midstate_mem = create_buffer(&api, context, CL_MEM_READ_ONLY, 8 * std::mem::size_of::<ClUInt>())?;
-            let tail_mem = create_buffer(&api, context, CL_MEM_READ_ONLY, 12)?;
-            let target_mem = create_buffer(&api, context, CL_MEM_READ_ONLY, 32)?;
-            let result_mem = create_buffer(&api, context, CL_MEM_READ_WRITE, 2 * std::mem::size_of::<ClUInt>())?;
+            let midstate_mem = create_buffer(&api, &mut allocations, context, CL_MEM_READ_ONLY, 8 * std::mem::size_of::<ClUInt>())?;
+            let tail_mem = create_buffer(&api, &mut allocations, context, CL_MEM_READ_ONLY, 12)?;
+            let target_mem = create_buffer(&api, &mut allocations, context, CL_MEM_READ_ONLY, 32)?;
+            let result_mem = create_buffer(&api, &mut allocations, context, CL_MEM_READ_WRITE, 2 * std::mem::size_of::<ClUInt>())?;
 
             Ok(Self {
+                _allocations: allocations,
                 api,
-                context,
                 queue,
-                program,
                 kernel,
                 midstate_mem,
                 tail_mem,
@@ -314,24 +390,8 @@ impl OpenClGpuMiner {
 }
 
 #[cfg(target_os = "windows")]
-impl Drop for OpenClGpuMiner {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = (self.api.cl_release_mem_object)(self.midstate_mem);
-            let _ = (self.api.cl_release_mem_object)(self.tail_mem);
-            let _ = (self.api.cl_release_mem_object)(self.target_mem);
-            let _ = (self.api.cl_release_mem_object)(self.result_mem);
-            let _ = (self.api.cl_release_kernel)(self.kernel);
-            let _ = (self.api.cl_release_program)(self.program);
-            let _ = (self.api.cl_release_command_queue)(self.queue);
-            let _ = (self.api.cl_release_context)(self.context);
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 struct OpenClApi {
-    _lib: *mut c_void,
+    _lib: Arc<OpenClOwnedHandle>,
     cl_get_platform_ids: unsafe extern "system" fn(ClUInt, *mut ClPlatformId, *mut ClUInt) -> ClInt,
     cl_get_device_ids: unsafe extern "system" fn(ClPlatformId, ClULong, ClUInt, *mut ClDeviceId, *mut ClUInt) -> ClInt,
     cl_get_device_info: unsafe extern "system" fn(ClDeviceId, ClUInt, SizeT, *mut c_void, *mut SizeT) -> ClInt,
@@ -361,8 +421,8 @@ impl OpenClApi {
             let wide: Vec<u16> = std::ffi::OsStr::new("OpenCL.dll").encode_wide().chain(Some(0)).collect();
             let lib = LoadLibraryW(wide.as_ptr());
             if lib.is_null() { bail!("OpenCL.dll not found. Install/update AMD/Nvidia GPU drivers with OpenCL support."); }
+            let library = Arc::new(OpenClOwnedHandle { raw: lib, release: FreeLibrary });
             Ok(Self {
-                _lib: lib,
                 cl_get_platform_ids: load_fn(lib, b"clGetPlatformIDs\0")?,
                 cl_get_device_ids: load_fn(lib, b"clGetDeviceIDs\0")?,
                 cl_get_device_info: load_fn(lib, b"clGetDeviceInfo\0")?,
@@ -383,6 +443,7 @@ impl OpenClApi {
                 cl_release_program: load_fn(lib, b"clReleaseProgram\0")?,
                 cl_release_command_queue: load_fn(lib, b"clReleaseCommandQueue\0")?,
                 cl_release_context: load_fn(lib, b"clReleaseContext\0")?,
+                _lib: library,
             })
         }
     }
@@ -514,9 +575,12 @@ fn check(code: ClInt, name: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn create_buffer(api: &OpenClApi, context: ClContext, flags: ClULong, size: usize) -> Result<ClMem> {
+unsafe fn create_buffer(api: &OpenClApi, allocations: &mut OpenClAllocations, context: ClContext, flags: ClULong, size: usize) -> Result<ClMem> {
     let mut err = 0;
-    let mem = (api.cl_create_buffer)(context, flags, size, ptr::null_mut(), &mut err);
+    let mem = allocations.track(
+        (api.cl_create_buffer)(context, flags, size, ptr::null_mut(), &mut err),
+        api.cl_release_mem_object,
+    );
     check(err, "clCreateBuffer")?;
     if mem.is_null() { bail!("clCreateBuffer returned null"); }
     Ok(mem)
@@ -737,5 +801,132 @@ mod hf127_tests {
             initial_work_items(1, 0),
             interruptible_work_items(tuning_work_item_candidates(100, 0)[0])
         );
+    }
+}
+
+#[cfg(test)]
+mod hf131_lifetime_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static RELEASES: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+    }
+
+    const LIBRARY_HANDLE: usize = 1000;
+
+    unsafe extern "system" fn release_ok(raw: *mut c_void) -> ClInt {
+        RELEASES.with(|events| events.borrow_mut().push(raw as usize));
+        CL_SUCCESS
+    }
+
+    unsafe extern "system" fn release_error(raw: *mut c_void) -> ClInt {
+        RELEASES.with(|events| events.borrow_mut().push(raw as usize));
+        -5
+    }
+
+    fn take_releases() -> Vec<usize> {
+        RELEASES.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+
+    fn fake_library() -> Arc<OpenClOwnedHandle> {
+        Arc::new(OpenClOwnedHandle {
+            raw: LIBRARY_HANDLE as *mut c_void,
+            release: release_ok,
+        })
+    }
+
+    fn fail_initialization_after(count: usize) -> std::result::Result<(), ()> {
+        let library = fake_library();
+        let mut allocations = OpenClAllocations::new(Arc::clone(&library));
+        for handle in 1..=count {
+            unsafe {
+                allocations.track(handle as *mut c_void, release_ok);
+            }
+        }
+        // Model each constructor failure after the newly returned handle has
+        // been adopted, including the final buffer's status check.
+        Err(())
+    }
+
+    #[test]
+    fn hf131_gpu_partial_initialization_releases_every_created_handle_once() {
+        for count in 0..=8 {
+            assert!(take_releases().is_empty());
+            assert!(fail_initialization_after(count).is_err());
+            let mut expected: Vec<usize> = (1..=count).rev().collect();
+            expected.push(LIBRARY_HANDLE);
+            assert_eq!(take_releases(), expected, "failure after {count} allocations");
+        }
+    }
+
+    #[test]
+    fn hf131_gpu_allocations_retain_library_until_reverse_cleanup_finishes() {
+        assert!(take_releases().is_empty());
+        let library = fake_library();
+        let mut allocations = OpenClAllocations::new(Arc::clone(&library));
+        for handle in 1..=8 {
+            unsafe {
+                allocations.track(handle as *mut c_void, release_ok);
+            }
+        }
+        // Simulate an API owner ending before its resources. Function pointers
+        // must remain valid until the final resource release has returned.
+        drop(library);
+        assert!(take_releases().is_empty());
+        drop(allocations);
+        assert_eq!(take_releases(), vec![8, 7, 6, 5, 4, 3, 2, 1, LIBRARY_HANDLE]);
+    }
+
+    #[test]
+    fn hf131_gpu_api_retains_library_after_resource_cleanup() {
+        assert!(take_releases().is_empty());
+        let library = fake_library();
+        let mut allocations = OpenClAllocations::new(Arc::clone(&library));
+        unsafe {
+            allocations.track(1usize as *mut c_void, release_ok);
+        }
+        drop(allocations);
+        assert_eq!(take_releases(), vec![1]);
+        drop(library);
+        assert_eq!(take_releases(), vec![LIBRARY_HANDLE]);
+    }
+
+    #[test]
+    fn hf131_gpu_cleanup_continues_after_driver_release_error() {
+        assert!(take_releases().is_empty());
+        let mut allocations = OpenClAllocations::new(fake_library());
+        unsafe {
+            allocations.track(1usize as *mut c_void, release_ok);
+            allocations.track(2usize as *mut c_void, release_error);
+            allocations.track(3usize as *mut c_void, release_ok);
+        }
+        drop(allocations);
+        assert_eq!(take_releases(), vec![3, 2, 1, LIBRARY_HANDLE]);
+    }
+
+    #[test]
+    fn hf131_gpu_null_allocations_never_call_release() {
+        assert!(take_releases().is_empty());
+        let mut allocations = OpenClAllocations::new(fake_library());
+        unsafe {
+            assert!(allocations.track(ptr::null_mut(), release_error).is_null());
+            allocations.track(1usize as *mut c_void, release_ok);
+            allocations.track(ptr::null_mut(), release_error);
+        }
+        drop(allocations);
+        assert_eq!(take_releases(), vec![1, LIBRARY_HANDLE]);
+    }
+
+    #[test]
+    fn hf131_gpu_library_load_scope_error_releases_module() {
+        fn failed_symbol_resolution() -> std::result::Result<(), ()> {
+            let _library = fake_library();
+            // The library guard exists before fallible symbol resolution.
+            Err(())
+        }
+        assert!(take_releases().is_empty());
+        assert!(failed_symbol_resolution().is_err());
+        assert_eq!(take_releases(), vec![LIBRARY_HANDLE]);
     }
 }

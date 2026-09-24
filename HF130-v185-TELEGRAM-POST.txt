@@ -1,0 +1,37 @@
+OPERATOR DRAFT - DO NOT POST BEFORE THE RELEASE GATES PASS
+
+Replace the three release placeholders below using the actually published,
+verified artifacts under the selected release trust policy. Remove this preface after the Windows, mixed-version,
+NYC3/AMS3, external-client and six-hour soak gates pass. Source-only checks
+are not completed native or production validation.
+
+--- ANNOUNCEMENT DRAFT ---
+
+QUB Core v1.8.5 / HF130
+
+This reliability update focuses on pool mining recovery and chain synchronization.
+
+Changes include:
+- Pool share preparation responds to Stop and refreshes when the chain parent changes.
+- Sync operations use bounded network waits and clearer freshness checks.
+- Mining resumes with the same Pool and payout address after a sync pause.
+- GUI chain/balance updates reject late results from older captures.
+- Chain maintenance and snapshot publication handle failures more safely.
+
+HF130 keeps the existing consensus rules, PoW, rewards, pool payouts and chain
+format. It includes the earlier unreleased HF129 work; users upgrade directly
+from v1.8.4 to v1.8.5.
+
+Download and release notes:
+<VERIFIED_RELEASE_URL>
+
+Windows installer SHA256:
+<PUBLISHED_INSTALLER_SHA256>
+
+Source ZIP SHA256:
+<PUBLISHED_HF130_SOURCE_ZIP_SHA256>
+
+Keep your existing wallet and data directory. Do not delete wallet.json or
+chain-v2 when updating. If pool mining still pauses or falls behind, please
+include the app version, pool, local/network heights, approximate time and
+relevant logs with private keys and wallet secrets removed.

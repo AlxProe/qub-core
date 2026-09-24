@@ -1,0 +1,17 @@
+QUB Core v1.8.5 - HF131 is available.
+
+This update focuses on solo/pool mining, CPU/GPU sessions and synchronization:
+- fixes a race that could lose a valid found block before submission;
+- improves recovery and peer checks when a seed is slow or unavailable;
+- prevents stale GUI peer information from pausing mining;
+- improves pool-share cancellation, Stop/Start and payout continuity;
+- fixes OpenCL resource cleanup and makes relay/storage failures clearer.
+
+No chain upgrade. Compatible with v1.8.4 and the current QUB Explorer 0.7.3.
+
+Download: https://download.qubit-coin.io/mainnet/QUB-Core-Latest.exe
+Release notes and source: https://github.com/AlxProe/qub-core/releases/tag/v1.8.5-hf131
+
+After updating, let Sync reach the current chain before starting mining. If you
+still see a stall, send the mining mode, CPU/GPU device, local height/hash and
+the relevant logs. Never share wallet keys or private files.

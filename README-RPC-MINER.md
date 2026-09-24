@@ -1,4 +1,4 @@
-# QUB RPC and Reference Miner (HF128 / v1.8.4)
+# QUB RPC and Reference Miner (HF129 / v1.8.5)
 
 ## Production model
 

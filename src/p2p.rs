@@ -2,6 +2,8 @@ use crate::*;
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -11,12 +13,12 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_VERSION: u32 = 2;
-const USER_AGENT: &str = "/QUB Core:1.8.4/"; // HF128 mining, pool, sync and updater reliability
+const USER_AGENT: &str = "/QUB Core:1.8.6/"; // HF130 bounded recovery; unchanged wire protocol
 const LAN_DISCOVERY_MAGIC: &str = "qub-lan-discovery-v1";
 const GLOBAL_PEER_LIVE_SECS: u64 = 900;
 const RELAY_REACHABILITY_CACHE_SECS: u64 = 300;
@@ -91,6 +93,109 @@ const HF127_OUTBOUND_DIALS_PER_TICK: usize = 4;
 const HF127_KNOWN_PEER_REFRESH_SECS: u64 = 15;
 const HF127_PEER_OBSERVATION_WRITE_SECS: u64 = 30;
 const HF127_STATUS_LOG_SECS: u64 = 15;
+const HF129_OFFICIAL_TIP_MAX_AGE_SECS: u64 = 3 * 60;
+const HF129_OFFICIAL_TIP_FUTURE_SKEW_SECS: u64 = 120;
+
+// HF130: deadlines belong to the operation, not to individual socket reads.
+// Nested sync stages inherit the shorter deadline; a scoped probe explicitly
+// inherits this context as well. Cancellation never detaches a chain writer.
+#[derive(Clone, Default)]
+struct Hf130IoContext {
+    deadline: Option<Instant>,
+    cancel: Option<Arc<AtomicBool>>,
+    completion: Option<Arc<AtomicBool>>,
+}
+
+thread_local! {
+    static HF130_IO_CONTEXT: RefCell<Hf130IoContext> = RefCell::new(Hf130IoContext::default());
+}
+
+struct Hf130IoScope(Hf130IoContext);
+
+impl Hf130IoScope {
+    fn enter(mut context: Hf130IoContext) -> Self {
+        HF130_IO_CONTEXT.with(|slot| {
+            let previous = slot.borrow().clone();
+            if let Some(parent) = previous.deadline {
+                context.deadline = Some(context.deadline.map_or(parent, |d| d.min(parent)));
+            }
+            if context.cancel.is_none() {
+                context.cancel = previous.cancel.clone();
+            }
+            if context.completion.is_none() {
+                context.completion = previous.completion.clone();
+            }
+            *slot.borrow_mut() = context;
+            Self(previous)
+        })
+    }
+
+    fn deadline(deadline: Instant) -> Self {
+        Self::enter(Hf130IoContext { deadline: Some(deadline), cancel: None, completion: None })
+    }
+}
+
+impl Drop for Hf130IoScope {
+    fn drop(&mut self) {
+        HF130_IO_CONTEXT.with(|slot| *slot.borrow_mut() = self.0.clone());
+    }
+}
+
+/// Cooperatively cancel mining guards, including their nested network work.
+/// The caller retains its controller until this closure has actually returned.
+pub fn hf130_with_mining_cancellation<T>(
+    stop: Arc<AtomicBool>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    let _scope = Hf130IoScope::enter(Hf130IoContext { deadline: None, cancel: Some(stop), completion: None });
+    operation()
+}
+
+fn hf130_io_context() -> Hf130IoContext {
+    HF130_IO_CONTEXT.with(|slot| slot.borrow().clone())
+}
+
+fn hf130_effective_deadline(deadline: Instant) -> Instant {
+    HF130_IO_CONTEXT.with(|slot| slot.borrow().deadline.map_or(deadline, |d| d.min(deadline)))
+}
+
+fn hf130_io_remaining(deadline: Instant) -> io::Result<Duration> {
+    if HF130_IO_CONTEXT.with(|slot| {
+        let context = slot.borrow();
+        context.cancel.as_ref().map_or(false, |stop| stop.load(Ordering::Relaxed))
+            || context.completion.as_ref().map_or(false, |stop| stop.load(Ordering::Relaxed))
+    }) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "mining operation cancelled"));
+    }
+    let left = hf130_effective_deadline(deadline).saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "operation deadline expired"))
+    } else {
+        Ok(left)
+    }
+}
+
+
+/// Cooperative CPU/storage checkpoint. Socket deadlines only bound network
+/// work: expiry during validation must not discard an otherwise valid chunk.
+/// Explicit controller cancellation still stops private replay before commit.
+pub(crate) fn hf132_check_sync_budget() -> Result<()> {
+    let context = hf130_io_context();
+    if context.cancel.as_ref().map_or(false, |flag| flag.load(Ordering::Relaxed))
+        || context.completion.as_ref().map_or(false, |flag| flag.load(Ordering::Relaxed))
+    {
+        bail!("mining operation cancelled");
+    }
+    Ok(())
+}
+
+/// Reserve network opportunity for the remaining peers. Validation may finish
+/// and persist its accepted chunk after this socket slice expires.
+fn hf132_peer_io_deadline(deadline: Instant, peers_left: usize) -> Instant {
+    let now = Instant::now();
+    let left = hf130_effective_deadline(deadline).saturating_duration_since(now);
+    now + left / peers_left.clamp(1, 4) as u32
+}
 
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -103,6 +208,46 @@ pub struct P2PSyncReport {
     pub txs_accepted: usize,
     pub height: u32,
     pub tip_hash: String,
+    #[serde(default)]
+    pub writer_acquired: bool,
+    #[serde(default)]
+    pub writer_busy: bool,
+    #[serde(default)]
+    pub progressed: bool,
+    #[serde(default)]
+    pub fresh_at_tip: bool,
+    #[serde(default)]
+    pub canonical_tip_proven: bool,
+    #[serde(default)]
+    pub terminal: String,
+    #[serde(default)]
+    pub sync_reason: String,
+    #[serde(default)]
+    pub before_height: u32,
+    #[serde(default)]
+    pub before_tip_hash: String,
+    #[serde(default)]
+    pub best_peer_tip_hash: String,
+    // Process-local evidence. Deserializing an old report must never recreate
+    // freshness, and this does not change the public report JSON schema.
+    #[serde(skip)]
+    pub canonical_proof: Option<Hf130CanonicalProof>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Hf130CanonicalEvidence {
+    OfficialTip,
+    OfficialHttp,
+    OfficialTcp,
+    DirectQuorum,
+}
+
+#[derive(Debug, Clone)]
+pub struct Hf130CanonicalProof {
+    pub height: u32,
+    pub tip_hash: String,
+    pub observed_at: Instant,
+    pub source: Hf130CanonicalEvidence,
 }
 
 
@@ -146,7 +291,7 @@ impl BlockRelayReport {
             .iter()
             .filter(|result| {
                 official.map(|expected| result.official == expected).unwrap_or(true)
-                    && result.transport == "ack"
+                    && matches!(result.transport.as_str(), "ack" | "ack_after_suffix" | "ack_after_overlap")
                     && matches!(result.status.as_str(), "accepted" | "already_known")
             })
             .map(|result| normalize_peer_addr(&result.peer))
@@ -352,7 +497,16 @@ fn load_chain_for_hf90_catchup(settings: &Settings) -> Result<ChainState> {
     // let the public tip move away again. Use the persisted chain/UTXO snapshot
     // with checkpoint + recent-link checks for the read side, then consensus-
     // validate every newly received block through connect_block / from_blocks.
-    load_or_init_chain_for_ui_fast(settings).or_else(|_| load_or_init_chain(settings))
+    // A busy live owner is retryable; falling back here replayed the full chain
+    // while the existing writer was still working.
+    load_or_init_chain_for_ui_fast(settings)
+}
+
+// Snapshot append validation needs a consensus-validated UTXO baseline. A
+// structural UI snapshot alone is insufficient for the validated-candidate API.
+fn load_chain_for_hf132_validated_catchup(settings: &Settings) -> Result<ChainState> {
+    if let Some(local) = try_live_chain_snapshot(settings)? { return Ok(local); }
+    load_or_init_chain(settings)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -449,6 +603,61 @@ fn mark_fresh_tip_trusted(settings: &Settings, chain: &ChainState) {
         cache.height = chain.height();
         cache.tip_hash = chain.tip_hash().to_string();
         cache.at = Some(Instant::now());
+    }
+}
+
+fn hf129_mark_canonical_tip_proven(report: &mut P2PSyncReport) {
+    // Legacy call sites also accept lower ancestors and unresolved PoW ties.
+    // Those remain mineable under the existing rules, but are not exact-tip
+    // acknowledgement. Only the evidence-bearing helper can create a proof.
+    report.canonical_tip_proven = report.canonical_proof.is_some();
+}
+
+fn hf130_mark_exact_tip_proven(
+    report: &mut P2PSyncReport,
+    local: &ChainState,
+    source: Hf130CanonicalEvidence,
+) {
+    report.canonical_proof = Some(Hf130CanonicalProof {
+        height: local.height(),
+        tip_hash: local.tip_hash().to_string(),
+        observed_at: Instant::now(),
+        source,
+    });
+    report.canonical_tip_proven = true;
+}
+
+fn hf130_proof_matches_final(
+    report: &P2PSyncReport,
+    height: u32,
+    tip_hash: &str,
+    pending_relay: bool,
+) -> bool {
+    !pending_relay && report.canonical_proof.as_ref().map_or(false, |proof| {
+        proof.height == height
+            && proof.tip_hash == tip_hash
+            && proof.observed_at.elapsed() <= Duration::from_secs(FRESH_TIP_TRUST_WINDOW_SECS)
+    })
+}
+
+/// Keep an advertised height and its hash as one observation. In particular,
+/// a higher height with no hash must clear a lower height's hash rather than
+/// manufacture a mismatched `(height, hash)` pair.
+fn hf129_observe_tip(report: &mut P2PSyncReport, height: u32, tip_hash: &str) {
+    if report.canonical_proof.as_ref().map_or(false, |proof| {
+        height > proof.height || (height == proof.height && !tip_hash.trim().is_empty() && tip_hash != proof.tip_hash)
+    }) {
+        report.canonical_proof = None;
+        report.canonical_tip_proven = false;
+    }
+    if height == 0 {
+        return;
+    }
+    if height > report.best_peer_height {
+        report.best_peer_height = height;
+        report.best_peer_tip_hash = tip_hash.to_string();
+    } else if height == report.best_peer_height && !tip_hash.trim().is_empty() {
+        report.best_peer_tip_hash = tip_hash.to_string();
     }
 }
 
@@ -565,6 +774,7 @@ fn hf97_greenlight_local_tip_after_uncatchable_height(
     mark_hf97_uncatchable_tip(settings, local, advertised_height);
     mark_fresh_tip_trusted(settings, local);
     report.best_peer_height = local.height();
+    report.best_peer_tip_hash.clear();
     report.height = local.height();
     report.tip_hash = local_tip;
     eprintln!(
@@ -586,6 +796,7 @@ fn hf97_suppress_quarantined_best_height(
         && hf97_uncatchable_tip_quarantined(settings, local, report.best_peer_height)
     {
         report.best_peer_height = local.height();
+        report.best_peer_tip_hash.clear();
         report.height = local.height();
         report.tip_hash = local.tip_hash().to_string();
     }
@@ -1234,32 +1445,24 @@ pub fn run_node(settings: Settings) -> Result<()> {
 
         let mut relay_after_merge = Vec::<Transaction>::new();
         if committed_changed {
-            match load_committed_chain(&settings, false) {
-                Ok(disk_chain) => {
+            match load_committed_chain_with_identity(&settings, false) {
+                Ok((disk_chain, captured_identity)) => {
                     let disk_mempool_txids = disk_chain.mempool_txids();
                     let mut local = chain.lock().expect("chain mutex poisoned");
-                    relay_after_merge.extend(merge_mempool_from_chain(
-                        &mut local,
-                        &disk_chain,
-                        &settings,
-                    ));
-                    if disk_chain.height() > local.height()
-                        || (disk_chain.height() == local.height()
-                            && disk_chain.tip_hash() != local.tip_hash())
-                    {
-                        let mut adopted = disk_chain;
-                        let keep_mempool = local.reorg_mempool_candidates_for(&adopted);
-                        adopted.rebuild_mempool_from(keep_mempool, &settings);
-                        relay_after_merge.extend(adopted.mempool.iter().take(64).cloned());
-                        *local = adopted;
-                    }
-                    // A same-tip GUI/CLI save may contain only one side of a
-                    // concurrent mempool update. The live owner merges both
-                    // sides; if that union differs from the committed state,
-                    // schedule one coalesced commit so restart durability and
-                    // the lightweight identity check converge again.
-                    if local.mempool_txids() != disk_mempool_txids {
-                        mempool_dirty.store(true, Ordering::Release);
+                    // The generation may have changed while waiting for the
+                    // live owner. Never publish a stale captured disk view.
+                    let current_identity = fast_storage_identity(&settings).ok().flatten();
+                    if hf132_committed_capture_is_current(captured_identity.as_ref(), current_identity.as_ref()) {
+                        match hf132_reconcile_committed_view(&mut local, disk_chain, &settings) {
+                            Ok(relayed) => {
+                                relay_after_merge.extend(relayed);
+                                // Retain the union of concurrent mempool updates.
+                                if local.mempool_txids() != disk_mempool_txids {
+                                    mempool_dirty.store(true, Ordering::Release);
+                                }
+                            }
+                            Err(err) => eprintln!("HF132 committed-state reconcile skipped: {err:#}"),
+                        }
                     }
                 }
                 Err(err) => {
@@ -1408,12 +1611,52 @@ pub fn run_node(settings: Settings) -> Result<()> {
     }
 }
 
+fn hf132_committed_capture_is_current(
+    captured: Option<&FastStorageIdentity>, current: Option<&FastStorageIdentity>,
+) -> bool {
+    matches!((captured, current), (Some(a), Some(b)) if a == b)
+}
+
+fn hf132_reconcile_committed_view(
+    local: &mut ChainState, disk: ChainState, settings: &Settings,
+) -> Result<Vec<Transaction>> {
+    // Committed equal-work reanchors remain authoritative at the exact CURRENT
+    // identity. Height alone must never replace a stronger live branch.
+    let different_tip = disk.tip_hash() != local.tip_hash();
+    let can_adopt = if different_tip {
+        let disk_work = chain_work_for_blocks(&disk.blocks)?;
+        let local_work = chain_work_for_blocks(&local.blocks)?;
+        disk_work > local_work || (disk_work == local_work && disk.height() >= local.height())
+    } else { false };
+    let mut relay = merge_mempool_from_chain(local, &disk, settings);
+    if can_adopt {
+        let mut adopted = disk;
+        let keep_mempool = local.reorg_mempool_candidates_for(&adopted);
+        adopted.rebuild_mempool_from(keep_mempool, settings);
+        relay.extend(adopted.mempool.iter().take(64).cloned());
+        *local = adopted;
+    }
+    Ok(relay)
+}
+
 pub fn sync_chain_once(settings: &Settings) -> Result<P2PSyncReport> {
+    let _scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(120));
     // HF74/v1.5.8 fixed2: keep CLI callers on the tiered official sync path.
     // If the local chain is on a valid-but-noncanonical branch at the same/near
     // height, tail/suffix sync cannot append. In that case, allow canonical
     // snapshot repair instead of falling into long peer loops.
-    let mut report = hf90_manual_catchup(settings, 120_000).unwrap_or_default();
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "sync-chain-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, workflow_report),
+    };
+    let mut report = hf90_manual_catchup(settings, 120_000).unwrap_or(workflow_report);
     let before_tail = load_chain_for_hf90_catchup(settings).ok();
     let before_h = before_tail.as_ref().map(|c| c.height()).unwrap_or(0);
     let before_tip = before_tail
@@ -1466,10 +1709,21 @@ pub fn sync_chain_once(settings: &Settings) -> Result<P2PSyncReport> {
 }
 
 pub fn sync_once(settings: &Settings) -> Result<P2PSyncReport> {
+    let _scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(15));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        15_000,
+        false,
+        "legacy-sync-once",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
     let peers = known_peers(settings)?;
     for addr in peers
         .into_iter()
@@ -1485,6 +1739,7 @@ pub fn sync_once(settings: &Settings) -> Result<P2PSyncReport> {
         stream.set_read_timeout(Some(Duration::from_secs(8)))?;
         stream.set_write_timeout(Some(Duration::from_secs(8)))?;
         let mut reader = BufReader::new(stream.try_clone()?);
+        let mut client_session = PeerSession::default();
         let local = load_chain_for_hf90_catchup(settings)?;
         let from_height = local.height().saturating_add(1);
         send_version(&mut stream, settings, &local)?;
@@ -1500,9 +1755,11 @@ pub fn sync_once(settings: &Settings) -> Result<P2PSyncReport> {
         send_wire(&mut stream, &WireMessage::GetHeaders { from_height })?;
         send_wire(&mut stream, &WireMessage::GetChain { from_height })?;
         let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = hf130_effective_deadline(deadline);
+        let _hf130_io_scope = Hf130IoScope::deadline(deadline);
         while Instant::now() < deadline {
             match read_wire(&mut reader, settings.p2p.max_message_bytes) {
-                Ok(msg) => process_client_message(settings, &addr, msg, &mut stream, &mut report)?,
+                Ok(msg) => process_client_message(settings, &addr, msg, &mut stream, &mut report, &mut client_session)?,
                 Err(err) if is_timeout(&err) => break,
                 Err(err) => {
                     report.peer_errors = report.peer_errors.saturating_add(1);
@@ -1521,22 +1778,48 @@ pub fn sync_quick(
     max_peers: usize,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "quick-sync",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(1_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let peer_budget = max_peers.max(1).saturating_mul(2).min(32);
-    let peers = prioritized_outbound_peers(settings, peer_budget)
-        .unwrap_or_else(|_| known_peers(settings).unwrap_or_default());
-    for addr in peers.into_iter().take(peer_budget) {
+    let mut peers = hf131_direct_candidates(settings, peer_budget.min(12));
+    for addr in prioritized_outbound_peers(settings, peer_budget)
+        .unwrap_or_else(|_| known_peers(settings).unwrap_or_default()) {
+        if !peers.contains(&addr) { peers.push(addr); }
+    }
+    peers.truncate(peer_budget);
+    if let Ok(version) = hf131_probe_version(settings) {
+        let probe_deadline = deadline.min(Instant::now() + Duration::from_millis(800));
+        let reachable = hf131_probe_batch(&peers, probe_deadline,
+            |addr, left| probe_peer_with_version(settings, addr, left, &version).ok())
+            .into_iter().map(|(addr, _)| addr).collect::<HashSet<_>>();
+        hf131_prefer_reachable(&mut peers, &reachable);
+    }
+    let candidate_count = peers.len().min(peer_budget);
+    for (index, addr) in peers.into_iter().take(peer_budget).enumerate() {
         if Instant::now() >= deadline {
             break;
         }
         if should_skip_outbound(settings, &addr) {
             continue;
         }
-        match sync_peer_adaptive_session(settings, &addr, deadline, &mut report) {
+        let peer_deadline = hf132_peer_io_deadline(deadline, candidate_count.saturating_sub(index));
+        match sync_peer_adaptive_session(settings, &addr, peer_deadline, &mut report) {
             Ok(()) => {}
             Err(err) => {
                 report.peer_errors = report.peer_errors.saturating_add(1);
@@ -1579,12 +1862,44 @@ pub fn sync_quick(
     finish_report(settings, report)
 }
 
+fn hf131_prefer_reachable(peers: &mut [String], reachable: &HashSet<String>) {
+    // Stable ordering keeps discovered direct peers ahead of official aliases
+    // within the responsive group; height advertisements are not fork choice.
+    peers.sort_by_key(|addr| !reachable.contains(addr));
+}
+
+// Give ordinary peers a real opportunity before long official snapshot paths.
+// Probing is concurrent, but block validation/adoption stays under the existing
+// single canonical writer. A peer advertisement only selects a transport.
+fn hf131_sync_direct_before_snapshots(settings: &Settings, report: &mut P2PSyncReport, budget_ms: u64) {
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(budget_ms));
+    let _scope = Hf130IoScope::deadline(deadline);
+    let peers = hf131_direct_candidates(settings, 12);
+    if peers.is_empty() { return; }
+    let Ok(version) = hf131_probe_version(settings) else { return; };
+    let probe_deadline = deadline.min(Instant::now() + Duration::from_millis(800));
+    let mut observations = hf131_unique_observations(hf131_probe_batch(&peers, probe_deadline,
+        |addr, left| probe_peer_with_version(settings, addr, left, &version).ok()));
+    observations.sort_by(|a, b| b.1.height.cmp(&a.1.height));
+    let candidate_count = observations.len().min(4);
+    for (index, (addr, _)) in observations.into_iter().take(4).enumerate() {
+        if hf130_io_remaining(deadline).is_err() { break; }
+        let mut step = P2PSyncReport::default();
+        let peer_deadline = hf132_peer_io_deadline(deadline, candidate_count.saturating_sub(index));
+        if sync_peer_adaptive_session(settings, &addr, peer_deadline, &mut step).is_err() {
+            step.peer_errors = step.peer_errors.saturating_add(1);
+        }
+        merge_sync_reports(report, step);
+    }
+}
+
 fn sync_peer_adaptive_session(
     settings: &Settings,
     addr: &str,
     deadline: Instant,
     report: &mut P2PSyncReport,
 ) -> Result<()> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(deadline);
     let connect_left = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_millis(1800));
@@ -1596,6 +1911,7 @@ fn sync_peer_adaptive_session(
     stream.set_read_timeout(Some(Duration::from_millis(900)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2500)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut client_session = PeerSession::default();
 
     let local = load_chain_for_hf90_catchup(settings)?;
     let _ = send_version(&mut stream, settings, &local);
@@ -1609,7 +1925,7 @@ fn sync_peer_adaptive_session(
     // "Sync takes forever / reinstall fixes it" path.
     let from_height = local.height().saturating_add(1);
     let _ = send_wire(&mut stream, &WireMessage::GetHeaders { from_height });
-    let _ = send_wire(&mut stream, &WireMessage::GetChain { from_height });
+    request_peer_chain_from(&mut stream, &local, 0, "", from_height, &mut client_session)?;
 
     let mut peer_height = 0u32;
     let mut peer_tip = String::new();
@@ -1634,11 +1950,11 @@ fn sync_peer_adaptive_session(
                         if *height >= peer_height {
                             peer_tip = (*tip_hash).clone();
                         }
-                        report.best_peer_height = report.best_peer_height.max(*height);
+                        hf129_observe_tip(report, *height, tip_hash);
                     }
                     _ => {}
                 }
-                process_client_message(settings, addr, msg, &mut stream, report)?;
+                process_client_message(settings, addr, msg, &mut stream, report, &mut client_session)?;
 
                 let current = load_chain_for_hf90_catchup(settings)?;
                 if current.height() != last_local_height
@@ -1754,18 +2070,147 @@ fn official_snapshot_peers(settings: &Settings) -> Vec<String> {
     out
 }
 
+static HF131_ACTIVE_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+struct Hf131ProbePermit;
+
+impl Hf131ProbePermit {
+    fn acquire() -> Option<Self> {
+        HF131_ACTIVE_PROBES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            if active < 32 { Some(active + 1) } else { None }
+        }).ok().map(|_| Self)
+    }
+}
+
+impl Drop for Hf131ProbePermit {
+    fn drop(&mut self) { HF131_ACTIVE_PROBES.fetch_sub(1, Ordering::AcqRel); }
+}
+
+// Probe readers may run concurrently; canonical chain writers never do. Every
+// worker inherits the same absolute deadline and cancellation and is joined.
+// A silent first seed therefore cannot hide another regional or ordinary peer.
+fn hf131_probe_batch<T: Send, F>(peers: &[String], deadline: Instant, probe: F) -> Vec<(String, T)>
+where F: Fn(&str, Duration) -> Option<T> + Sync {
+    let deadline = hf130_effective_deadline(deadline);
+    let inherited = hf130_io_context();
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        let probe = &probe;
+        for addr in peers.iter().take(16) {
+            if hf130_io_remaining(deadline).is_err() { break; }
+            let Some(permit) = Hf131ProbePermit::acquire() else { continue; };
+            let inherited = inherited.clone();
+            if let Ok(worker) = thread::Builder::new().name("qub-tip-probe".into()).spawn_scoped(scope, move || {
+                let _permit = permit;
+                let _scope = Hf130IoScope::enter(inherited);
+                let _deadline = Hf130IoScope::deadline(deadline);
+                let left = hf130_io_remaining(deadline).ok()?;
+                probe(addr, left).map(|info| (addr.clone(), info))
+            }) {
+                workers.push(worker);
+            }
+        }
+        workers.into_iter().filter_map(|worker| worker.join().ok().flatten()).collect()
+    })
+}
+
+fn hf131_unique_observations(observations: Vec<(String, P2PProbeInfo)>) -> Vec<(String, P2PProbeInfo)> {
+    let mut nodes = HashSet::new();
+    observations.into_iter().filter(|(_, info)| {
+        let id = info.node_id.trim();
+        !id.is_empty() && nodes.insert(id.to_string())
+    }).collect()
+}
+
+fn hf131_direct_candidates(settings: &Settings, max_peers: usize) -> Vec<String> {
+    // Do not requeue timed-out official aliases in the ordinary-peer lane.
+    let official = official_snapshot_peers(settings).into_iter()
+        .map(|addr| normalize_peer_addr(&addr)).collect::<HashSet<_>>();
+    known_peers(settings).unwrap_or_default().into_iter()
+        .filter(|addr| !official.contains(&normalize_peer_addr(addr)) && !should_skip_outbound(settings, addr))
+        .take(max_peers.clamp(1, 16)).collect()
+}
+
+fn hf131_direct_observations(settings: &Settings, max_peers: usize, deadline: Instant) -> Vec<(String, P2PProbeInfo)> {
+    let peers = hf131_direct_candidates(settings, max_peers);
+    if peers.is_empty() { return Vec::new(); }
+    let Ok(version) = hf131_probe_version(settings) else { return Vec::new(); };
+    hf131_unique_observations(hf131_probe_batch(&peers, deadline,
+        |addr, left| probe_peer_with_version(settings, addr, left, &version).ok()))
+}
+
+#[derive(Default)]
+struct Hf131ParentView {
+    contacted: usize,
+    exact: usize,
+    ahead_height: u32,
+    raw_ahead_height: u32,
+    conflicts: Vec<String>,
+    raw_conflicts: Vec<String>,
+}
+
+fn hf131_parent_view(parent_height: u32, parent_hash: &str, observations: Vec<(String, P2PProbeInfo)>) -> Hf131ParentView {
+    let mut view = Hf131ParentView::default();
+    let mut ahead = HashMap::<(u32, String), usize>::new();
+    let mut conflicts = HashMap::<String, usize>::new();
+    for (_, info) in hf131_unique_observations(observations) {
+        if info.height == 0 || info.tip_hash.trim().is_empty() { continue; }
+        view.contacted += 1;
+        if info.height > parent_height {
+            view.raw_ahead_height = view.raw_ahead_height.max(info.height);
+            *ahead.entry((info.height, info.tip_hash)).or_default() += 1;
+        } else if info.height == parent_height {
+            if info.tip_hash == parent_hash { view.exact += 1; }
+            else { *conflicts.entry(info.tip_hash).or_default() += 1; }
+        }
+    }
+    view.ahead_height = ahead.into_iter().filter(|(_, count)| *count >= 2)
+        .map(|((height, _), _)| height).max().unwrap_or(0);
+    for (hash, count) in conflicts {
+        view.raw_conflicts.push(hash.clone());
+        if count >= 2 { view.conflicts.push(hash); }
+    }
+    view
+}
+
+fn hf131_observe_parent(settings: &Settings, height: u32, hash: &str, max_peers: usize, timeout_ms: u64)
+    -> (Option<(usize, u32, String)>, Option<(u32, String)>, Hf131ParentView)
+{
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let inherited = hf130_io_context();
+    thread::scope(|scope| {
+        let official = scope.spawn(|| {
+            let _scope = Hf130IoScope::enter(inherited.clone());
+            let _deadline = Hf130IoScope::deadline(deadline);
+            best_official_peer_tip(settings, timeout_ms).ok()
+        });
+        let http = scope.spawn(|| {
+            let _scope = Hf130IoScope::enter(inherited.clone());
+            let _deadline = Hf130IoScope::deadline(deadline);
+            official_http_tip(settings, timeout_ms).ok().flatten()
+        });
+        let direct = hf131_direct_observations(settings, max_peers, deadline);
+        (official.join().ok().flatten(), http.join().ok().flatten(), hf131_parent_view(height, hash, direct))
+    })
+}
+
 fn official_snapshot_peer_candidates(
     settings: &Settings,
     timeout_ms: u64,
 ) -> Vec<(String, u32, String, u128, String)> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let mut out: Vec<(String, u32, String, u128, String)> = Vec::new();
     let mut seen_node_ids = HashMap::<String, String>::new();
-    for addr in official_snapshot_peers(settings).into_iter().take(4) {
-        if should_skip_outbound(settings, &addr) {
-            continue;
-        }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(150));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let peers = official_snapshot_peers(settings).into_iter().filter(|addr| !should_skip_outbound(settings, addr)).take(4).collect::<Vec<_>>();
+    let Ok(version) = hf131_probe_version(settings) else { return out; };
+    for (addr, (result, elapsed)) in hf131_probe_batch(&peers, deadline, |addr, left| {
         let started = Instant::now();
-        match probe_peer(settings, &addr, Duration::from_millis(timeout_ms.max(150))) {
+        Some((probe_peer_with_version(settings, addr, left, &version), started.elapsed().as_millis()))
+    }) {
+        match result {
             Ok(info) => {
                 let identity = info.node_id.trim().to_string();
                 if !identity.is_empty() {
@@ -1782,7 +2227,7 @@ fn official_snapshot_peer_candidates(
                     addr,
                     info.height,
                     info.tip_hash,
-                    started.elapsed().as_millis(),
+                    elapsed,
                     identity,
                 ));
             }
@@ -1790,7 +2235,7 @@ fn official_snapshot_peer_candidates(
                 addr,
                 0,
                 String::new(),
-                started.elapsed().as_millis(),
+                elapsed,
                 String::new(),
             )),
         }
@@ -1800,6 +2245,7 @@ fn official_snapshot_peer_candidates(
 }
 
 fn best_official_peer_tip(settings: &Settings, timeout_ms: u64) -> Result<(usize, u32, String)> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let candidates = official_snapshot_peer_candidates(settings, timeout_ms);
     let contacted = candidates
         .iter()
@@ -1894,10 +2340,11 @@ fn hf115_http_tip_acknowledges_local(
     local: &ChainState,
     timeout_ms: u64,
 ) -> bool {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     if settings.network.name != "mainnet" {
         return false;
     }
-    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700).min(2_500))
+    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.clamp(100, 2_500))
     else {
         return false;
     };
@@ -1910,23 +2357,27 @@ fn hf115_http_tip_acknowledges_parent(
     parent_hash: &str,
     timeout_ms: u64,
 ) -> bool {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     if settings.network.name != "mainnet" {
         return false;
     }
-    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700).min(2_500))
+    let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.clamp(100, 2_500))
     else {
         return false;
     };
     height == parent_height && !tip.trim().is_empty() && tip == parent_hash
 }
 
-fn hf115_http_exact_greenlight(
+fn hf129_preobserved_http_exact_greenlight(
     settings: &Settings,
     report: &mut P2PSyncReport,
     local: &ChainState,
+    height: u32,
+    tip: &str,
     timeout_ms: u64,
 ) -> bool {
-    if !hf115_http_tip_acknowledges_local(settings, local, timeout_ms) {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    if !hf114_official_tip_acknowledges_local(settings, local, height, tip) {
         return false;
     }
     let local_tip = local.tip_hash().to_string();
@@ -1935,15 +2386,16 @@ fn hf115_http_exact_greenlight(
         local.height(),
         &local_tip,
         settings.p2p.max_outbound_peers.max(6).min(12),
-        timeout_ms.max(220).min(700),
+        timeout_ms.clamp(100, 700),
     )
     .unwrap_or((0, 0, Vec::new()));
     report.peers_contacted = report.peers_contacted.max(contacted);
-    report.best_peer_height = report.best_peer_height.max(quorum_ahead_height);
+    hf129_observe_tip(report, quorum_ahead_height, "");
     if quorum_ahead_height > local.height() || !quorum_conflicts.is_empty() {
         return false;
     }
     mark_fresh_tip_trusted(settings, local);
+    hf130_mark_exact_tip_proven(report, local, Hf130CanonicalEvidence::OfficialHttp);
     true
 }
 
@@ -1952,10 +2404,11 @@ fn official_tip_summary(
     report: &mut P2PSyncReport,
     timeout_ms: u64,
 ) -> (usize, u32, String) {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let (contacted, height, tip) =
         best_official_peer_tip(settings, timeout_ms).unwrap_or((0, 0, String::new()));
     report.peers_contacted = report.peers_contacted.max(contacted);
-    report.best_peer_height = report.best_peer_height.max(height);
+    hf129_observe_tip(report, height, &tip);
     (contacted, height, tip)
 }
 
@@ -1965,6 +2418,7 @@ fn official_tip_greenlight(
     local: &ChainState,
     timeout_ms: u64,
 ) -> bool {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let (contacted, official_height, official_tip) =
         official_tip_summary(settings, report, timeout_ms);
     if contacted == 0 {
@@ -1977,29 +2431,10 @@ fn official_tip_greenlight(
     };
     if ok {
         mark_fresh_tip_trusted(settings, local);
-        return true;
-    }
-    false
-}
-
-fn official_http_tip_greenlight(
-    settings: &Settings,
-    report: &mut P2PSyncReport,
-    local: &ChainState,
-    timeout_ms: u64,
-) -> bool {
-    if let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(700)) {
-        report.peers_contacted = report.peers_contacted.max(1);
-        report.best_peer_height = report.best_peer_height.max(height);
-        let ok = if settings.network.name == "mainnet" {
-            hf114_official_tip_acknowledges_local(settings, local, height, &tip)
-        } else {
-            official_tip_compatible_with_local(local, height, &tip)
-        };
-        if ok {
-            mark_fresh_tip_trusted(settings, local);
-            return true;
+        if official_height == local.height() && official_tip == local.tip_hash().to_string() {
+            hf130_mark_exact_tip_proven(report, local, Hf130CanonicalEvidence::OfficialTcp);
         }
+        return true;
     }
     false
 }
@@ -2014,113 +2449,82 @@ fn hf104_canonical_greenlight(
     local: &ChainState,
     timeout_ms: u64,
 ) -> bool {
-    if settings.network.name != "mainnet" {
-        return official_tip_greenlight(settings, report, local, timeout_ms)
-            || official_http_tip_greenlight(settings, report, local, timeout_ms);
-    }
-
-    let mut direct_contacted = 0usize;
-    let mut contacted_total = 0usize;
-    let mut best_height = 0u32;
+    let _scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let local_tip = local.tip_hash().to_string();
+    // All three lanes receive the same budget. Official outages cannot consume
+    // time reserved for direct peers or hide a responsive second seed.
+    let (official, http, direct) = hf131_observe_parent(
+        settings, local.height(), &local_tip, 12, timeout_ms.clamp(100, 3_000),
+    );
+    report.canonical_proof = None;
+    report.canonical_tip_proven = false;
+    let mut best_height = 0;
     let mut best_tip = String::new();
-
-    if let Ok((contacted, height, tip)) = best_official_peer_tip(settings, timeout_ms.max(650)) {
-        if contacted > 0 {
-            direct_contacted = contacted;
-            contacted_total = contacted_total.saturating_add(contacted);
-            if height > best_height || (height == best_height && !tip.trim().is_empty()) {
-                best_height = height;
-                best_tip = tip;
-            }
-        }
+    let mut contacted = direct.contacted;
+    if let Some((count, height, tip)) = official.as_ref() {
+        contacted += *count;
+        if *count > 0 { best_height = *height; best_tip = tip.clone(); }
     }
-
-    if let Ok(Some((height, tip))) = official_http_tip(settings, timeout_ms.max(1_500)) {
-        contacted_total = contacted_total.saturating_add(1);
-        if height > best_height || (height == best_height && !tip.trim().is_empty()) {
-            best_height = height;
-            best_tip = tip;
-        }
+    if let Some((height, tip)) = http.as_ref() {
+        contacted += 1;
+        if *height >= best_height { best_height = *height; best_tip = tip.clone(); }
     }
+    report.peers_contacted = report.peers_contacted.max(contacted);
+    hf129_observe_tip(report, best_height, &best_tip);
+    hf129_observe_tip(report, direct.ahead_height, "");
 
-    report.peers_contacted = report.peers_contacted.max(contacted_total);
-    report.best_peer_height = report.best_peer_height.max(best_height);
-
-    // HF107: for mainnet mining, HTTP-only is not enough to green-light. HTTP
-    // snapshots are excellent for catch-up, but the actual mining OK must see at
-    // least one official/direct TCP seed sample so a stale published tip cannot
-    // green-light an old local parent while the live seed already moved ahead.
-    if direct_contacted == 0 || best_height == 0 {
-        // HF116: exact official HTTP/public-snapshot acknowledgement is enough to
-        // keep mainnet alive when TCP seeds are unreachable. HF114 rejected this
-        // and could freeze every honest miner at the public tip until a seed or
-        // two exact peers came back. This remains exact-tip only and is vetoed by
-        // a two-peer direct quorum above/a conflicting same-height quorum.
-        if hf115_http_exact_greenlight(settings, report, local, timeout_ms.max(900)) {
-            return true;
-        }
-        // HF113: if all official/direct seeds are temporarily unreachable, keep
-        // the network alive only when a directly reachable peer quorum agrees
-        // with our validated local tip. This avoids seed dependency without
-        // trusting one random future/ghost peer.
-        if hf113_peer_quorum_greenlight(settings, local, 12, timeout_ms.max(420)) {
-            mark_fresh_tip_trusted(settings, local);
-            return true;
-        }
-        return false;
-    }
-    // HF125/v1.8.2: an official/public tip that is a lower ancestor is a
-    // publication lag, not authority to erase a valid higher-work suffix. Keep
-    // the local chain and rely on explicit block acknowledgements plus normal
-    // cumulative-work fork choice. A just-mined unacknowledged tip pauses only
-    // the next mining round while automatic relay retry remains active.
-    if best_height > 0
-        && best_height < local.height()
-        && !best_tip.trim().is_empty()
-        && local_chain_contains_tip(local, best_height, &best_tip)
-    {
-        if pending_block_relay_waiting(settings, local) {
-            return false;
-        }
-        mark_fresh_tip_trusted(settings, local);
-        return true;
-    }
-
-    if hf126_is_same_height_competing_tip(
-        local.height(),
-        &local.tip_hash().to_string(),
-        best_height,
-        &best_tip,
-    ) && !pending_block_relay_waiting(settings, local)
-    {
-        // HF126: an ordinary equal-height sibling is an unresolved PoW tie. It
-        // must remain mineable so the next block can produce the higher-work
-        // branch; only a locally mined unacknowledged tip enters verified re-anchor.
-        mark_fresh_tip_trusted(settings, local);
-        return true;
-    }
-
-    if !hf114_official_tip_acknowledges_local(settings, local, best_height, &best_tip) {
-        // HF116: if an official TCP seed is reachable but stale/lower, do not let
-        // it freeze the network after the next public block. Exact HTTP/public
-        // snapshot acknowledgement wins, and if the published snapshot also lags,
-        // two direct peers acknowledging our exact local tip are enough to keep
-        // mining alive while still rejecting two-peer ahead/conflict quorums.
-        if hf115_http_exact_greenlight(settings, report, local, timeout_ms.max(900)) {
-            return true;
-        }
-        if best_height > 0
-            && best_height < local.height()
-            && hf113_peer_quorum_greenlight(settings, local, 12, timeout_ms.max(420))
-        {
+    if settings.network.name != "mainnet" {
+        if official.as_ref().map_or(false, |(count, height, tip)| {
+            *count > 0 && official_tip_compatible_with_local(local, *height, tip)
+        }) || http.as_ref().map_or(false, |(height, tip)| official_tip_compatible_with_local(local, *height, tip)) {
             mark_fresh_tip_trusted(settings, local);
             return true;
         }
         return false;
     }
 
-    mark_fresh_tip_trusted(settings, local);
-    true
+    // A previously observed newer source cannot be overwritten by an older
+    // exact HTTP publication. A single untrusted high peer remains telemetry.
+    if hf131_parent_is_behind(local.height(), best_height, direct.ahead_height) { return false; }
+    let pending = pending_block_relay_waiting(settings, local);
+    if !direct.conflicts.is_empty() {
+        let verdict = hf130_quorum_verdict(direct.exact, false, true, !pending);
+        let allowed = hf130_apply_quorum_verdict(report, verdict, local.height(), &local_tip);
+        if allowed { mark_fresh_tip_trusted(settings, local); }
+        return allowed;
+    }
+
+    let official_exact = official.as_ref().map_or(false, |(count, height, tip)| {
+        *count > 0 && hf114_official_tip_acknowledges_local(settings, local, *height, tip)
+    });
+    let http_exact = http.as_ref().map_or(false, |(height, tip)| {
+        hf114_official_tip_acknowledges_local(settings, local, *height, tip)
+    });
+    if official_exact || http_exact {
+        mark_fresh_tip_trusted(settings, local);
+        hf130_mark_exact_tip_proven(report, local, if official_exact {
+            Hf130CanonicalEvidence::OfficialTcp
+        } else { Hf130CanonicalEvidence::OfficialHttp });
+        return true;
+    }
+    let verdict = hf130_quorum_verdict(direct.exact, false, false, !pending);
+    if hf130_apply_quorum_verdict(report, verdict, local.height(), &local_tip) {
+        mark_fresh_tip_trusted(settings, local);
+        return true;
+    }
+    // Preserve HF125/HF126 permission for an acknowledged higher local suffix
+    // or an ordinary equal-height PoW tie. Neither is an exact freshness proof.
+    if !pending && ((best_height > 0 && best_height < local.height()
+        && local_chain_contains_tip(local, best_height, &best_tip))
+        || hf126_is_same_height_competing_tip(local.height(), &local_tip, best_height, &best_tip)) {
+        mark_fresh_tip_trusted(settings, local);
+        return true;
+    }
+    false
+}
+
+fn hf131_parent_is_behind(parent_height: u32, official_height: u32, direct_quorum_height: u32) -> bool {
+    official_height > parent_height || direct_quorum_height > parent_height
 }
 
 fn local_is_at_or_past_tip(local: &ChainState, height: u32, tip_hash: &str) -> bool {
@@ -2141,6 +2545,7 @@ fn fresh_tip_still_matches_light_network(
     local: &ChainState,
     timeout_ms: u64,
 ) -> bool {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     if !fresh_tip_is_trusted(settings, local) {
         return false;
     }
@@ -2152,7 +2557,12 @@ fn fresh_tip_still_matches_light_network(
     // trust cache and hashes an old parent.
     if settings.network.name == "mainnet" {
         let mut report = P2PSyncReport::default();
-        return hf104_canonical_greenlight(settings, &mut report, local, timeout_ms.max(1_200));
+        return hf104_canonical_greenlight(
+            settings,
+            &mut report,
+            local,
+            timeout_ms.clamp(100, 1_200),
+        );
     }
 
     let mut best_height = 0u32;
@@ -2189,16 +2599,16 @@ fn best_reachable_peer_tip(
     max_peers: usize,
     timeout_ms: u64,
 ) -> Result<(usize, u32, String)> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let mut contacted = 0usize;
     let mut best_height = 0u32;
     let mut best_tip = String::new();
-    let deadline = Instant::now()
-        + Duration::from_millis(
-            timeout_ms
-                .max(150)
-                .saturating_mul(max_peers.max(1) as u64)
-                .min(4_000),
-        );
+    // `timeout_ms` is an end-to-end probe deadline, not a fresh allowance for
+    // each registry row. Multiplying it by peer count made a light tip check
+    // occupy the sync/mining worker for several seconds.
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(100, 4_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     for addr in prioritized_outbound_peers(settings, max_peers.max(1))? {
         if Instant::now() >= deadline {
             break;
@@ -2210,7 +2620,7 @@ fn best_reachable_peer_tip(
         match probe_peer(
             settings,
             &addr,
-            left.min(Duration::from_millis(timeout_ms.max(120))),
+            left.min(Duration::from_millis(700)),
         ) {
             Ok(info) => {
                 contacted = contacted.saturating_add(1);
@@ -2234,81 +2644,61 @@ fn best_reachable_peer_tip(
 /// pause mining by itself.
 fn hf113_peer_quorum_greenlight(
     settings: &Settings,
+    report: &mut P2PSyncReport,
     local: &ChainState,
     max_peers: usize,
     timeout_ms: u64,
 ) -> bool {
-    let Ok(peers) = prioritized_outbound_peers(settings, max_peers.max(3).min(16)) else {
-        return false;
-    };
-    let mut contacted = 0usize;
-    let mut compatible = 0usize;
-    let mut same_tip = 0usize;
-    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
-    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
-    let local_height = local.height();
-    let local_tip = local.tip_hash().to_string();
-    let per_peer = Duration::from_millis(timeout_ms.max(120).min(700));
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let observations = hf131_direct_observations(settings, max_peers, deadline);
+    let tip = local.tip_hash().to_string();
+    let view = hf131_parent_view(local.height(), &tip, observations);
+    report.peers_contacted = report.peers_contacted.max(view.contacted);
+    hf129_observe_tip(report, view.ahead_height, "");
+    let verdict = hf130_quorum_verdict(view.exact, view.ahead_height > local.height(),
+        !view.conflicts.is_empty(), settings.network.name == "mainnet" && !pending_block_relay_waiting(settings, local));
+    let allowed = hf130_apply_quorum_verdict(report, verdict, local.height(), &tip);
+    if allowed { mark_fresh_tip_trusted(settings, local); }
+    allowed
+}
 
-    for addr in peers.into_iter() {
-        if should_skip_outbound(settings, &addr) {
-            continue;
-        }
-        let Ok(info) = probe_peer(settings, &addr, per_peer) else {
-            continue;
-        };
-        if info.height == 0 {
-            continue;
-        }
-        contacted = contacted.saturating_add(1);
-        if info.height > local_height {
-            *ahead_counts
-                .entry((info.height, info.tip_hash.clone()))
-                .or_insert(0) += 1;
-            continue;
-        }
-        if info.height == local_height
-            && !info.tip_hash.trim().is_empty()
-            && info.tip_hash != local_tip
-        {
-            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
-            continue;
-        }
-        if local_is_at_or_past_tip(local, info.height, &info.tip_hash) {
-            compatible = compatible.saturating_add(1);
-            if info.height == local_height
-                && !info.tip_hash.trim().is_empty()
-                && info.tip_hash == local_tip
-            {
-                same_tip = same_tip.saturating_add(1);
-            }
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hf130QuorumVerdict { Rejected, Exact, MineableTie }
 
-    // Two directly reachable peers agreeing on a future tip means we should not
-    // green-light the old parent. One peer alone is not enough; it could be a
-    // stale/private/future telemetry row.
-    if ahead_counts.values().any(|count| *count >= 2) {
-        return false;
+fn hf130_quorum_verdict(
+    exact_matches: usize,
+    ahead_quorum: bool,
+    conflicting_quorum: bool,
+    tie_mineable: bool,
+) -> Hf130QuorumVerdict {
+    if ahead_quorum {
+        Hf130QuorumVerdict::Rejected
+    } else if conflicting_quorum {
+        if tie_mineable { Hf130QuorumVerdict::MineableTie } else { Hf130QuorumVerdict::Rejected }
+    } else if exact_matches >= 2 {
+        Hf130QuorumVerdict::Exact
+    } else {
+        Hf130QuorumVerdict::Rejected
     }
-    if conflict_counts.values().any(|count| *count >= 2) {
-        if settings.network.name == "mainnet" && !pending_block_relay_waiting(settings, local) {
-            // HF126: two peers reporting the same-height sibling prove a live
-            // PoW tie, not an invalid parent. Keep ordinary validated branches
-            // mineable so cumulative work can resolve the tie. A locally mined,
-            // unacknowledged tip still enters the verified re-anchor path.
-            mark_fresh_tip_trusted(settings, local);
-            return true;
-        }
-        return false;
-    }
+}
 
-    // HF114: fallback green-light also needs two peers to acknowledge the exact
-    // current tip. Compatible older ancestors are telemetry only; using them as OK
-    // made local-ahead self-mined branches look canonical during seed outages.
-    let _ = contacted;
-    let _ = compatible;
-    same_tip >= 2
+fn hf130_apply_quorum_verdict(
+    report: &mut P2PSyncReport,
+    verdict: Hf130QuorumVerdict,
+    local_height: u32,
+    local_tip: &str,
+) -> bool {
+    // A newer tie/veto cannot retain an exact proof from an earlier pass.
+    report.canonical_proof = if verdict == Hf130QuorumVerdict::Exact {
+        Some(Hf130CanonicalProof {
+            height: local_height,
+            tip_hash: local_tip.to_string(),
+            observed_at: Instant::now(),
+            source: Hf130CanonicalEvidence::DirectQuorum,
+        })
+    } else { None };
+    report.canonical_tip_proven = report.canonical_proof.is_some();
+    verdict != Hf130QuorumVerdict::Rejected
 }
 
 fn hf115_direct_parent_ack_quorum(
@@ -2318,45 +2708,11 @@ fn hf115_direct_parent_ack_quorum(
     max_peers: usize,
     timeout_ms: u64,
 ) -> bool {
-    if settings.network.name != "mainnet" {
-        return false;
-    }
-    let Ok(peers) = prioritized_outbound_peers(settings, max_peers.max(3).min(16)) else {
-        return false;
-    };
-    let mut same_parent = 0usize;
-    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
-    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
-    let per_peer = Duration::from_millis(timeout_ms.max(120).min(700));
-    for addr in peers.into_iter() {
-        if should_skip_outbound(settings, &addr) {
-            continue;
-        }
-        let Ok(info) = probe_peer(settings, &addr, per_peer) else {
-            continue;
-        };
-        if info.height == 0 {
-            continue;
-        }
-        if info.height > parent_height {
-            *ahead_counts
-                .entry((info.height, info.tip_hash.clone()))
-                .or_insert(0) += 1;
-        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() {
-            if info.tip_hash == parent_hash {
-                same_parent = same_parent.saturating_add(1);
-            } else {
-                *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    if ahead_counts.values().any(|count| *count >= 2) {
-        return false;
-    }
-    if conflict_counts.values().any(|count| *count >= 2) {
-        return false;
-    }
-    same_parent >= 2
+    if settings.network.name != "mainnet" { return false; }
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let observations = hf131_direct_observations(settings, max_peers, deadline);
+    let view = hf131_parent_view(parent_height, parent_hash, observations);
+    view.exact >= 2 && view.ahead_height == 0 && view.conflicts.is_empty()
 }
 
 /// HF113/v1.7.1: lightweight active-mining pause probe. This is intentionally
@@ -2369,127 +2725,48 @@ pub fn hf113_live_tip_pause_reason(
     parent_hash: Hash256,
     timeout_ms: u64,
 ) -> Option<String> {
-    if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan")
-    {
+    let _scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan") {
         return None;
     }
     let parent_hash_s = parent_hash.to_string();
-
-    if let Ok((contacted, official_h, official_tip)) =
-        best_official_peer_tip(settings, timeout_ms.max(180).min(900))
-    {
-        if contacted > 0 {
-            if official_h > parent_height {
-                return Some(format!(
-                    "official seed moved to #{} while candidate parent is #{}",
-                    official_h, parent_height
-                ));
+    let (official, http, direct) = hf131_observe_parent(settings, parent_height, &parent_hash_s, 12, timeout_ms);
+    let official_height = official.as_ref().filter(|(count, _, _)| *count > 0)
+        .map(|(_, height, _)| *height).unwrap_or(0);
+    let http_height = http.as_ref().map(|(height, _)| *height).unwrap_or(0);
+    if hf131_parent_is_behind(parent_height, official_height.max(http_height), direct.ahead_height) {
+        return Some(format!("live network view advanced to #{} while candidate parent is #{}",
+            official_height.max(http_height).max(direct.ahead_height), parent_height));
+    }
+    if settings.network.name != "mainnet" && !direct.conflicts.is_empty() {
+        return Some(format!("direct peer quorum disagrees at candidate parent #{}", parent_height));
+    }
+    if let Some((count, height, tip)) = official {
+        if count > 0 && settings.network.name == "mainnet" && (height < parent_height || tip.trim().is_empty()) {
+            let http_exact = http.as_ref().map_or(false, |(h, hash)| *h == parent_height && hash == &parent_hash_s);
+            if (http_exact || direct.exact >= 2) && direct.conflicts.is_empty() { return None; }
+            // An older seed is not authority to stop an already acknowledged
+            // local suffix. Verify ancestry against the exact active parent.
+            if let Ok(local) = load_chain_for_hf90_catchup(settings) {
+                if local.height() == parent_height && local.tip_hash() == parent_hash
+                    && local_chain_contains_tip(&local, height, &tip)
+                    && !pending_block_relay_waiting(settings, &local) { return None; }
             }
-            if settings.network.name == "mainnet" && official_h < parent_height {
-                if hf115_http_tip_acknowledges_parent(
-                    settings,
-                    parent_height,
-                    &parent_hash_s,
-                    timeout_ms.max(900),
-                ) || hf115_direct_parent_ack_quorum(
-                    settings,
-                    parent_height,
-                    &parent_hash_s,
-                    12,
-                    timeout_ms.max(420),
-                ) {
-                    return None;
-                }
-                return Some(format!("candidate parent #{} is ahead of official seed tip #{}; waiting for HF116 canonical acknowledgement/re-anchor", parent_height, official_h));
-            }
-            if official_h == parent_height {
-                if official_tip.trim().is_empty() && settings.network.name == "mainnet" {
-                    if hf115_http_tip_acknowledges_parent(
-                        settings,
-                        parent_height,
-                        &parent_hash_s,
-                        timeout_ms.max(900),
-                    ) {
-                        return None;
-                    }
-                    return Some(format!(
-                        "official seed did not acknowledge candidate parent hash at #{}",
-                        parent_height
-                    ));
-                }
-                if !official_tip.trim().is_empty() && official_tip != parent_hash_s {
-                    // HF126/v1.8.2: an equal-height sibling is a normal PoW tie,
-                    // not proof that the active candidate became invalid. The
-                    // next higher-work block or the verified pending-tip re-anchor
-                    // resolves it without globally stopping hashers.
-                    return None;
-                }
-            }
-            return None;
+            return Some(format!("candidate parent #{} awaits live acknowledgement; sampled seed is #{}", parent_height, height));
         }
     }
-
-    // If no official seed could be sampled, use direct peer quorum only. A single
-    // high/future peer is ignored so the old orange/future-tip problem cannot
-    // stop otherwise healthy miners. HF114 additionally requires two peers to
-    // acknowledge the exact candidate parent before mainnet miners keep hashing
-    // during a seed outage; older compatible ancestors are not enough.
-    let Ok(peers) = prioritized_outbound_peers(settings, 12) else {
-        return None;
-    };
-    let mut contacted = 0usize;
-    let mut same_parent = 0usize;
-    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
-    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
-    let per_peer = Duration::from_millis(timeout_ms.max(120).min(550));
-    for addr in peers.into_iter() {
-        let Ok(info) = probe_peer(settings, &addr, per_peer) else {
-            continue;
-        };
-        if info.height == 0 {
-            continue;
-        }
-        contacted = contacted.saturating_add(1);
-        if info.height > parent_height {
-            *ahead_counts
-                .entry((info.height, info.tip_hash.clone()))
-                .or_insert(0) += 1;
-        } else if info.height == parent_height && !info.tip_hash.trim().is_empty() {
-            if info.tip_hash == parent_hash_s {
-                same_parent = same_parent.saturating_add(1);
-            } else {
-                *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
-            }
-        }
-    }
-    if let Some(((height, _), count)) = ahead_counts.iter().find(|(_, count)| **count >= 2) {
-        return Some(format!(
-            "direct peer quorum ({count}) moved to #{} while candidate parent is #{}",
-            height, parent_height
-        ));
-    }
-    if let Some((_, count)) = conflict_counts.iter().find(|(_, count)| **count >= 2) {
-        if settings.network.name != "mainnet" {
-            return Some(format!(
-                "direct peer quorum ({count}) disagrees at candidate parent #{}",
-                parent_height
-            ));
-        }
-        return None;
-    }
-    if settings.network.name == "mainnet" && contacted >= 2 && same_parent < 2 {
-        // HF126: absence of a two-peer acknowledgement at the same height is
-        // not sufficient to invalidate a parent. Only an ahead/higher-work view
-        // stops the round; equal-height competition remains live.
-        return None;
-    }
+    // Absence of observations does not invalidate an already running parent.
+    // The next candidate still passes the strict canonical/relay gates. Normal
+    // same-height PoW competition retains HF126's mining permission.
     None
 }
+
 fn best_known_live_tip(
     settings: &Settings,
     report: &mut P2PSyncReport,
     timeout_ms: u64,
 ) -> (usize, u32, String) {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let (official_contacted, official_height, official_tip) =
         official_tip_summary(settings, report, timeout_ms.max(150));
     if settings.network.name == "mainnet" {
@@ -2501,7 +2778,7 @@ fn best_known_live_tip(
     let (direct_contacted, direct_height, direct_tip) =
         best_reachable_peer_tip(settings, 8, timeout_ms.max(150)).unwrap_or((0, 0, String::new()));
     report.peers_contacted = report.peers_contacted.saturating_add(direct_contacted);
-    report.best_peer_height = report.best_peer_height.max(direct_height);
+    hf129_observe_tip(report, direct_height, &direct_tip);
     if direct_height > official_height {
         (
             official_contacted.saturating_add(direct_contacted),
@@ -2518,17 +2795,38 @@ fn best_known_live_tip(
 }
 
 fn hf97_visible_tip(settings: &Settings, timeout_ms: u64) -> (usize, u32, String) {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let total_budget = timeout_ms.clamp(100, 3_000);
+    let deadline = Instant::now() + Duration::from_millis(total_budget);
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let probe_budget = total_budget.saturating_sub(100).max(100);
+    let inherited = hf130_io_context();
+    let (direct_observation, http_observation) = thread::scope(|scope| {
+        let direct = scope.spawn(|| {
+            let _scope = Hf130IoScope::enter(inherited.clone());
+            best_official_peer_tip(settings, probe_budget).ok()
+        });
+        let http = scope.spawn(|| {
+            let _scope = Hf130IoScope::enter(inherited.clone());
+            official_http_tip(settings, probe_budget).ok().flatten()
+        });
+        (
+            direct.join().ok().flatten(),
+            http.join().ok().flatten(),
+        )
+    });
     let mut contacted = 0usize;
     let mut best_height = 0u32;
     let mut best_tip = String::new();
-    if let Ok((c, h, tip)) = best_official_peer_tip(settings, timeout_ms.max(150)) {
+    if let Some((c, h, tip)) = direct_observation {
         contacted = contacted.saturating_add(c);
         if h > best_height || (h == best_height && !tip.trim().is_empty()) {
             best_height = h;
             best_tip = tip;
         }
     }
-    if let Ok(Some((h, tip))) = official_http_tip(settings, timeout_ms.max(700)) {
+    if let Some((h, tip)) = http_observation {
         contacted = contacted.saturating_add(1);
         if h > best_height || (h == best_height && !tip.trim().is_empty()) {
             best_height = h;
@@ -2540,11 +2838,14 @@ fn hf97_visible_tip(settings: &Settings, timeout_ms: u64) -> (usize, u32, String
     // visible tip instead of chasing ghost/private/pool branches. Test/regtest can
     // still use generic reachable peers for developer diagnostics.
     if best_height == 0 && settings.network.name != "mainnet" {
-        if let Ok((c, h, tip)) = best_reachable_peer_tip(settings, 8, timeout_ms.max(150)) {
-            contacted = contacted.saturating_add(c);
-            if h > best_height || (h == best_height && !tip.trim().is_empty()) {
-                best_height = h;
-                best_tip = tip;
+        let peer_budget = remaining_ms(deadline);
+        if peer_budget >= 100 {
+            if let Ok((c, h, tip)) = best_reachable_peer_tip(settings, 8, peer_budget) {
+                contacted = contacted.saturating_add(c);
+                if h > best_height || (h == best_height && !tip.trim().is_empty()) {
+                    best_height = h;
+                    best_tip = tip;
+                }
             }
         }
     }
@@ -2556,9 +2857,195 @@ fn hf82_catchup_gate() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+static HF129_PRIORITY_CATCHUP_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// A complete public sync/mining workflow may call the coordinated ladder
+    /// internally. Keep the process-wide mutex re-entrant only for that same
+    /// thread so one permit can cover the whole mutation workflow without
+    /// deadlocking its nested repair stages.
+    static HF129_CATCHUP_WRITER_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static HF132_DEFERRED_CHAIN_RELAY: RefCell<Option<(Settings, Option<String>)>> = const { RefCell::new(None) };
+}
+
+struct Hf129CatchupWriter {
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Hf129CatchupWriter {
+    fn nested() -> Option<Self> {
+        HF129_CATCHUP_WRITER_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current == 0 {
+                None
+            } else {
+                depth.set(current.saturating_add(1));
+                Some(Self { _guard: None })
+            }
+        })
+    }
+
+    fn outer(guard: MutexGuard<'static, ()>) -> Self {
+        HF129_CATCHUP_WRITER_DEPTH.with(|depth| {
+            debug_assert_eq!(depth.get(), 0);
+            depth.set(1);
+        });
+        Self {
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for Hf129CatchupWriter {
+    fn drop(&mut self) {
+        let outer_finished = HF129_CATCHUP_WRITER_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0);
+            depth.set(current.saturating_sub(1));
+            current == 1
+        });
+        // Release the writer before scheduling any outbound diffusion. During
+        // bulk sync all accepted chunks coalesce into this one final relay.
+        if outer_finished {
+            drop(self._guard.take());
+            let pending = HF132_DEFERRED_CHAIN_RELAY.with(|slot| slot.borrow_mut().take());
+            if let Some((settings, source)) = pending {
+                hf132_spawn_chain_relay(settings, source);
+            }
+        }
+    }
+}
+
+fn hf132_spawn_chain_relay(settings: Settings, source: Option<String>) {
+    hf127_spawn_detached("qub-sync-chain-diffusion", move || {
+        let _scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(6));
+        let _ = relay_chain_to_known_peers(&settings, source.as_deref());
+    });
+}
+
+fn hf132_defer_chain_relay(settings: &Settings, source: &str) {
+    let pending = (settings.clone(), Some(source.to_string()));
+    if HF129_CATCHUP_WRITER_DEPTH.with(|depth| depth.get() > 0) {
+        HF132_DEFERRED_CHAIN_RELAY.with(|slot| *slot.borrow_mut() = Some(pending));
+    } else {
+        hf132_spawn_chain_relay(pending.0, pending.1);
+    }
+}
+
+struct Hf129PriorityWaiter;
+
+impl Hf129PriorityWaiter {
+    fn begin() -> Self {
+        HF129_PRIORITY_CATCHUP_WAITERS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Hf129PriorityWaiter {
+    fn drop(&mut self) {
+        HF129_PRIORITY_CATCHUP_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// HF129/v1.8.5 process-wide catch-up coordinator. Background pulses coalesce
+/// immediately, but manual/mining repair waits for the real writer instead of
+/// consuming a UI request and returning a false-success local report.
+fn hf129_acquire_catchup_writer(
+    priority: bool,
+    deadline: Instant,
+) -> Result<Option<Hf129CatchupWriter>> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(deadline);
+    match hf130_io_remaining(deadline) {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    if let Some(nested) = Hf129CatchupWriter::nested() {
+        return Ok(Some(nested));
+    }
+    if !priority {
+        if HF129_PRIORITY_CATCHUP_WAITERS.load(Ordering::SeqCst) > 0 {
+            return Ok(None);
+        }
+        return match hf82_catchup_gate().try_lock() {
+            Ok(guard) => Ok(Some(Hf129CatchupWriter::outer(guard))),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => bail!("catch-up writer mutex poisoned"),
+        };
+    }
+
+    let _waiter = Hf129PriorityWaiter::begin();
+    loop {
+        match hf130_io_remaining(deadline) {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        match hf82_catchup_gate().try_lock() {
+            Ok(guard) => return Ok(Some(Hf129CatchupWriter::outer(guard))),
+            Err(TryLockError::Poisoned(_)) => bail!("catch-up writer mutex poisoned"),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let left = match hf130_io_remaining(deadline) {
+            Ok(left) => left,
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        thread::sleep(left.min(Duration::from_millis(50)));
+    }
+}
+
+fn hf129_mark_writer_busy(report: &mut P2PSyncReport, reason: &str) {
+    report.writer_busy = true;
+    report.sync_reason = reason.to_string();
+    report.terminal = "busy".to_string();
+}
+
+fn hf129_mark_writer_acquired(
+    report: &mut P2PSyncReport,
+    reason: &str,
+    before: &ChainState,
+) {
+    report.writer_acquired = true;
+    report.sync_reason = reason.to_string();
+    report.before_height = before.height();
+    report.before_tip_hash = before.tip_hash().to_string();
+}
+
+fn hf129_note_canonical_greenlight(
+    report: &mut P2PSyncReport,
+    green: bool,
+) -> bool {
+    if green {
+        hf129_mark_canonical_tip_proven(report);
+    }
+    green
+}
+
+fn hf129_acquire_sync_step(
+    settings: &Settings,
+    report: &mut P2PSyncReport,
+    wait_timeout_ms: u64,
+    priority: bool,
+    reason: &str,
+) -> Result<Option<Hf129CatchupWriter>> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(wait_timeout_ms));
+    let deadline = Instant::now()
+        + Duration::from_millis(wait_timeout_ms.clamp(1_000, 30_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let Some(guard) = hf129_acquire_catchup_writer(priority, deadline)? else {
+        hf129_mark_writer_busy(report, reason);
+        return Ok(None);
+    };
+    let before = load_chain_for_hf90_catchup(settings)?;
+    hf129_mark_writer_acquired(report, reason, &before);
+    Ok(Some(guard))
+}
+
 fn remaining_ms(deadline: Instant) -> u64 {
-    deadline
-        .saturating_duration_since(Instant::now())
+    hf130_io_remaining(deadline)
+        .unwrap_or(Duration::ZERO)
         .as_millis()
         .min(u64::MAX as u128) as u64
 }
@@ -2568,25 +3055,50 @@ fn hf82_catchup_impl(
     total_timeout_ms: u64,
     allow_full_snapshot: bool,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
 
-    // Single-flight guard: do not let startup refresh, wallet sync, miner green-light,
-    // pool worker, tx builder and embedded node all run chain repair at once. If a
-    // catch-up is already active, return the current local view immediately; the
-    // active worker will update chain.json and the next UI tick will observe it.
-    let _guard = match hf82_catchup_gate().try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return finish_report(settings, report),
+    let priority = allow_full_snapshot;
+    let overall_deadline = Instant::now()
+        + Duration::from_millis(total_timeout_ms.clamp(1_500, 90_000));
+    let overall_deadline = hf130_effective_deadline(overall_deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(overall_deadline);
+    let _guard = match hf129_acquire_catchup_writer(priority, overall_deadline)? {
+        Some(guard) => guard,
+        None => {
+            hf129_mark_writer_busy(
+                &mut report,
+                if priority { "legacy-priority" } else { "legacy-auto" },
+            );
+            return finish_report(settings, report);
+        }
     };
+    if priority && remaining_ms(overall_deadline) < 1_200 {
+        drop(_guard);
+        hf129_mark_writer_busy(&mut report, "legacy-priority-deadline");
+        return finish_report(settings, report);
+    }
 
-    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.clamp(1_500, 90_000));
+    let deadline = overall_deadline;
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let mut local = load_chain_for_hf90_catchup(settings)?;
+    hf129_mark_writer_acquired(
+        &mut report,
+        if priority { "legacy-priority" } else { "legacy-auto" },
+        &local,
+    );
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     report.height = local.height();
     report.tip_hash = local.tip_hash().to_string();
+
+    let direct_budget = remaining_ms(deadline).min(4_000);
+    if direct_budget >= 1_200 {
+        hf131_sync_direct_before_snapshots(settings, &mut report, direct_budget);
+    }
 
     // 1) Fast official missing-suffix path. This is the common behind-by-1..N case
     // and should never touch full snapshots.
@@ -2600,6 +3112,7 @@ fn hf82_catchup_impl(
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     if fresh_tip_still_matches_light_network(settings, &local, HF82_LIGHT_TIP_PROBE_MS) {
         mark_fresh_tip_trusted(settings, &local);
+        hf129_mark_canonical_tip_proven(&mut report);
         return finish_report(settings, report);
     }
 
@@ -2611,7 +3124,7 @@ fn hf82_catchup_impl(
         if let Ok(Some((http_h, http_tip))) =
             official_http_tip(settings, left.min(2_200).max(1_500))
         {
-            report.best_peer_height = report.best_peer_height.max(http_h);
+            hf129_observe_tip(&mut report, http_h, &http_tip);
             let wrong_same_height =
                 http_h == local.height() && !http_tip.trim().is_empty() && http_tip != local_tip;
             if http_h > local.height() || wrong_same_height {
@@ -2627,6 +3140,7 @@ fn hf82_catchup_impl(
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     if fresh_tip_still_matches_light_network(settings, &local, HF82_LIGHT_TIP_PROBE_MS) {
         mark_fresh_tip_trusted(settings, &local);
+        hf129_mark_canonical_tip_proven(&mut report);
         return finish_report(settings, report);
     }
 
@@ -2646,6 +3160,7 @@ fn hf82_catchup_impl(
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     if fresh_tip_still_matches_light_network(settings, &local, HF82_LIGHT_TIP_PROBE_MS) {
         mark_fresh_tip_trusted(settings, &local);
+        hf129_mark_canonical_tip_proven(&mut report);
         return finish_report(settings, report);
     }
 
@@ -2665,6 +3180,7 @@ fn hf82_catchup_impl(
 }
 
 pub fn hf82_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf82_catchup_impl(
         settings,
         total_timeout_ms.min(HF82_AUTO_CATCHUP_MS).max(1_500),
@@ -2673,6 +3189,7 @@ pub fn hf82_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P
 }
 
 pub fn hf82_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf82_catchup_impl(
         settings,
         total_timeout_ms.min(HF82_MINING_CATCHUP_MS).max(2_500),
@@ -2681,6 +3198,7 @@ pub fn hf82_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
 }
 
 pub fn hf82_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf82_catchup_impl(settings, total_timeout_ms.max(8_000), true)
 }
 
@@ -2689,12 +3207,30 @@ fn hf85_catchup_pulse(
     total_timeout_ms: u64,
     allow_full_snapshot: bool,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
 
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.clamp(1_500, 60_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        remaining_ms(deadline),
+        allow_full_snapshot,
+        if allow_full_snapshot {
+            "hf85-priority-workflow"
+        } else {
+            "hf85-auto-workflow"
+        },
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
     // HF88/v1.6.2: no recursive self-heal and no global P2P gate here. This is
     // a one-shot pulse intended for detached GUI workers and mining green-light.
@@ -2759,6 +3295,7 @@ fn hf85_catchup_pulse(
 }
 
 pub fn hf85_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     // HF88: background auto pulses are intentionally append/tail only. Full
     // snapshot repair is reserved for manual Sync/Repair or mining workers so
     // the GUI cannot starve its first local wallet/block snapshot.
@@ -2766,12 +3303,14 @@ pub fn hf85_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P
 }
 
 pub fn hf85_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     // Worker-thread mining green-light can also use the canonical HTTP snapshot
     // fallback to avoid infinite one/few-block-behind loops.
     hf85_catchup_pulse(settings, total_timeout_ms.min(16_000).max(2_500), true)
 }
 
 pub fn hf85_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf85_catchup_pulse(settings, total_timeout_ms.max(8_000), true)
 }
 
@@ -2780,7 +3319,21 @@ pub fn hf85_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
 /// local chain. This runs off the UI thread and is single-purpose: make nodes
 /// that were left open overnight catch up again without manual babysitting.
 pub fn hf86_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
-    let mut report = hf85_catchup_pulse(settings, total_timeout_ms.min(12_000).max(2_000), false)?;
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        total_timeout_ms,
+        false,
+        "hf86-auto-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, workflow_report),
+    };
+    let mut report = workflow_report;
+    let pulse = hf85_catchup_pulse(settings, total_timeout_ms.min(12_000).max(2_000), false)?;
+    merge_sync_reports(&mut report, pulse);
     let local_now = load_chain_for_hf90_catchup(settings).ok();
     let local_h = local_now
         .as_ref()
@@ -2791,7 +3344,7 @@ pub fn hf86_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P
         .map(|c| c.tip_hash().to_string())
         .unwrap_or_default();
     if let Ok(Some((official_h, official_tip))) = official_http_tip(settings, 2_500) {
-        report.best_peer_height = report.best_peer_height.max(official_h);
+        hf129_observe_tip(&mut report, official_h, &official_tip);
         let same_height_wrong_tip =
             official_h == local_h && !official_tip.trim().is_empty() && official_tip != local_tip;
         if official_h > local_h || same_height_wrong_tip {
@@ -2806,7 +3359,21 @@ pub fn hf86_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P
 }
 
 pub fn hf86_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
-    let mut report = hf85_manual_catchup(settings, total_timeout_ms.max(12_000))?;
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "hf86-manual-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, workflow_report),
+    };
+    let mut report = workflow_report;
+    let pulse = hf85_manual_catchup(settings, total_timeout_ms.max(12_000))?;
+    merge_sync_reports(&mut report, pulse);
     let local_now = load_chain_for_hf90_catchup(settings).ok();
     let local_h = local_now
         .as_ref()
@@ -2817,7 +3384,7 @@ pub fn hf86_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
         .map(|c| c.tip_hash().to_string())
         .unwrap_or_default();
     if let Ok(Some((official_h, official_tip))) = official_http_tip(settings, 3_000) {
-        report.best_peer_height = report.best_peer_height.max(official_h);
+        hf129_observe_tip(&mut report, official_h, &official_tip);
         let same_height_wrong_tip =
             official_h == local_h && !official_tip.trim().is_empty() && official_tip != local_tip;
         if official_h > local_h || same_height_wrong_tip {
@@ -2832,7 +3399,21 @@ pub fn hf86_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
 }
 
 pub fn hf86_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
-    let mut report = hf85_mining_catchup(settings, total_timeout_ms.max(8_000))?;
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "hf86-mining-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, workflow_report),
+    };
+    let mut report = workflow_report;
+    let pulse = hf85_mining_catchup(settings, total_timeout_ms.max(8_000))?;
+    merge_sync_reports(&mut report, pulse);
     let local_now = load_chain_for_hf90_catchup(settings).ok();
     let local_h = local_now
         .as_ref()
@@ -2843,7 +3424,7 @@ pub fn hf86_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
         .map(|c| c.tip_hash().to_string())
         .unwrap_or_default();
     if let Ok(Some((official_h, official_tip))) = official_http_tip(settings, 2_500) {
-        report.best_peer_height = report.best_peer_height.max(official_h);
+        hf129_observe_tip(&mut report, official_h, &official_tip);
         let same_height_wrong_tip =
             official_h == local_h && !official_tip.trim().is_empty() && official_tip != local_tip;
         if official_h > local_h || same_height_wrong_tip {
@@ -2868,35 +3449,47 @@ fn hf88_best_tip(
     report: &mut P2PSyncReport,
     timeout_ms: u64,
 ) -> (u32, String) {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let mut best_h = 0u32;
     let mut best_tip = String::new();
-    if let Ok(Some((h, tip))) = official_http_tip(settings, timeout_ms.min(2_000).max(700)) {
-        report.peers_contacted = report.peers_contacted.saturating_add(1);
-        report.best_peer_height = report.best_peer_height.max(h);
-        best_h = h;
-        best_tip = tip;
-    }
-    if let Ok((contacted, h, tip)) = best_official_peer_tip(settings, timeout_ms.min(900).max(250))
-    {
-        report.peers_contacted = report.peers_contacted.saturating_add(contacted);
-        report.best_peer_height = report.best_peer_height.max(h);
-        if h > best_h || (h == best_h && !tip.trim().is_empty()) {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(100));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let http_budget = remaining_ms(deadline).min(2_000);
+    if http_budget >= 100 {
+        if let Ok(Some((h, tip))) = official_http_tip(settings, http_budget) {
+            report.peers_contacted = report.peers_contacted.saturating_add(1);
+            hf129_observe_tip(report, h, &tip);
             best_h = h;
             best_tip = tip;
+        }
+    }
+    let tcp_budget = remaining_ms(deadline).min(900);
+    if tcp_budget >= 100 {
+        if let Ok((contacted, h, tip)) = best_official_peer_tip(settings, tcp_budget) {
+            report.peers_contacted = report.peers_contacted.saturating_add(contacted);
+            hf129_observe_tip(report, h, &tip);
+            if h > best_h || (h == best_h && !tip.trim().is_empty()) {
+                best_h = h;
+                best_tip = tip;
+            }
         }
     }
     // HF107: for canonical catch-up/mining, do not let a random reachable peer
     // outrank official seed/HTTP tips. On mainnet, if official sources are absent,
     // return no canonical target and let mining wait; peer tips remain telemetry.
     if best_h == 0 && settings.network.name != "mainnet" {
-        if let Ok((contacted, h, tip)) =
-            best_reachable_peer_tip(settings, 6, timeout_ms.min(700).max(220))
-        {
-            report.peers_contacted = report.peers_contacted.saturating_add(contacted);
-            report.best_peer_height = report.best_peer_height.max(h);
-            if h > best_h || (h == best_h && !tip.trim().is_empty()) {
-                best_h = h;
-                best_tip = tip;
+        let peer_budget = remaining_ms(deadline).min(700);
+        if peer_budget >= 100 {
+            if let Ok((contacted, h, tip)) =
+                best_reachable_peer_tip(settings, 6, peer_budget)
+            {
+                report.peers_contacted = report.peers_contacted.saturating_add(contacted);
+                hf129_observe_tip(report, h, &tip);
+                if h > best_h || (h == best_h && !tip.trim().is_empty()) {
+                    best_h = h;
+                    best_tip = tip;
+                }
             }
         }
     }
@@ -2908,18 +3501,11 @@ fn hf88_catchup_ladder(
     total_timeout_ms: u64,
     allow_snapshot: bool,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
-
-    // HF107/v1.6.9: one catch-up writer at a time across GUI, embedded P2P,
-    // mining, transaction workers and manual Sync. The UI remains live; extra
-    // callers get the current local view while the active writer advances disk.
-    let _guard = match hf82_catchup_gate().try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return finish_report(settings, report),
-    };
 
     // HF107/v1.6.9: real catch-up, not another cosmetic pulse. HF88/HF89 made the
     // UI transparent, which exposed the exact failure mode: local #N could see
@@ -2933,14 +3519,44 @@ fn hf88_catchup_ladder(
         total_timeout_ms.clamp(90_000, 150_000)
     };
     let deadline = Instant::now() + Duration::from_millis(budget);
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let _guard = match hf129_acquire_catchup_writer(allow_snapshot, deadline)? {
+        Some(guard) => guard,
+        None => {
+            hf129_mark_writer_busy(
+                &mut report,
+                if allow_snapshot { "hf88-priority" } else { "hf88-auto" },
+            );
+            return finish_report(settings, report);
+        }
+    };
+    if allow_snapshot && remaining_ms(deadline) < 2_000 {
+        drop(_guard);
+        hf129_mark_writer_busy(&mut report, "hf88-priority-deadline");
+        return finish_report(settings, report);
+    }
 
-    let before = load_chain_for_hf90_catchup(settings)?;
+    let mut before = load_chain_for_hf90_catchup(settings)?;
+    hf129_mark_writer_acquired(
+        &mut report,
+        if allow_snapshot { "hf88-priority" } else { "hf88-auto" },
+        &before,
+    );
     validate_chain_consensus_checkpoints(settings, &before.blocks)?;
     let mut local_h = before.height();
     let mut local_tip = before.tip_hash().to_string();
     report.height = local_h;
     report.tip_hash = local_tip.clone();
 
+    if remaining_ms(deadline) >= 2_000 {
+        hf131_sync_direct_before_snapshots(settings, &mut report, remaining_ms(deadline).min(18_000));
+        before = load_chain_for_hf90_catchup(settings)?;
+        local_h = before.height();
+        local_tip = before.tip_hash().to_string();
+        report.height = local_h;
+        report.tip_hash = local_tip.clone();
+    }
     let (mut best_h, mut best_tip) = hf88_best_tip(settings, &mut report, 2_500);
     let same_height_wrong_tip =
         best_h == local_h && !best_tip.trim().is_empty() && best_tip != local_tip;
@@ -2950,6 +3566,7 @@ fn hf88_catchup_ladder(
         || !fresh_tip_still_matches_light_network(settings, &before, 1_200);
     if !should_catch {
         mark_fresh_tip_trusted(settings, &before);
+        hf129_mark_canonical_tip_proven(&mut report);
         return finish_report(settings, report);
     }
 
@@ -2989,6 +3606,7 @@ fn hf88_catchup_ladder(
 
             if best_h > 0 && local_is_at_or_past_tip(&current, best_h, &best_tip) {
                 mark_fresh_tip_trusted(settings, &current);
+                hf129_mark_canonical_tip_proven(&mut report);
                 return finish_report(settings, report);
             }
 
@@ -3011,20 +3629,20 @@ fn hf88_catchup_ladder(
             if !should_run {
                 continue;
             }
-            if snapshot_step && left < 6_000 {
-                continue;
-            }
-            if full_http_step && left < 12_000 {
-                continue;
-            }
-
-            let step_budget = left.min(*max_ms).max(if full_http_step {
+            let minimum_budget = if full_http_step {
                 16_000
             } else if snapshot_step {
                 12_000
             } else {
                 3_000
-            });
+            };
+            if left < minimum_budget {
+                continue;
+            }
+            // The remaining overall deadline is authoritative. Raising a short
+            // remainder to a per-step minimum recreated the very post-deadline
+            // 1-3 minute rescue work HF129 is removing.
+            let step_budget = left.min(*max_ms);
             let before_step_h = local_h;
             let before_step_tip = local_tip.clone();
             let res = match *step {
@@ -3053,13 +3671,20 @@ fn hf88_catchup_ladder(
                 no_progress_steps = no_progress_steps.saturating_add(1);
             }
 
-            let (new_best_h, new_best_tip) = hf88_best_tip(settings, &mut report, 1_100);
-            if new_best_h > best_h || (new_best_h == best_h && !new_best_tip.trim().is_empty()) {
-                best_h = new_best_h;
-                best_tip = new_best_tip;
+            let refresh_budget = remaining_ms(deadline).min(1_100);
+            if refresh_budget >= 150 {
+                let (new_best_h, new_best_tip) =
+                    hf88_best_tip(settings, &mut report, refresh_budget);
+                if new_best_h > best_h
+                    || (new_best_h == best_h && !new_best_tip.trim().is_empty())
+                {
+                    best_h = new_best_h;
+                    best_tip = new_best_tip;
+                }
             }
             if best_h > 0 && local_is_at_or_past_tip(&after, best_h, &best_tip) {
                 mark_fresh_tip_trusted(settings, &after);
+                hf129_mark_canonical_tip_proven(&mut report);
                 return finish_report(settings, report);
             }
         }
@@ -3080,11 +3705,11 @@ fn hf88_catchup_ladder(
     if best_h > 0 {
         if let Ok(cur) = load_chain_for_hf90_catchup(settings) {
             if !local_is_at_or_past_tip(&cur, best_h, &best_tip) {
-                if let Ok(full) = sync_official_http_snapshot(
-                    settings,
-                    if allow_snapshot { 120_000 } else { 90_000 },
-                ) {
-                    merge_sync_reports(&mut report, full);
+                let left = remaining_ms(deadline);
+                if left >= 2_000 {
+                    if let Ok(full) = sync_official_http_snapshot(settings, left) {
+                        merge_sync_reports(&mut report, full);
+                    }
                 }
             }
         }
@@ -3093,7 +3718,9 @@ fn hf88_catchup_ladder(
     if let Ok(final_chain) = load_chain_for_hf90_catchup(settings) {
         report.height = final_chain.height();
         report.tip_hash = final_chain.tip_hash().to_string();
-        if hf104_canonical_greenlight(settings, &mut report, &final_chain, 1_200)
+        let canonical_green =
+            hf104_canonical_greenlight(settings, &mut report, &final_chain, 1_200);
+        if hf129_note_canonical_greenlight(&mut report, canonical_green)
             || (settings.network.name != "mainnet"
                 && best_h > 0
                 && local_is_at_or_past_tip(&final_chain, best_h, &best_tip))
@@ -3105,18 +3732,22 @@ fn hf88_catchup_ladder(
 }
 
 pub fn hf88_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf88_catchup_ladder(settings, total_timeout_ms.max(90_000).min(150_000), false)
 }
 
 pub fn hf88_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf88_catchup_ladder(settings, total_timeout_ms.max(90_000).min(180_000), true)
 }
 
 pub fn hf88_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf88_catchup_ladder(settings, total_timeout_ms.max(90_000).min(180_000), true)
 }
 
 pub fn hf90_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf90_catchup_ladder(
         settings,
         total_timeout_ms.clamp(60_000, 600_000),
@@ -3126,6 +3757,7 @@ pub fn hf90_auto_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P
 }
 
 pub fn hf90_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf90_catchup_ladder(
         settings,
         total_timeout_ms.clamp(90_000, 720_000),
@@ -3135,6 +3767,7 @@ pub fn hf90_manual_catchup(settings: &Settings, total_timeout_ms: u64) -> Result
 }
 
 pub fn hf90_mining_catchup(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     hf90_catchup_ladder(
         settings,
         total_timeout_ms.clamp(60_000, 600_000),
@@ -3147,22 +3780,39 @@ pub fn hf110_deep_official_repair(
     settings: &Settings,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
+
+    let deadline = Instant::now()
+        + Duration::from_millis(total_timeout_ms.clamp(180_000, 900_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
 
     // HF111/v1.7.1: this is the heavy but safe repair used by manual Repair and
     // GUI auto-heal when a miner has been behind for too long. It is official-
     // source only: first the fresh HTTP tail/snapshot, then official direct full
     // chain, then suffix/overlap repair. All adopted blocks are consensus-
     // validated by the lower-level repair functions before chain.json is saved.
-    let _guard = match hf82_catchup_gate().try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return finish_report(settings, report),
+    let _guard = match hf129_acquire_catchup_writer(true, deadline)? {
+        Some(guard) => guard,
+        None => {
+            hf129_mark_writer_busy(&mut report, "manual-deep-repair");
+            return finish_report(settings, report);
+        }
     };
-
-    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.clamp(180_000, 900_000));
+    if remaining_ms(deadline) < 5_000 {
+        drop(_guard);
+        hf129_mark_writer_busy(&mut report, "manual-deep-repair-deadline");
+        return finish_report(settings, report);
+    }
+    let before = load_chain_for_hf90_catchup(settings)?;
+    hf129_mark_writer_acquired(&mut report, "manual-deep-repair", &before);
+    if remaining_ms(deadline) >= 2_000 {
+        hf131_sync_direct_before_snapshots(settings, &mut report, remaining_ms(deadline).min(18_000));
+    }
 
     for round in 0..3usize {
         if remaining_ms(deadline) < 5_000 {
@@ -3173,7 +3823,8 @@ pub fn hf110_deep_official_repair(
         report.height = local.height();
         report.tip_hash = local.tip_hash().to_string();
 
-        if hf104_canonical_greenlight(settings, &mut report, &local, 1_500) {
+        let green = hf104_canonical_greenlight(settings, &mut report, &local, 1_500);
+        if hf129_note_canonical_greenlight(&mut report, green) {
             return finish_report(settings, report);
         }
 
@@ -3193,7 +3844,7 @@ pub fn hf110_deep_official_repair(
             if left < 5_000 {
                 break;
             }
-            let budget = left.min(*max_ms).max(8_000);
+            let budget = left.min(*max_ms);
             let res = match *step {
                 "official-http-tail-deep" => sync_official_http_tail(settings, budget),
                 "official-http-full-snapshot-deep" => sync_official_http_snapshot(settings, budget),
@@ -3213,7 +3864,8 @@ pub fn hf110_deep_official_repair(
             validate_chain_consensus_checkpoints(settings, &after.blocks)?;
             report.height = after.height();
             report.tip_hash = after.tip_hash().to_string();
-            if hf104_canonical_greenlight(settings, &mut report, &after, 1_500) {
+            let green = hf104_canonical_greenlight(settings, &mut report, &after, 1_500);
+            if hf129_note_canonical_greenlight(&mut report, green) {
                 return finish_report(settings, report);
             }
         }
@@ -3239,22 +3891,43 @@ fn hf90_catchup_ladder(
     settings: &Settings,
     total_timeout_ms: u64,
     allow_full_snapshot: bool,
-    _reason: &str,
+    reason: &str,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
 
-    // HF107/v1.6.9: one strong catch-up writer at a time inside the process.
-    // GUI, embedded P2P, mining and manual Sync may all ask for repair; only
-    // one should write chain.json while the others keep showing local state.
-    let _guard = match hf82_catchup_gate().try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return finish_report(settings, report),
-    };
-
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(30_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let priority = reason != "auto";
+    let _guard = match hf129_acquire_catchup_writer(priority, deadline)? {
+        Some(guard) => guard,
+        None => {
+            hf129_mark_writer_busy(&mut report, reason);
+            return finish_report(settings, report);
+        }
+    };
+    if priority && remaining_ms(deadline) < 3_000 {
+        drop(_guard);
+        hf129_mark_writer_busy(&mut report, "priority-deadline");
+        return finish_report(settings, report);
+    }
+    let before = load_chain_for_hf90_catchup(settings)?;
+    hf129_mark_writer_acquired(&mut report, reason, &before);
+    if remaining_ms(deadline) >= 2_000 {
+        hf131_sync_direct_before_snapshots(settings, &mut report, remaining_ms(deadline).min(18_000));
+    }
+    if report.blocks_connected > 0 || report.chains_adopted > 0 {
+        let current = load_chain_for_hf90_catchup(settings)?;
+        if hf104_canonical_greenlight(settings, &mut report, &current, remaining_ms(deadline).min(1_200))
+            && hf130_proof_matches_final(&report, current.height(), &current.tip_hash().to_string(),
+                pending_block_relay_waiting(settings, &current)) {
+            return finish_report(settings, report);
+        }
+    }
     let mut no_progress_rounds = 0usize;
 
     for round in 0..4usize {
@@ -3266,15 +3939,24 @@ fn hf90_catchup_ladder(
         report.height = current.height();
         report.tip_hash = current.tip_hash().to_string();
 
-        let (mut best_h, mut best_tip) = hf88_best_tip(settings, &mut report, 2_800);
-        if let Ok((contacted, h, tip)) = best_official_peer_tip(settings, 2_800) {
-            report.peers_contacted = report.peers_contacted.saturating_add(contacted);
-            report.best_peer_height = report.best_peer_height.max(h);
-            if h > best_h || (h == best_h && !tip.trim().is_empty()) {
-                best_h = h;
-                best_tip = tip;
+        let probe_budget = remaining_ms(deadline).min(2_800);
+        if probe_budget < 150 {
+            break;
+        }
+        let (mut best_h, mut best_tip) =
+            hf88_best_tip(settings, &mut report, probe_budget);
+        let official_budget = remaining_ms(deadline).min(2_800);
+        if official_budget >= 150 {
+            if let Ok((contacted, h, tip)) = best_official_peer_tip(settings, official_budget) {
+                report.peers_contacted = report.peers_contacted.saturating_add(contacted);
+                hf129_observe_tip(&mut report, h, &tip);
+                if h > best_h || (h == best_h && !tip.trim().is_empty()) {
+                    best_h = h;
+                    best_tip = tip;
+                }
             }
         }
+        hf129_observe_tip(&mut report, best_h, &best_tip);
 
         let wrong_tip = best_h == current.height()
             && !best_tip.trim().is_empty()
@@ -3285,7 +3967,7 @@ fn hf90_catchup_ladder(
         // path requires multi-source evidence, full replay validation and the
         // explicit equal-work Fast Chain Engine commit policy.
         if wrong_tip && pending_block_relay_waiting(settings, &current) {
-            let budget = remaining_ms(deadline).min(35_000).max(4_000);
+            let budget = remaining_ms(deadline).min(35_000);
             if let Ok(reanchor) = sync_official_http_tail_reanchor_hf114(settings, budget) {
                 merge_sync_reports(&mut report, reanchor);
                 let repaired = load_chain_for_hf90_catchup(settings)?;
@@ -3294,18 +3976,33 @@ fn hf90_catchup_ladder(
                     report.height = repaired.height();
                     report.tip_hash = repaired.tip_hash().to_string();
                     mark_fresh_tip_trusted(settings, &repaired);
+                    hf129_mark_canonical_tip_proven(&mut report);
                     return finish_report(settings, report);
                 }
             }
         }
 
-        if best_h > 0 && local_is_at_or_past_tip(&current, best_h, &best_tip) && !wrong_tip {
+        if best_h > 0
+            && !best_tip.trim().is_empty()
+            && local_is_at_or_past_tip(&current, best_h, &best_tip)
+            && !wrong_tip
+            && !pending_block_relay_waiting(settings, &current)
+        {
             mark_fresh_tip_trusted(settings, &current);
+            if best_h == current.height() && best_tip == current.tip_hash().to_string() {
+                hf130_mark_exact_tip_proven(&mut report, &current, Hf130CanonicalEvidence::OfficialTip);
+            }
             return finish_report(settings, report);
         }
-        if best_h == 0 && fresh_tip_still_matches_light_network(settings, &current, 900) {
-            mark_fresh_tip_trusted(settings, &current);
-            return finish_report(settings, report);
+        if best_h == 0 {
+            let light_budget = remaining_ms(deadline).min(900);
+            if light_budget >= 150
+                && fresh_tip_still_matches_light_network(settings, &current, light_budget)
+            {
+                mark_fresh_tip_trusted(settings, &current);
+                hf129_mark_canonical_tip_proven(&mut report);
+                return finish_report(settings, report);
+            }
         }
 
         let gap = best_h.saturating_sub(current.height());
@@ -3346,15 +4043,7 @@ fn hf90_catchup_ladder(
             if left < 2_500 {
                 break;
             }
-            let full_http_step = *step == "official-http-full-snapshot";
-            let direct_full_step = *step == "official-direct-full-chain";
-            let step_budget = left.min(*max_ms).max(if direct_full_step {
-                18_000
-            } else if full_http_step {
-                16_000
-            } else {
-                2_500
-            });
+            let step_budget = left.min(*max_ms);
             let before_step = load_chain_for_hf90_catchup(settings)?;
             let before_step_h = before_step.height();
             let before_step_tip = before_step.tip_hash().to_string();
@@ -3395,7 +4084,12 @@ fn hf90_catchup_ladder(
                 || after_step.tip_hash().to_string() != before_step_tip
             {
                 no_progress_rounds = 0;
-                let (fresh_h, fresh_tip) = hf88_best_tip(settings, &mut report, 1_800);
+                let fresh_budget = remaining_ms(deadline).min(1_800);
+                let (fresh_h, fresh_tip) = if fresh_budget >= 150 {
+                    hf88_best_tip(settings, &mut report, fresh_budget)
+                } else {
+                    (0, String::new())
+                };
                 let target_h = fresh_h.max(best_h);
                 let target_tip = if fresh_h >= best_h && !fresh_tip.trim().is_empty() {
                     fresh_tip
@@ -3404,8 +4098,13 @@ fn hf90_catchup_ladder(
                 };
                 if target_h == 0 || local_is_at_or_past_tip(&after_step, target_h, &target_tip) {
                     mark_fresh_tip_trusted(settings, &after_step);
+                    hf129_mark_canonical_tip_proven(&mut report);
                     return finish_report(settings, report);
                 }
+                // A moving remote tip after a successful suffix is normal.
+                // Continue the next round from the committed height before
+                // considering expensive snapshot/fork repair again.
+                break;
             }
         }
 
@@ -3422,17 +4121,27 @@ fn hf90_catchup_ladder(
         }
     }
 
-    let (_seen, visible_h, visible_tip) = hf97_visible_tip(settings, 1_200);
+    let probe_budget = remaining_ms(deadline).min(1_200);
+    let (_seen, visible_h, visible_tip) = if probe_budget >= 150 {
+        hf97_visible_tip(settings, probe_budget)
+    } else {
+        (0, report.best_peer_height, report.best_peer_tip_hash.clone())
+    };
     if visible_h > 0 {
         if let Ok(cur) = load_chain_for_hf90_catchup(settings) {
             if !local_is_at_or_past_tip(&cur, visible_h, &visible_tip) {
-                if let Ok(full) = sync_official_http_snapshot(settings, 150_000) {
-                    merge_sync_reports(&mut report, full);
+                let left = remaining_ms(deadline);
+                if left >= 2_500 {
+                    if let Ok(full) = sync_official_http_snapshot(settings, left) {
+                        merge_sync_reports(&mut report, full);
+                    }
                 }
                 if let Ok(cur_after_http) = load_chain_for_hf90_catchup(settings) {
-                    if !local_is_at_or_past_tip(&cur_after_http, visible_h, &visible_tip) {
-                        if let Ok(full_direct) = sync_official_direct_full_chain(settings, 180_000)
-                        {
+                    let left = remaining_ms(deadline);
+                    if left >= 2_500
+                        && !local_is_at_or_past_tip(&cur_after_http, visible_h, &visible_tip)
+                    {
+                        if let Ok(full_direct) = sync_official_direct_full_chain(settings, left) {
                             merge_sync_reports(&mut report, full_direct);
                         }
                     }
@@ -3444,14 +4153,18 @@ fn hf90_catchup_ladder(
     let final_chain = load_chain_for_hf90_catchup(settings)?;
     report.height = final_chain.height();
     report.tip_hash = final_chain.tip_hash().to_string();
-    report.best_peer_height = report.best_peer_height.max(visible_h);
+    hf129_observe_tip(&mut report, visible_h, &visible_tip);
     if visible_h > final_chain.height()
         && !local_is_at_or_past_tip(&final_chain, visible_h, &visible_tip)
     {
         mark_hf97_uncatchable_tip(settings, &final_chain, visible_h);
     }
-    if fresh_tip_still_matches_light_network(settings, &final_chain, 1_200) {
+    let final_light_budget = remaining_ms(deadline).min(1_200);
+    if final_light_budget >= 150
+        && fresh_tip_still_matches_light_network(settings, &final_chain, final_light_budget)
+    {
         mark_fresh_tip_trusted(settings, &final_chain);
+        hf129_mark_canonical_tip_proven(&mut report);
     }
     finish_report(settings, report)
 }
@@ -3462,10 +4175,13 @@ fn hf80_fast_official_catchup(
     local: &mut ChainState,
     total_timeout_ms: u64,
 ) -> Result<()> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     if !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return Ok(());
     }
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let mut last_height = local.height();
     let mut last_tip = local.tip_hash().to_string();
 
@@ -3549,12 +4265,25 @@ fn best_common_height_from_headers(local: &ChainState, headers: &[IndexedHeader]
 /// blocks if they extend the current tip. It is used before mining/manual sync
 /// so the common one-block-behind case cannot fall into long repair loops.
 pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "official-suffix",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(1_500));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     for addr in official_snapshot_peers(settings).into_iter().take(3) {
         if Instant::now() >= deadline {
             break;
@@ -3572,8 +4301,12 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
             continue;
         };
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(3_200)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(3_500)));
+        let io_left = deadline.saturating_duration_since(Instant::now());
+        if io_left.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(io_left.min(Duration::from_millis(3_200))));
+        let _ = stream.set_write_timeout(Some(io_left.min(Duration::from_millis(3_500))));
         let mut reader = BufReader::new(stream.try_clone()?);
 
         let local_before = load_chain_for_hf90_catchup(settings)?;
@@ -3586,6 +4319,8 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
         let _ = send_wire(&mut stream, &WireMessage::GetChain { from_height });
 
         let peer_deadline = Instant::now() + left.min(Duration::from_millis(16_000));
+        let peer_deadline = hf130_effective_deadline(peer_deadline);
+        let _hf130_io_scope = Hf130IoScope::deadline(peer_deadline);
         let mut peer_tip = String::new();
         let mut last_request_at = Instant::now();
         let mut last_progress_at = Instant::now();
@@ -3598,7 +4333,7 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
                 | Ok(WireMessage::Inv {
                     height, tip_hash, ..
                 }) => {
-                    report.best_peer_height = report.best_peer_height.max(height);
+                    hf129_observe_tip(&mut report, height, "");
                     if height >= report.best_peer_height {
                         peer_tip = tip_hash.clone();
                     }
@@ -3619,7 +4354,7 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
                 }
                 Ok(WireMessage::Headers { headers }) => {
                     if let Some(last) = headers.last() {
-                        report.best_peer_height = report.best_peer_height.max(last.height);
+                        hf129_observe_tip(&mut report, last.height, &last.hash);
                         peer_tip = last.hash.clone();
                     }
                 }
@@ -3639,6 +4374,7 @@ pub fn sync_official_suffix(settings: &Settings, total_timeout_ms: u64) -> Resul
                         let mut candidate = local.clone();
                         let mut ok = true;
                         for block in blocks {
+                            hf132_check_sync_budget()?;
                             if let Err(_) = candidate.connect_block(block, settings) {
                                 ok = false;
                                 break;
@@ -3823,6 +4559,14 @@ struct OfficialTailSnapshot {
     blocks: Vec<Block>,
 }
 
+fn hf129_official_tip_timestamp_is_fresh(published_at: Option<u64>, now: u64) -> bool {
+    let Some(published_at) = published_at else {
+        return false;
+    };
+    published_at <= now.saturating_add(HF129_OFFICIAL_TIP_FUTURE_SKEW_SECS)
+        && now.saturating_sub(published_at) <= HF129_OFFICIAL_TIP_MAX_AGE_SECS
+}
+
 fn curl_binary() -> &'static str {
     if cfg!(target_os = "windows") {
         "curl.exe"
@@ -3841,20 +4585,42 @@ fn hide_snapshot_command_window(command: &mut Command) {
 fn hide_snapshot_command_window(_command: &mut Command) {}
 
 fn download_http_snapshot_to(path: &PathBuf, url: &str, timeout_ms: u64) -> Result<()> {
-    let timeout_secs = ((timeout_ms.max(1_000) + 999) / 1000).max(2).to_string();
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let bounded_ms = hf130_io_remaining(deadline)?.as_millis().max(1) as u64;
+    let timeout_secs = format!("{:.3}", bounded_ms as f64 / 1_000.0);
+    let connect_secs = format!("{:.3}", bounded_ms.min(5_000) as f64 / 1_000.0);
     let mut command = Command::new(curl_binary());
     hide_snapshot_command_window(&mut command);
-    let status = command
+    let mut child = command
         .arg("-fsSL")
         .arg("--connect-timeout")
-        .arg("5")
+        .arg(connect_secs)
         .arg("--max-time")
         .arg(timeout_secs)
         .arg("--output")
         .arg(path)
         .arg(url)
-        .status()
+        .spawn()
         .with_context(|| format!("failed to start curl for {url}"))?;
+    let status = loop {
+        // Reap before returning: a cancelled download must not keep writing to
+        // a path that the next canonical writer will use or remove.
+        if let Err(err) = hf130_io_remaining(deadline) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err.into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err.into());
+            }
+        }
+    };
     if !status.success() {
         bail!("snapshot download failed from {url} with status {status}");
     }
@@ -3862,6 +4628,7 @@ fn download_http_snapshot_to(path: &PathBuf, url: &str, timeout_ms: u64) -> Resu
 }
 
 fn download_http_text(url: &str, timeout_ms: u64, label: &str) -> Result<String> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let mut tmp = std::env::temp_dir();
     let safe = label
         .chars()
@@ -3884,15 +4651,105 @@ fn download_http_text(url: &str, timeout_ms: u64, label: &str) -> Result<String>
     result
 }
 
+fn hf130_snapshot_identity_matches(tip: &OfficialTipSnapshot, height: u32, hash: &str) -> bool {
+    tip.height == height && !hash.trim().is_empty() && tip.tip_hash == hash
+}
+
+/// Existing URLs remain compatible with HF128. A client may cross a publisher
+/// pointer switch between requests, so bind the payload to the sampled tip and
+/// retry twice within the SAME operation budget on a generation mismatch.
+fn hf130_download_bound_snapshot<T>(
+    settings: &Settings,
+    url: &str,
+    timeout_ms: u64,
+    decode: impl Fn(&str, &OfficialTipSnapshot) -> Result<T>,
+) -> Result<T> {
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let _scope = Hf130IoScope::deadline(deadline);
+    let tip_url = official_http_tip_urls(settings).into_iter().next()
+        .context("no official snapshot tip URL")?;
+    let mut last_error = None;
+    for _ in 0..2 {
+        hf130_io_remaining(deadline)?;
+        let attempt = (|| -> Result<T> {
+            let metadata = download_http_text(&tip_url, remaining_ms(deadline).min(1_500), "generation-tip")?;
+            let tip: OfficialTipSnapshot = serde_json::from_str(&metadata)?;
+            if tip.network != settings.network.name || tip.tip_hash.trim().is_empty() {
+                bail!("invalid snapshot generation metadata");
+            }
+            // Bootstrap data may be old; only official_http_tip treats the
+            // publication timestamp as live mining evidence.
+            let raw = download_http_text(url, remaining_ms(deadline), "bound-snapshot")?;
+            hf130_io_remaining(deadline)?;
+            decode(&raw, &tip)
+        })();
+        match attempt {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("snapshot generation unavailable")))
+}
+
+fn hf130_decode_tail_generation(raw: &str, tip: &OfficialTipSnapshot) -> Result<OfficialTailSnapshot> {
+    let tail: OfficialTailSnapshot = serde_json::from_str(raw)?;
+    if tail.network != tip.network
+        || !hf130_snapshot_identity_matches(tip, tail.tip_height, &tail.tip_hash)
+    {
+        bail!("snapshot generation changed during tail download");
+    }
+    Ok(tail)
+}
+
+fn hf130_download_tail(settings: &Settings, url: &str, timeout_ms: u64) -> Result<OfficialTailSnapshot> {
+    hf130_download_bound_snapshot(settings, url, timeout_ms, hf130_decode_tail_generation)
+}
+
+fn hf130_download_full(settings: &Settings, url: &str, timeout_ms: u64) -> Result<PersistedChainState> {
+    hf130_download_bound_snapshot(settings, url, timeout_ms, |raw, tip| {
+        let expected = tip.chain_sha256.as_deref().context("snapshot generation lacks checksum")?;
+        let actual = hex::encode(Sha256::digest(raw.as_bytes()));
+        if !actual.eq_ignore_ascii_case(expected) {
+            bail!("snapshot generation changed during full download");
+        }
+        let persisted: PersistedChainState = serde_json::from_str(raw)?;
+        let height = persisted.blocks.len().saturating_sub(1) as u32;
+        let hash = persisted.blocks.last().map(|block| block.block_hash().to_string()).unwrap_or_default();
+        if persisted.network != tip.network || !hf130_snapshot_identity_matches(tip, height, &hash) {
+            bail!("snapshot generation payload identity mismatch");
+        }
+        Ok(persisted)
+    })
+}
+
 pub fn official_http_tip(settings: &Settings, timeout_ms: u64) -> Result<Option<(u32, String)>> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(100));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     for url in official_http_tip_urls(settings) {
-        let raw = match download_http_text(&url, timeout_ms.min(6_000).max(1_500), "official-tip") {
+        let left = remaining_ms(deadline).min(6_000);
+        if left < 100 {
+            break;
+        }
+        let raw = match download_http_text(&url, left, "official-tip") {
             Ok(raw) => raw,
             Err(_) => continue,
         };
         let tip: OfficialTipSnapshot = serde_json::from_str(&raw)
             .with_context(|| format!("invalid official tip json from {url}"))?;
         if tip.network != settings.network.name {
+            continue;
+        }
+        // HF129: tip.json is liveness evidence, not merely bootstrap data. A
+        // frozen publisher must never remain an HTTP-only mining green-light or
+        // suppress newer-tip discovery indefinitely. Tails/full snapshots stay
+        // available as consensus-validated bootstrap transports elsewhere.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        if !hf129_official_tip_timestamp_is_fresh(tip.published_at_unix, now) {
             continue;
         }
         if tip.height > 0 && !tip.tip_hash.trim().is_empty() {
@@ -3933,6 +4790,7 @@ fn apply_official_snapshot_fast_path(
         Arc::make_mut(&mut repaired.mempool).clear();
         let mut connected = 0usize;
         for block in persisted.blocks.into_iter().skip(local_height as usize + 1) {
+            hf132_check_sync_budget()?;
             repaired.connect_block(block, settings)?;
             connected = connected.saturating_add(1);
         }
@@ -4028,6 +4886,7 @@ fn apply_official_tail_snapshot(
                     repaired.blocks.len()
                 );
             }
+            hf132_check_sync_budget()?;
             repaired.connect_block(block, settings)?;
             appended_from_tail = appended_from_tail.saturating_add(1);
         }
@@ -4122,6 +4981,7 @@ fn hf126_verified_equal_height_competing_tip(
     local: &ChainState,
     timeout_ms: u64,
 ) -> Option<Hf126EqualHeightTipEvidence> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     if settings.network.name != "mainnet" || !pending_block_relay_waiting(settings, local) {
         return None;
     }
@@ -4325,6 +5185,7 @@ fn sync_official_http_tail_reanchor_hf114(
     settings: &Settings,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if settings.network.name != "mainnet" {
         return finish_report(settings, report);
@@ -4353,7 +5214,7 @@ fn sync_official_http_tail_reanchor_hf114(
             .saturating_add(evidence.direct_matches)
             .saturating_add(evidence.http_matches),
     );
-    report.best_peer_height = report.best_peer_height.max(official_height);
+    hf129_observe_tip(&mut report, official_height, &official_tip);
     eprintln!(
         "HF126 verified equal-height re-anchor evidence at #{} {}: http={} official_tcp={} direct={}",
         official_height,
@@ -4365,6 +5226,8 @@ fn sync_official_http_tail_reanchor_hf114(
 
     urls.sort_by_key(|url| official_tail_window_from_url(url));
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     for url in urls {
         if Instant::now() >= deadline {
             break;
@@ -4373,23 +5236,16 @@ fn sync_official_http_tail_reanchor_hf114(
             .saturating_duration_since(Instant::now())
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        let per_url_timeout = left_ms.min(8_000).max(1_500);
+        let per_url_timeout = left_ms.min(8_000);
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        let raw = match download_http_text(&url, per_url_timeout, "official-tail-hf114-reanchor") {
-            Ok(raw) => raw,
-            Err(_) => {
-                report.peer_errors = report.peer_errors.saturating_add(1);
-                continue;
-            }
-        };
-        let tail: OfficialTailSnapshot = match serde_json::from_str(&raw) {
+        let tail = match hf130_download_tail(settings, &url, per_url_timeout) {
             Ok(tail) => tail,
             Err(_) => {
                 report.peer_errors = report.peer_errors.saturating_add(1);
                 continue;
             }
         };
-        report.best_peer_height = report.best_peer_height.max(tail.tip_height);
+        hf129_observe_tip(&mut report, tail.tip_height, &tail.tip_hash);
         if official_height > 0 && tail.tip_height != official_height {
             continue;
         }
@@ -4462,6 +5318,7 @@ fn sync_official_http_snapshot_reanchor_hf114(
     official_tip_hint: &str,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if settings.network.name != "mainnet" {
         return finish_report(settings, report);
@@ -4484,24 +5341,20 @@ fn sync_official_http_snapshot_reanchor_hf114(
     for url in urls {
         let _ = fs::remove_file(&tmp);
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        if let Err(err) = download_http_snapshot_to(&tmp, &url, total_timeout_ms.max(8_000)) {
-            report.peer_errors = report.peer_errors.saturating_add(1);
-            let _ = fs::remove_file(&tmp);
-            if !err.to_string().contains("404") { /* try next official URL */ }
-            continue;
-        }
-
-        let raw = fs::read_to_string(&tmp)
-            .with_context(|| format!("failed reading HF114 re-anchor snapshot from {url}"))?;
-        let persisted: PersistedChainState = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid HF114 re-anchor snapshot json from {url}"))?;
+        let persisted = match hf130_download_full(settings, &url, remaining_ms(hf130_effective_deadline(Instant::now() + Duration::from_millis(total_timeout_ms)))) {
+            Ok(persisted) => persisted,
+            Err(_) => {
+                report.peer_errors = report.peer_errors.saturating_add(1);
+                continue;
+            }
+        };
         let (mut candidate, connected_hint) =
             apply_official_snapshot_fast_path(settings, &local_before, persisted).with_context(
                 || format!("HF114 re-anchor snapshot failed consensus replay from {url}"),
             )?;
 
         validate_chain_consensus_checkpoints(settings, &candidate.blocks)?;
-        report.best_peer_height = report.best_peer_height.max(candidate.height());
+        hf129_observe_tip(&mut report, candidate.height(), &candidate.tip_hash().to_string());
         if official_height_hint > 0 && candidate.height() < official_height_hint {
             report.peer_errors = report.peer_errors.saturating_add(1);
             continue;
@@ -4574,13 +5427,24 @@ pub fn sync_official_http_tail(
     settings: &Settings,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     let mut urls = official_http_tail_urls(settings);
     if urls.is_empty() {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "official-http-tail",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
-    let local_before = load_chain_for_hf90_catchup(settings)?;
+    let local_before = load_chain_for_hf132_validated_catchup(settings)?;
     let local_height_before = local_before.height();
     let local_tip_before = local_before.tip_hash().to_string();
     if let Ok(Some((official_h, _))) = official_http_tip(settings, 700) {
@@ -4591,6 +5455,8 @@ pub fn sync_official_http_tail(
         });
     }
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(1_500));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
 
     for url in urls {
         if Instant::now() >= deadline {
@@ -4600,24 +5466,17 @@ pub fn sync_official_http_tail(
             .saturating_duration_since(Instant::now())
             .as_millis()
             .min(u64::MAX as u128) as u64;
-        let per_url_timeout = left_ms.min(8_000).max(1_500);
+        let per_url_timeout = left_ms.min(8_000);
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        let raw = match download_http_text(&url, per_url_timeout, "official-tail") {
-            Ok(raw) => raw,
-            Err(_) => {
-                report.peer_errors = report.peer_errors.saturating_add(1);
-                continue;
-            }
-        };
-        let tail: OfficialTailSnapshot = match serde_json::from_str(&raw) {
+        let tail = match hf130_download_tail(settings, &url, per_url_timeout) {
             Ok(tail) => tail,
             Err(_) => {
                 report.peer_errors = report.peer_errors.saturating_add(1);
                 continue;
             }
         };
-        report.best_peer_height = report.best_peer_height.max(tail.tip_height);
-        let (mut candidate, connected_hint) =
+        hf129_observe_tip(&mut report, tail.tip_height, &tail.tip_hash);
+        let (candidate, connected_hint) =
             match apply_official_tail_snapshot(settings, &local_before, tail) {
                 Ok(v) => v,
                 Err(_) => {
@@ -4626,11 +5485,7 @@ pub fn sync_official_http_tail(
                 }
             };
         let mut selected = local_before.clone();
-        let adopted = selected.try_adopt_peer_chain(
-            candidate.blocks.as_ref().clone(),
-            settings,
-            false,
-        )?;
+        let adopted = selected.try_adopt_validated_peer_chain(candidate, settings, false)?;
         if adopted {
             // HF125/v1.8.2: HTTP snapshots are bootstrap transports, not an
             // equal-work chain-selection authority. Only normal cumulative-work
@@ -4663,13 +5518,24 @@ pub fn sync_official_http_snapshot(
     settings: &Settings,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     let urls = official_http_snapshot_urls(settings);
     if urls.is_empty() {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "official-http-snapshot",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
-    let local_before = load_chain_for_hf90_catchup(settings)?;
+    let local_before = load_chain_for_hf132_validated_catchup(settings)?;
     let local_height_before = local_before.height();
     let local_tip_before = local_before.tip_hash().to_string();
     let mut tmp = std::env::temp_dir();
@@ -4679,31 +5545,30 @@ pub fn sync_official_http_snapshot(
         std::process::id()
     ));
 
+    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     for url in urls {
+        let left = remaining_ms(deadline);
+        if left < 2_000 {
+            break;
+        }
         let _ = fs::remove_file(&tmp);
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        if let Err(err) = download_http_snapshot_to(&tmp, &url, total_timeout_ms) {
-            report.peer_errors = report.peer_errors.saturating_add(1);
-            let _ = fs::remove_file(&tmp);
-            if !err.to_string().contains("404") { /* try next official URL */ }
-            continue;
-        }
-
-        let raw = fs::read_to_string(&tmp)
-            .with_context(|| format!("failed reading downloaded snapshot from {url}"))?;
-        let persisted: PersistedChainState = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid snapshot json from {url}"))?;
-        let (mut candidate, connected_hint) =
+        let persisted = match hf130_download_full(settings, &url, remaining_ms(hf130_effective_deadline(Instant::now() + Duration::from_millis(total_timeout_ms)))) {
+            Ok(persisted) => persisted,
+            Err(_) => {
+                report.peer_errors = report.peer_errors.saturating_add(1);
+                continue;
+            }
+        };
+        let (candidate, connected_hint) =
             apply_official_snapshot_fast_path(settings, &local_before, persisted)
                 .with_context(|| format!("snapshot failed consensus repair from {url}"))?;
 
-        report.best_peer_height = report.best_peer_height.max(candidate.height());
+        hf129_observe_tip(&mut report, candidate.height(), &candidate.tip_hash().to_string());
         let mut selected = local_before.clone();
-        let adopted = selected.try_adopt_peer_chain(
-            candidate.blocks.as_ref().clone(),
-            settings,
-            false,
-        )?;
+        let adopted = selected.try_adopt_validated_peer_chain(candidate, settings, false)?;
         if adopted {
             // HF125/v1.8.2: a published full snapshot must win by validated
             // cumulative work, never by hostname or publication status alone.
@@ -4734,15 +5599,28 @@ fn sync_official_direct_full_chain(
     settings: &Settings,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || !matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "official-direct-full-chain",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
     let local_before = load_chain_for_hf90_catchup(settings)?;
     let local_height_before = local_before.height();
     let local_tip_before = local_before.tip_hash().to_string();
-    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(20_000));
+    let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(2_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
 
     let mut candidates = official_snapshot_peer_candidates(settings, 1_500);
     if candidates.is_empty() {
@@ -4769,9 +5647,13 @@ fn sync_official_direct_full_chain(
             continue;
         };
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        report.best_peer_height = report.best_peer_height.max(candidate_height);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(18_000)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(5_000)));
+        hf129_observe_tip(&mut report, candidate_height, &candidate_tip);
+        let io_left = deadline.saturating_duration_since(Instant::now());
+        if io_left.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(io_left.min(Duration::from_millis(18_000))));
+        let _ = stream.set_write_timeout(Some(io_left.min(Duration::from_millis(5_000))));
         let mut reader = BufReader::new(stream.try_clone()?);
 
         let local_now = load_chain_for_hf90_catchup(settings)?;
@@ -4805,7 +5687,7 @@ fn sync_official_direct_full_chain(
                             peer_tip = tip_hash;
                         }
                     }
-                    report.best_peer_height = report.best_peer_height.max(height);
+                    hf129_observe_tip(&mut report, height, "");
                     last_rx = Instant::now();
                 }
                 Ok(WireMessage::Headers { headers }) => {
@@ -4814,7 +5696,7 @@ fn sync_official_direct_full_chain(
                             peer_height = last.height;
                             peer_tip = last.hash.clone();
                         }
-                        report.best_peer_height = report.best_peer_height.max(last.height);
+                        hf129_observe_tip(&mut report, last.height, &last.hash);
                     }
                     last_rx = Instant::now();
                 }
@@ -4860,10 +5742,8 @@ fn sync_official_direct_full_chain(
                         validate_chain_consensus_checkpoints(settings, &candidate.blocks)?;
                         let candidate_height_now = candidate.height();
                         let candidate_tip_now = candidate.tip_hash().to_string();
-                        report.best_peer_height = report
-                            .best_peer_height
-                            .max(candidate_height_now)
-                            .max(peer_height);
+                        hf129_observe_tip(&mut report, candidate_height_now, &candidate_tip_now);
+                        hf129_observe_tip(&mut report, peer_height, &peer_tip);
                         let repairs_same_height = candidate_height_now == local_height_before
                             && candidate_tip_now != local_tip_before;
                         let matches_peer_tip = peer_tip.trim().is_empty()
@@ -4918,13 +5798,26 @@ fn sync_official_direct_full_chain(
 }
 
 pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "official-p2p-snapshot",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(4_000));
-    for (addr, candidate_height, _candidate_tip, _latency_ms, _node_id) in
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    for (addr, candidate_height, candidate_tip, _latency_ms, _node_id) in
         official_snapshot_peer_candidates(settings, 650)
             .into_iter()
             .take(4)
@@ -4946,11 +5839,15 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
             continue;
         };
         report.peers_contacted = report.peers_contacted.saturating_add(1);
-        report.best_peer_height = report.best_peer_height.max(candidate_height);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(
-            OFFICIAL_SNAPSHOT_READ_TIMEOUT_MS,
-        )));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(2_000)));
+        hf129_observe_tip(&mut report, candidate_height, &candidate_tip);
+        let io_left = deadline.saturating_duration_since(Instant::now());
+        if io_left.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(
+            io_left.min(Duration::from_millis(OFFICIAL_SNAPSHOT_READ_TIMEOUT_MS)),
+        ));
+        let _ = stream.set_write_timeout(Some(io_left.min(Duration::from_millis(2_000))));
         let mut reader = BufReader::new(stream.try_clone()?);
 
         let local = load_chain_for_hf90_catchup(settings)?;
@@ -5008,7 +5905,7 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
                                 peer_height = height;
                                 peer_tip = tip_hash;
                             }
-                            report.best_peer_height = report.best_peer_height.max(height);
+                            hf129_observe_tip(&mut report, height, "");
                             let cur = load_chain_for_hf90_catchup(settings)?;
                             if height == cur.height()
                                 && !peer_tip.trim().is_empty()
@@ -5027,7 +5924,7 @@ pub fn sync_official_snapshot(settings: &Settings, total_timeout_ms: u64) -> Res
                         }
                         WireMessage::Headers { headers } => {
                             if let Some(last) = headers.last() {
-                                report.best_peer_height = report.best_peer_height.max(last.height);
+                                hf129_observe_tip(&mut report, last.height, &last.hash);
                             }
                             let cur = load_chain_for_hf90_catchup(settings)?;
                             if let Some(common) = best_common_height_from_headers(&cur, &headers) {
@@ -5267,6 +6164,7 @@ fn sync_peer_force_anchor_session(
     deadline: Instant,
     report: &mut P2PSyncReport,
 ) -> Result<()> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(deadline);
     let connect_left = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_millis(3_500));
@@ -5276,11 +6174,16 @@ fn sync_peer_force_anchor_session(
 
     let mut stream = connect_peer(addr, connect_left)?;
     report.peers_contacted = report.peers_contacted.saturating_add(1);
-    stream.set_read_timeout(Some(Duration::from_millis(
-        FORCE_ANCHOR_SYNC_READ_TIMEOUT_MS,
-    )))?;
-    stream.set_write_timeout(Some(Duration::from_millis(5_000)))?;
+    let io_left = deadline.saturating_duration_since(Instant::now());
+    if io_left.is_zero() {
+        return Ok(());
+    }
+    stream.set_read_timeout(Some(
+        io_left.min(Duration::from_millis(FORCE_ANCHOR_SYNC_READ_TIMEOUT_MS)),
+    ))?;
+    stream.set_write_timeout(Some(io_left.min(Duration::from_millis(5_000))))?;
     let mut reader = BufReader::new(stream.try_clone()?);
+    let mut client_session = PeerSession::default();
 
     let local = load_chain_for_hf90_catchup(settings)?;
     let anchor_from = force_anchor_from_height(settings, &local);
@@ -5308,6 +6211,11 @@ fn sync_peer_force_anchor_session(
         },
     );
 
+    client_session.sync_local_height = local.height();
+    client_session.sync_local_tip = local.tip_hash().to_string();
+    client_session.sync_from_height = anchor_from;
+    client_session.sync_requested_at = Some(Instant::now());
+
     let mut peer_height = 0u32;
     let mut peer_tip = String::new();
     let mut last_request_at = Instant::now();
@@ -5329,11 +6237,11 @@ fn sync_peer_force_anchor_session(
                         if *height >= peer_height {
                             peer_tip = tip_hash.clone();
                         }
-                        report.best_peer_height = report.best_peer_height.max(*height);
+                        hf129_observe_tip(report, *height, tip_hash);
                     }
                     _ => {}
                 }
-                process_client_message(settings, addr, msg, &mut stream, report)?;
+                process_client_message(settings, addr, msg, &mut stream, report, &mut client_session)?;
 
                 let current = load_chain_for_hf90_catchup(settings)?;
                 if current.height() != last_local_height
@@ -5395,12 +6303,25 @@ fn sync_force_anchor_to_best_direct(
     min_peer_height: u32,
     total_timeout_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(total_timeout_ms));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled {
         return finish_report(settings, report);
     }
+    let _guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        total_timeout_ms,
+        false,
+        "direct-force-anchor",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, report),
+    };
 
     let deadline = Instant::now() + Duration::from_millis(total_timeout_ms.max(3_000));
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let peers =
         prioritized_outbound_peers(settings, settings.p2p.max_outbound_peers.max(8).min(24))
             .unwrap_or_else(|_| release_bootnodes(settings));
@@ -5425,7 +6346,7 @@ fn sync_force_anchor_to_best_direct(
             .any(|b| b == normalized_addr);
         let mut should_try = is_release_bootnode;
         if let Ok(info) = probe_peer(settings, &addr, Duration::from_millis(900)) {
-            report.best_peer_height = report.best_peer_height.max(info.height);
+            hf129_observe_tip(&mut report, info.height, &info.tip_hash);
             should_try = should_try || min_peer_height == 0 || info.height >= min_peer_height;
         }
         if !should_try {
@@ -5477,6 +6398,17 @@ fn catch_up_to_direct_height(
     normal_rounds: usize,
     sleep_ms: u64,
 ) -> Result<P2PSyncReport> {
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "direct-height-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, workflow_report),
+    };
     let mut merged = sync_until_converged(settings, normal_rounds, sleep_ms)?;
     let local = load_chain_for_hf90_catchup(settings)?;
     if min_peer_height > local.height() {
@@ -5496,6 +6428,16 @@ pub fn sync_until_converged(
     sleep_ms: u64,
 ) -> Result<P2PSyncReport> {
     let mut merged = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut merged,
+        30_000,
+        true,
+        "converged-sync-workflow",
+    )? {
+        Some(guard) => guard,
+        None => return finish_report(settings, merged),
+    };
     let rounds = rounds.max(1);
     let mut stable_rounds = 0usize;
     let mut last_tip = load_chain_for_hf90_catchup(settings)
@@ -5585,7 +6527,7 @@ pub fn sync_until_converged(
             .peers_contacted
             .saturating_add(report.peers_contacted);
         merged.peer_errors = merged.peer_errors.saturating_add(report.peer_errors);
-        merged.best_peer_height = merged.best_peer_height.max(report.best_peer_height);
+        hf129_observe_tip(&mut merged, report.best_peer_height, &report.best_peer_tip_hash);
         merged.chains_adopted = merged.chains_adopted.saturating_add(report.chains_adopted);
         merged.blocks_connected = merged
             .blocks_connected
@@ -5625,7 +6567,16 @@ pub fn sync_until_converged(
 fn merge_sync_reports(into: &mut P2PSyncReport, other: P2PSyncReport) {
     into.peers_contacted = into.peers_contacted.saturating_add(other.peers_contacted);
     into.peer_errors = into.peer_errors.saturating_add(other.peer_errors);
-    into.best_peer_height = into.best_peer_height.max(other.best_peer_height);
+    // Keep height and hash as one observation. Updating the max first made the
+    // comparison below unable to recognize a genuinely higher target and could
+    // retain a hash belonging to an older, lower-height peer.
+    hf129_observe_tip(into, other.best_peer_height, &other.best_peer_tip_hash);
+    if let Some(proof) = other.canonical_proof.as_ref() {
+        if into.canonical_proof.as_ref().map_or(true, |old| proof.observed_at > old.observed_at) {
+            into.canonical_proof = Some(proof.clone());
+        }
+    }
+    into.canonical_tip_proven = into.canonical_proof.is_some();
     into.chains_adopted = into.chains_adopted.saturating_add(other.chains_adopted);
     into.blocks_connected = into.blocks_connected.saturating_add(other.blocks_connected);
     into.txs_accepted = into.txs_accepted.saturating_add(other.txs_accepted);
@@ -5696,11 +6647,11 @@ fn request_peer_chain_if_needed(
     } else {
         return Ok(false);
     };
-    let same_view = session.sync_peer_height == peer_height
-        && session.sync_peer_tip == peer_tip
-        && session.sync_local_height == local.height()
+    // An advancing advertisement does not invalidate the suffix already in
+    // flight from this exact local parent.
+    let same_view = session.sync_local_height == local.height()
         && session.sync_local_tip == local_tip
-        && session.sync_from_height == from_height;
+        && session.sync_from_height <= from_height;
     if same_view
         && session
             .sync_requested_at
@@ -5765,6 +6716,13 @@ fn request_earlier_peer_chain(
     Ok(true)
 }
 
+fn hf132_chunk_already_known(local: &ChainState, start_height: u32, blocks: &[Block]) -> bool {
+    let start = start_height as usize;
+    start.checked_add(blocks.len()).and_then(|end| local.blocks.get(start..end))
+        .map_or(false, |known| known.iter().zip(blocks)
+            .all(|(a, b)| a.block_hash() == b.block_hash()))
+}
+
 fn try_adopt_overlapping_blocks(
     local: &mut ChainState,
     start_height: u32,
@@ -5783,32 +6741,35 @@ fn try_adopt_overlapping_blocks(
         return Ok(false);
     }
 
-    // HF67/v1.5.2: direct append fast-path for the common official-seed +1/+N
-    // catch-up case. Some users were stuck at e.g. local #10533 while official
-    // seeds were #10534: the snapshot path requested the right suffix but the
-    // chain-adoption path could still fail to advance and the miner looped on
-    // "official seed height is ahead". If the peer suffix starts exactly at our
-    // next height, connect the blocks one-by-one against the current local UTXO
-    // set. This is the same validation as mining/normal block connection, keeps
-    // mempool cleanup correct, and avoids replacing any earlier local history.
-    if start == local.blocks.len() {
+    // A byte-identical duplicate is not a fork and needs no replay. A true
+    // overlap extension still takes normal from_blocks validation below.
+    if hf132_chunk_already_known(local, start_height, &blocks) { return Ok(false); }
+    // A matching overlap followed by new blocks is still an append. Retain
+    // the already validated local prefix and validate EVERY new block. Full
+    // Block equality also checks the supplied body, not only its header hash.
+    let overlap = local.blocks.len() - start;
+    if overlap < blocks.len()
+        && local.blocks[start..].iter().zip(&blocks).all(|(known, incoming)| known == incoming)
+    {
         let mut candidate = local.clone();
-        for block in blocks.clone() {
+        for block in blocks.into_iter().skip(overlap) {
+            hf132_check_sync_budget()?;
             candidate.connect_block(block, settings)?;
         }
-        if candidate.height() > local.height() {
-            *local = candidate;
-            return Ok(true);
-        }
-        return Ok(false);
+        *local = candidate;
+        return Ok(true);
     }
 
     let mut candidate_blocks = local.blocks[..start].to_vec();
     candidate_blocks.extend(blocks);
 
     let local_height_before = local.height();
-    let normal = local.try_adopt_peer_chain(
-        candidate_blocks.clone(),
+    // Replay a real competing branch once. Retain the validated candidate for
+    // the existing checkpoint repair policy instead of cloning/replaying all
+    // historical blocks a second time after a normal work comparison fails.
+    let candidate = ChainState::from_blocks(candidate_blocks, settings)?;
+    let normal = local.try_adopt_validated_peer_chain(
+        candidate.clone(),
         settings,
         prefer_peer_on_equal_work,
     )?;
@@ -5825,7 +6786,6 @@ fn try_adopt_overlapping_blocks(
     if settings.network.name == "mainnet"
         && start_height <= MAINNET_FORK_SAFETY_CHECKPOINT_HEIGHT.saturating_add(1)
     {
-        let candidate = ChainState::from_blocks(candidate_blocks, settings)?;
         let cp = MAINNET_FORK_SAFETY_CHECKPOINT_HEIGHT as usize;
         let checkpoint_matches = candidate.blocks.len() > cp
             && local.blocks.len() > cp
@@ -5873,75 +6833,18 @@ fn direct_parent_view(
     max_peers: usize,
     timeout_ms: u64,
 ) -> Result<(usize, u32, Vec<String>)> {
-    let mut contacted = 0usize;
-    let mut raw_best_direct_height = 0u32;
-    let mut ahead_counts: HashMap<(u32, String), usize> = HashMap::new();
-    let mut conflict_counts: HashMap<String, usize> = HashMap::new();
-    let mut first_conflict_addr: HashMap<String, String> = HashMap::new();
-
-    for addr in known_peers(settings)?.into_iter().take(max_peers.max(1)) {
-        if should_skip_outbound(settings, &addr) {
-            continue;
-        }
-        let Ok(info) = probe_peer(settings, &addr, Duration::from_millis(timeout_ms.max(100)))
-        else {
-            continue;
-        };
-        if info.height == 0 {
-            continue;
-        }
-        contacted = contacted.saturating_add(1);
-        raw_best_direct_height = raw_best_direct_height.max(info.height);
-        if info.height > parent_height {
-            *ahead_counts
-                .entry((info.height, info.tip_hash.clone()))
-                .or_insert(0) += 1;
-        } else if info.height == parent_height
-            && !info.tip_hash.trim().is_empty()
-            && info.tip_hash != expected_parent_hash
-        {
-            *conflict_counts.entry(info.tip_hash.clone()).or_insert(0) += 1;
-            first_conflict_addr
-                .entry(info.tip_hash.clone())
-                .or_insert(addr);
-        }
-    }
-
-    // HF116: on mainnet, one noisy/future/private peer must not pause every
-    // miner or make a found block miss the submit window. Only a two-peer quorum
-    // is returned as an actionable ahead/conflict signal. Non-mainnet keeps the
-    // old more aggressive direct-peer behavior for tests/dev networks.
+    let deadline = hf130_effective_deadline(Instant::now() + Duration::from_millis(timeout_ms));
+    // This view includes configured peers as before, but no silent first row
+    // can consume the entire observation deadline and aliases count once.
+    let peers = known_peers(settings)?.into_iter().take(max_peers.clamp(1, 16)).collect::<Vec<_>>();
+    let version = hf131_probe_version(settings)?;
+    let observations = hf131_probe_batch(&peers, deadline, |addr, left| probe_peer_with_version(settings, addr, left, &version).ok());
+    let view = hf131_parent_view(parent_height, expected_parent_hash, observations);
     if settings.network.name == "mainnet" {
-        let quorum_ahead = ahead_counts
-            .iter()
-            .filter(|(_, count)| **count >= 2)
-            .map(|((height, _), _)| *height)
-            .max()
-            .unwrap_or(0);
-        let mut conflicts = Vec::new();
-        for (hash, count) in conflict_counts
-            .iter()
-            .filter(|(_, count)| **count >= 2)
-            .take(4)
-        {
-            let addr = first_conflict_addr
-                .get(hash)
-                .cloned()
-                .unwrap_or_else(|| "peer-quorum".to_string());
-            conflicts.push(format!("{}@{} ({} peers)", addr, hash, count));
-        }
-        return Ok((contacted, quorum_ahead, conflicts));
+        Ok((view.contacted, view.ahead_height, view.conflicts))
+    } else {
+        Ok((view.contacted, view.raw_ahead_height, view.raw_conflicts))
     }
-
-    let mut conflicts = Vec::new();
-    for (hash, _) in conflict_counts.iter().take(4) {
-        let addr = first_conflict_addr
-            .get(hash)
-            .cloned()
-            .unwrap_or_else(|| "peer".to_string());
-        conflicts.push(format!("{}@{}", addr, hash));
-    }
-    Ok((contacted, raw_best_direct_height, conflicts))
 }
 
 fn force_official_tip_if_ahead(
@@ -5950,10 +6853,11 @@ fn force_official_tip_if_ahead(
     local: &mut ChainState,
     timeout_ms: u64,
 ) -> Result<bool> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_millis(timeout_ms));
     let (_, mut official_height, mut official_tip) = official_tip_summary(settings, report, 420);
     if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
         report.peers_contacted = report.peers_contacted.max(1);
-        report.best_peer_height = report.best_peer_height.max(http_height);
+        hf129_observe_tip(report, http_height, &http_tip);
         if http_height >= official_height || official_tip.trim().is_empty() {
             official_height = http_height;
             official_tip = http_tip;
@@ -5992,6 +6896,7 @@ fn force_official_tip_if_ahead(
         && hf97_uncatchable_tip_quarantined(settings, local, official_height)
     {
         report.best_peer_height = local.height();
+        report.best_peer_tip_hash.clear();
         report.height = local.height();
         report.tip_hash = local.tip_hash().to_string();
         mark_fresh_tip_trusted(settings, local);
@@ -6056,7 +6961,7 @@ fn force_official_tip_if_ahead(
             official_tip_summary(settings, report, 350);
         if let Ok(Some((http_height, http_tip))) = official_http_tip(settings, 900) {
             report.peers_contacted = report.peers_contacted.max(1);
-            report.best_peer_height = report.best_peer_height.max(http_height);
+            hf129_observe_tip(report, http_height, &http_tip);
             if http_height >= latest_height || latest_tip.trim().is_empty() {
                 latest_height = http_height;
                 latest_tip = http_tip;
@@ -6143,7 +7048,7 @@ pub fn hf127_transaction_parent_guard(
 
         if let Ok((contacted, height, tip)) = best_official_peer_tip(settings, 900) {
             report.peers_contacted = report.peers_contacted.max(contacted);
-            report.best_peer_height = report.best_peer_height.max(height);
+            hf129_observe_tip(report, height, "");
             if contacted > 0 {
                 if height > local_height {
                     needs_repair = true;
@@ -6167,7 +7072,7 @@ pub fn hf127_transaction_parent_guard(
 
         if let Ok(Some((height, tip))) = official_http_tip(settings, 1_800) {
             report.peers_contacted = report.peers_contacted.max(1);
-            report.best_peer_height = report.best_peer_height.max(height);
+            hf129_observe_tip(report, height, "");
             if height > local_height {
                 needs_repair = true;
                 conflicts.push(format!(
@@ -6211,6 +7116,17 @@ pub fn hf127_transaction_parent_guard(
         return finish_report(settings, report);
     }
 
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut report,
+        30_000,
+        true,
+        "transaction-repair-workflow",
+    )? {
+        Some(guard) => guard,
+        None => bail!("transaction creation paused: canonical sync writer is busy"),
+    };
+
     let repaired = hf90_auto_catchup(settings, repair_timeout_ms.max(60_000))?;
     merge_sync_reports(&mut report, repaired);
     local = load_chain_for_hf90_catchup(settings)?;
@@ -6249,6 +7165,7 @@ pub fn mining_parent_guard(
     parent_height: u32,
     expected_parent_hash: Hash256,
 ) -> Result<P2PSyncReport> {
+    let _hf130_guard_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(30));
     let expected_parent_hash_s = expected_parent_hash.to_string();
 
     // HF71/v1.5.8: if this exact local tip was just validated/repaired from
@@ -6266,6 +7183,7 @@ pub fn mining_parent_guard(
                     report.peers_contacted = report.peers_contacted.max(1);
                     report.height = local.height();
                     report.tip_hash = local.tip_hash().to_string();
+                    hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
                     return finish_report(settings, report);
                 }
             }
@@ -6284,16 +7202,30 @@ pub fn mining_parent_guard(
                 expected_parent_hash_s
             );
         }
+        hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
         return finish_report(settings, P2PSyncReport::default());
     }
 
-    let mut report = hf90_mining_catchup(settings, 90_000).unwrap_or_default();
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "mining-parent-workflow",
+    )? {
+        Some(guard) => guard,
+        None => bail!("mining candidate paused: canonical sync writer is busy"),
+    };
+
+    let mut report = hf90_mining_catchup(settings, 90_000).unwrap_or(workflow_report);
     let mut local = load_chain_for_hf90_catchup(settings)?;
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     if (hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS))
         && local.height() == parent_height
         && local.tip_hash() == expected_parent_hash
     {
+        hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
         return finish_report(settings, report);
     }
     let quick = sync_quick(
@@ -6361,6 +7293,7 @@ pub fn mining_parent_guard(
         if report.best_peer_height > parent_height {
             if hf97_uncatchable_tip_quarantined(settings, &local, report.best_peer_height) {
                 report.best_peer_height = parent_height;
+                report.best_peer_tip_hash.clear();
             } else {
                 bail!(
                     "mining paused: direct peer height {} is ahead of candidate parent #{}. Waiting for local chain catch-up before building/submitting blocks.",
@@ -6379,7 +7312,7 @@ pub fn mining_parent_guard(
         450,
     )?;
     report.peers_contacted = report.peers_contacted.max(direct_contacted);
-    report.best_peer_height = report.best_peer_height.max(best_direct_height);
+    hf129_observe_tip(&mut report, best_direct_height, "");
 
     if best_direct_height > parent_height
         && !hf97_uncatchable_tip_quarantined(settings, &local, best_direct_height)
@@ -6410,10 +7343,11 @@ pub fn mining_parent_guard(
             650,
         )?;
         report.peers_contacted = report.peers_contacted.max(retry_contacted);
-        report.best_peer_height = report.best_peer_height.max(retry_best_height);
+        hf129_observe_tip(&mut report, retry_best_height, "");
         if retry_best_height > parent_height {
             if hf97_uncatchable_tip_quarantined(settings, &local, retry_best_height) {
                 report.best_peer_height = parent_height;
+                report.best_peer_tip_hash.clear();
             } else {
                 bail!(
                     "mining paused: direct peer height {} is ahead of candidate parent #{}. Adaptive sync is still catching up; candidate will be rebuilt automatically.",
@@ -6444,6 +7378,7 @@ pub fn mining_parent_guard(
             mark_fresh_tip_trusted(settings, &local);
         }
     }
+    hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
     finish_report(settings, report)
 }
 
@@ -6456,9 +7391,11 @@ pub fn mining_parent_submit_guard(
     parent_height: u32,
     expected_parent_hash: Hash256,
 ) -> Result<P2PSyncReport> {
+    let _hf130_guard_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(15));
     let mut report = P2PSyncReport::default();
     if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan")
     {
+        hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
         return finish_report(settings, report);
     }
     let local = load_chain_for_hf90_catchup(settings)?;
@@ -6485,7 +7422,7 @@ pub fn mining_parent_submit_guard(
         360,
     )?;
     report.peers_contacted = report.peers_contacted.max(direct_contacted);
-    report.best_peer_height = report.best_peer_height.max(best_direct_height);
+    hf129_observe_tip(&mut report, best_direct_height, "");
     if !conflicts.is_empty() && settings.network.name != "mainnet" {
         bail!(
             "mining submit paused: direct peer(s) disagree at candidate parent #{}: {}",
@@ -6501,6 +7438,7 @@ pub fn mining_parent_submit_guard(
         );
     }
     mark_fresh_tip_trusted(settings, &local);
+    hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
     finish_report(settings, report)
 }
 
@@ -6509,8 +7447,10 @@ pub fn mining_parent_submit_guard(
 /// registry-only high-tip reports are useful telemetry, but they are not enough
 /// to make a node mine on a different branch.
 pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
+    let _hf130_guard_scope = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(60));
     if !settings.p2p.enabled || matches!(settings.network.name.as_str(), "regtest" | "regtest-lan")
     {
+        hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
         return finish_report(settings, P2PSyncReport::default());
     }
 
@@ -6524,14 +7464,28 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
             report.peers_contacted = report.peers_contacted.max(1);
             report.height = local.height();
             report.tip_hash = local.tip_hash().to_string();
+            hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
             return finish_report(settings, report);
         }
     }
 
-    let mut report = hf90_mining_catchup(settings, 120_000).unwrap_or_default();
+    let mut workflow_report = P2PSyncReport::default();
+    let _workflow_guard = match hf129_acquire_sync_step(
+        settings,
+        &mut workflow_report,
+        30_000,
+        true,
+        "mining-safety-workflow",
+    )? {
+        Some(guard) => guard,
+        None => bail!("mining paused: canonical sync writer is busy"),
+    };
+
+    let mut report = hf90_mining_catchup(settings, 120_000).unwrap_or(workflow_report);
     let mut local = load_chain_for_hf90_catchup(settings)?;
     validate_chain_consensus_checkpoints(settings, &local.blocks)?;
     if hf104_canonical_greenlight(settings, &mut report, &local, HF82_LIGHT_TIP_PROBE_MS) {
+        hf130_io_remaining(Instant::now() + Duration::from_secs(1))?;
         return finish_report(settings, report);
     }
     let quick = sync_quick(
@@ -6557,7 +7511,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
             .peers_contacted
             .saturating_add(catchup.peers_contacted);
         report.peer_errors = report.peer_errors.saturating_add(catchup.peer_errors);
-        report.best_peer_height = report.best_peer_height.max(catchup.best_peer_height);
+        hf129_observe_tip(&mut report, catchup.best_peer_height, &catchup.best_peer_tip_hash);
         report.chains_adopted = report.chains_adopted.saturating_add(catchup.chains_adopted);
         report.blocks_connected = report
             .blocks_connected
@@ -6584,6 +7538,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     }
     if hf97_uncatchable_tip_quarantined(settings, &local, report.best_peer_height) {
         report.best_peer_height = local.height();
+        report.best_peer_tip_hash.clear();
     }
     mark_fresh_tip_trusted(settings, &local);
 
@@ -6618,7 +7573,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
         )?;
         report.peers_contacted = report.peers_contacted.saturating_add(retry.peers_contacted);
         report.peer_errors = report.peer_errors.saturating_add(retry.peer_errors);
-        report.best_peer_height = report.best_peer_height.max(retry.best_peer_height);
+        hf129_observe_tip(&mut report, retry.best_peer_height, &retry.best_peer_tip_hash);
         report.chains_adopted = report.chains_adopted.saturating_add(retry.chains_adopted);
         report.blocks_connected = report
             .blocks_connected
@@ -6630,6 +7585,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
         if retry.best_peer_height > retry_local.height() {
             if hf97_uncatchable_tip_quarantined(settings, &retry_local, retry.best_peer_height) {
                 report.best_peer_height = retry_local.height();
+                report.best_peer_tip_hash.clear();
             } else {
                 bail!(
                     "mining paused: direct peer height {} is still ahead of local height {} after background catch-up. QUB Core will keep retrying automatically; keep it open unless this stays unchanged for a long time.",
@@ -6654,7 +7610,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
         350,
     )?;
     report.peers_contacted = report.peers_contacted.max(direct_contacted);
-    report.best_peer_height = report.best_peer_height.max(best_direct_height);
+    hf129_observe_tip(&mut report, best_direct_height, "");
     if !conflicting_direct.is_empty() && settings.network.name != "mainnet" {
         bail!(
             "mining paused: direct peer(s) report a different hash at local height #{}: {}. Do not mine until branches converge.",
@@ -6665,6 +7621,7 @@ pub fn mining_safety_check(settings: &Settings) -> Result<P2PSyncReport> {
     if best_direct_height > local_height {
         if hf97_uncatchable_tip_quarantined(settings, &local, best_direct_height) {
             report.best_peer_height = report.best_peer_height.min(local_height);
+            report.best_peer_tip_hash.clear();
         } else {
             bail!(
                 "mining paused: direct peer height {} is ahead of local height {}. HF98 catch-up will refresh before hashing.",
@@ -7365,9 +8322,17 @@ fn broadcast_block_confirmed_internal(
     source_peer: Option<&str>,
     track_pending: bool,
 ) -> Result<BlockRelayReport> {
-    let _relay_guard = hf125_block_relay_lock()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("HF125 block-relay mutex poisoned"))?;
+    let deadline = Instant::now() + Duration::from_secs(HF125_BLOCK_RELAY_TOTAL_SECS);
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+    let _relay_guard = loop {
+        let left = hf130_io_remaining(deadline)?;
+        match hf125_block_relay_lock().try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(_)) => bail!("HF125 block-relay mutex poisoned"),
+            Err(TryLockError::WouldBlock) => thread::sleep(left.min(Duration::from_millis(20))),
+        }
+    };
     let block_hash = block.block_hash().to_string();
     let chain = if let Some(live) = live_chain_snapshot(settings) {
         live
@@ -7415,8 +8380,14 @@ fn broadcast_block_confirmed_internal(
         return Ok(report);
     }
 
+    let inherited = hf130_io_context();
+    let controller_owned = inherited.cancel.is_some();
+    let relay_done = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
     let (sender, receiver) = mpsc::channel();
     for addr in peers {
+        let mut worker_context = inherited.clone();
+        if controller_owned { worker_context.completion = Some(relay_done.clone()); }
         let sender = sender.clone();
         let error_sender = sender.clone();
         let settings = settings.clone();
@@ -7427,8 +8398,10 @@ fn broadcast_block_confirmed_internal(
         if let Err(err) = thread::Builder::new()
             .name("qub-block-submit".to_string())
             .spawn(move || {
+                let _scope = Hf130IoScope::enter(worker_context);
                 let _ = sender.send(submit_block_to_peer(&settings, &addr, &block, &chain));
             })
+            .map(|handle| { if controller_owned { workers.push(handle); } })
         {
             let _ = error_sender.send(BlockRelayPeerResult {
                 peer,
@@ -7442,10 +8415,12 @@ fn broadcast_block_confirmed_internal(
     }
     drop(sender);
 
-    let deadline = Instant::now() + Duration::from_secs(HF125_BLOCK_RELAY_TOTAL_SECS);
     while report.peer_results.len() < report.attempts && Instant::now() < deadline {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(wait.min(Duration::from_millis(500))) {
+        let wait = match hf130_io_remaining(deadline) {
+            Ok(left) => left,
+            Err(_) => break,
+        };
+        match receiver.recv_timeout(wait.min(Duration::from_millis(200))) {
             Ok(result) => {
                 update_block_relay_report(&mut report, result);
                 if report.delivered() {
@@ -7455,6 +8430,13 @@ fn broadcast_block_confirmed_internal(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // A mining controller may retire only after its network workers return.
+    // Completion cancels redundant attempts without setting the user's Stop.
+    relay_done.store(true, Ordering::Relaxed);
+    for worker in workers { let _ = worker.join(); }
+    while let Ok(result) = receiver.try_recv() {
+        update_block_relay_report(&mut report, result);
     }
     if !report.delivered() {
         report.timed_out = report
@@ -8125,6 +9107,8 @@ fn submit_tx_to_peer(
 
         let mut reader = BufReader::new(stream.try_clone()?);
         let deadline = Instant::now() + Duration::from_secs(HF127_TX_ACK_TIMEOUT_SECS);
+        let deadline = hf130_effective_deadline(deadline);
+        let _hf130_io_scope = Hf130IoScope::deadline(deadline);
         while Instant::now() < deadline {
             match read_wire(&mut reader, settings.p2p.max_message_bytes) {
                 Ok(WireMessage::TxAck {
@@ -8315,6 +9299,9 @@ fn broadcast_tx_confirmed_internal(
     timeout_ms: u64,
     track_pending: bool,
 ) -> Result<TxRelayReport> {
+    let deadline = Instant::now() + Duration::from_secs(HF127_TX_RELAY_TOTAL_SECS);
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let txid_hash = tx.txid();
     let txid = txid_hash.to_string();
     let previous_delivery_attempts = if track_pending {
@@ -8414,8 +9401,14 @@ fn broadcast_tx_confirmed_internal(
     }
 
     let per_peer = Duration::from_millis(timeout_ms.max(300).min(3_000));
+    let inherited = hf130_io_context();
+    let controller_owned = inherited.cancel.is_some();
+    let relay_done = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
     let (sender, receiver) = mpsc::channel();
     for addr in peers {
+        let mut worker_context = inherited.clone();
+        if controller_owned { worker_context.completion = Some(relay_done.clone()); }
         let sender = sender.clone();
         let error_sender = sender.clone();
         let settings = settings.clone();
@@ -8426,6 +9419,7 @@ fn broadcast_tx_confirmed_internal(
         if let Err(err) = thread::Builder::new()
             .name("qub-tx-submit".to_string())
             .spawn(move || {
+                let _scope = Hf130IoScope::enter(worker_context);
                 let _ = sender.send(submit_tx_to_peer(
                     &settings,
                     &addr,
@@ -8434,6 +9428,7 @@ fn broadcast_tx_confirmed_internal(
                     per_peer,
                 ));
             })
+            .map(|handle| { if controller_owned { workers.push(handle); } })
         {
             let _ = error_sender.send(TxRelayPeerResult {
                 peer,
@@ -8447,10 +9442,12 @@ fn broadcast_tx_confirmed_internal(
     }
     drop(sender);
 
-    let deadline = Instant::now() + Duration::from_secs(HF127_TX_RELAY_TOTAL_SECS);
     while report.peer_results.len() < report.attempts && Instant::now() < deadline {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match receiver.recv_timeout(wait.min(Duration::from_millis(250))) {
+        let wait = match hf130_io_remaining(deadline) {
+            Ok(left) => left,
+            Err(_) => break,
+        };
+        match receiver.recv_timeout(wait.min(Duration::from_millis(200))) {
             Ok(result) => {
                 update_tx_relay_report(&mut report, result);
                 // An official acceptance is conclusive. When there are no
@@ -8464,6 +9461,13 @@ fn broadcast_tx_confirmed_internal(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // A mining controller may retire only after its network workers return.
+    // Completion cancels redundant attempts without setting the user's Stop.
+    relay_done.store(true, Ordering::Relaxed);
+    for worker in workers { let _ = worker.join(); }
+    while let Ok(result) = receiver.try_recv() {
+        update_tx_relay_report(&mut report, result);
     }
     if !report.delivered() {
         report.timed_out = report
@@ -8722,6 +9726,9 @@ fn handle_peer(
         let mut last_inv = Instant::now();
         let mut last_announced_height = local_chain.height();
         let mut last_announced_tip = local_chain.tip_hash();
+        // Persistent sessions must not pin the handshake's chain/UTXO/mempool
+        // generation for their entire lifetime. Heartbeats capture fresh views.
+        drop(local_chain);
         let mut session = PeerSession::default();
         let priority_handshake_deadline =
             Instant::now() + Duration::from_secs(HF127_PRIORITY_HANDSHAKE_SECS);
@@ -9116,6 +10123,15 @@ fn process_peer_message(
             if blocks.len() > settings.p2p.max_blocks_per_message {
                 bail!("too many blocks in chain message");
             }
+            // Incoming peer sessions share the existing manual/background sync
+            // writer. Never queue peer threads with full candidate histories.
+            // A busy response is discarded before taking a chain snapshot;
+            // normal Version/Inv request expiry retries it on a later tick.
+            let Some(_writer) = hf129_acquire_catchup_writer(
+                false, Instant::now() + Duration::from_millis(50),
+            )? else {
+                return Ok(());
+            };
             if blocks.is_empty() {
                 let local = chain.lock().expect("chain mutex poisoned").clone();
                 let _ = request_earlier_peer_chain(stream, &local, session, start_height)?;
@@ -9123,6 +10139,10 @@ fn process_peer_message(
             }
             let next_from = start_height.saturating_add(blocks.len() as u32);
             let base = chain.lock().expect("chain mutex poisoned").clone();
+            if hf132_chunk_already_known(&base, start_height, &blocks) {
+                request_peer_chain_if_needed(stream, &base, session.height, &session.tip_hash.clone(), session)?;
+                return Ok(());
+            }
             let mut candidate = base.clone();
             let mut changed = false;
             if start_height <= candidate.height().saturating_add(1) {
@@ -9143,9 +10163,10 @@ fn process_peer_message(
                             *live = candidate;
                             changed = true;
                         } else {
-                            let blocks = candidate.blocks.as_ref().clone();
-                            changed = live.try_adopt_peer_chain(
-                                blocks,
+                            // Candidate validation already ran on the private
+                            // snapshot. Never replay history under the live lock.
+                            changed = live.try_adopt_validated_peer_chain(
+                                candidate,
                                 settings,
                                 prefer_peer_tip_on_equal_work(settings, peer_addr),
                             )?;
@@ -9184,11 +10205,7 @@ fn process_peer_message(
                 )?;
             }
             if changed {
-                let relay_settings = settings.clone();
-                let source = peer_addr.to_string();
-                hf127_spawn_detached("qub-chain-diffusion", move || {
-                    let _ = relay_chain_to_known_peers(&relay_settings, Some(&source));
-                });
+                hf132_defer_chain_relay(settings, peer_addr);
             }
             if changed && next_from <= session.height {
                 let local = chain.lock().expect("chain mutex poisoned").clone();
@@ -9410,6 +10427,7 @@ fn process_client_message(
     message: WireMessage,
     stream: &mut TcpStream,
     report: &mut P2PSyncReport,
+    session: &mut PeerSession,
 ) -> Result<()> {
     match message {
         WireMessage::Version {
@@ -9447,12 +10465,14 @@ fn process_client_message(
                     &miner_address,
                 )?;
             }
-            report.best_peer_height = report.best_peer_height.max(height);
+            session.height = height;
+            session.tip_hash = tip_hash.clone();
+            hf129_observe_tip(report, height, &tip_hash);
             let local = load_chain_for_hf90_catchup(settings)?;
             if height > local.height()
                 || (height == local.height() && tip_hash != local.tip_hash().to_string())
             {
-                send_adaptive_chain_requests(stream, &local, height, &tip_hash)?;
+                request_peer_chain_if_needed(stream, &local, height, &tip_hash, session)?;
             }
         }
         WireMessage::Chain {
@@ -9469,7 +10489,8 @@ fn process_client_message(
             let next_from = start_height.saturating_add(blocks.len() as u32);
             let mut local = load_chain_for_hf90_catchup(settings)?;
             let mut changed = false;
-            if start_height <= local.height().saturating_add(1) {
+            let already_known = hf132_chunk_already_known(&local, start_height, &blocks);
+            if !already_known && start_height <= local.height().saturating_add(1) {
                 let local_height_before = local.height();
                 match try_adopt_overlapping_blocks(
                     &mut local,
@@ -9495,24 +10516,19 @@ fn process_client_message(
                         request_earlier_fork_window(stream, local_height_before, start_height)?;
                     }
                 }
-            } else {
-                send_wire(
-                    stream,
-                    &WireMessage::GetChain {
-                        from_height: local.height().saturating_add(1),
-                    },
-                )?;
+            } else if !already_known {
+                request_peer_chain_if_needed(stream, &local, session.height, &session.tip_hash.clone(), session)?;
             }
             if changed {
-                let _ = relay_chain_to_known_peers(settings, Some(addr));
+                hf132_defer_chain_relay(settings, addr);
             }
-            if more_expected {
-                send_wire(
-                    stream,
-                    &WireMessage::GetChain {
-                        from_height: next_from,
-                    },
-                )?;
+            if session.height > local.height()
+                || (more_expected && next_from > local.height())
+            {
+                // Follow the latest advertisement from the committed parent.
+                // Duplicate/overlapping frames must never restart old windows.
+                request_peer_chain_if_needed(stream, &local,
+                    session.height.max(next_from), &session.tip_hash.clone(), session)?;
             }
         }
         WireMessage::Block { block } => {
@@ -9527,7 +10543,7 @@ fn process_client_message(
                 request_earlier_fork_window(stream, h, h.saturating_add(1))?;
             }
             if changed {
-                let _ = relay_chain_to_known_peers(settings, Some(addr));
+                hf132_defer_chain_relay(settings, addr);
             }
         }
         WireMessage::SubmitBlock { request_id, block } => {
@@ -9622,13 +10638,12 @@ fn process_client_message(
         )?,
         WireMessage::Headers { headers } => {
             let local = load_chain_for_hf90_catchup(settings)?;
-            if headers.last().map(|h| h.height).unwrap_or(0) > local.height() {
-                send_wire(
-                    stream,
-                    &WireMessage::GetChain {
-                        from_height: local.height().saturating_add(1),
-                    },
-                )?;
+            if let Some(last) = headers.last() {
+                if last.height > session.height {
+                    session.height = last.height;
+                    session.tip_hash = last.hash.clone();
+                }
+                request_peer_chain_if_needed(stream, &local, session.height, &session.tip_hash.clone(), session)?;
             }
         }
         WireMessage::GetChain { from_height } => send_chain(
@@ -9674,12 +10689,14 @@ fn process_client_message(
         WireMessage::Inv {
             height, tip_hash, ..
         } => {
-            report.best_peer_height = report.best_peer_height.max(height);
+            session.height = height;
+            session.tip_hash = tip_hash.clone();
+            hf129_observe_tip(report, height, &tip_hash);
             let local = load_chain_for_hf90_catchup(settings)?;
             if height > local.height()
                 || (height == local.height() && tip_hash != local.tip_hash().to_string())
             {
-                send_adaptive_chain_requests(stream, &local, height, &tip_hash)?;
+                request_peer_chain_if_needed(stream, &local, height, &tip_hash, session)?;
             }
         }
         WireMessage::GetAddr
@@ -9690,30 +10707,26 @@ fn process_client_message(
     Ok(())
 }
 
-fn send_version_with_role(
-    stream: &mut TcpStream,
-    settings: &Settings,
-    chain: &ChainState,
-    role: &str,
-) -> Result<()> {
-    send_wire(
-        stream,
-        &WireMessage::Version {
-            protocol: PROTOCOL_VERSION,
-            network: settings.network.name.clone(),
-            magic: settings.network.magic.clone(),
-            user_agent: USER_AGENT.to_string(),
-            height: chain.height(),
-            tip_hash: chain.tip_hash().to_string(),
-            work: chain.total_work_hex().unwrap_or_else(|_| "0".to_string()),
-            genesis_hash: genesis_block(settings)?.block_hash().to_string(),
-            listen_addr: effective_advertise_addr(settings),
-            node_id: node_id(settings)?,
-            role: role.to_string(),
-            miner_address: runtime_miner_address(settings)
-                .unwrap_or_else(|| settings.mining.miner_address.clone()),
-        },
-    )
+fn version_message_with_role(settings: &Settings, chain: &ChainState, role: &str) -> Result<WireMessage> {
+    Ok(WireMessage::Version {
+        protocol: PROTOCOL_VERSION,
+        network: settings.network.name.clone(),
+        magic: settings.network.magic.clone(),
+        user_agent: USER_AGENT.to_string(),
+        height: chain.height(),
+        tip_hash: chain.tip_hash().to_string(),
+        work: chain.total_work_hex().unwrap_or_else(|_| "0".to_string()),
+        genesis_hash: genesis_block(settings)?.block_hash().to_string(),
+        listen_addr: effective_advertise_addr(settings),
+        node_id: node_id(settings)?,
+        role: role.to_string(),
+        miner_address: runtime_miner_address(settings)
+            .unwrap_or_else(|| settings.mining.miner_address.clone()),
+    })
+}
+
+fn send_version_with_role(stream: &mut TcpStream, settings: &Settings, chain: &ChainState, role: &str) -> Result<()> {
+    send_wire(stream, &version_message_with_role(settings, chain, role)?)
 }
 
 fn send_version(stream: &mut TcpStream, settings: &Settings, chain: &ChainState) -> Result<()> {
@@ -9763,6 +10776,14 @@ fn send_headers(
     send_wire(stream, &WireMessage::Headers { headers })
 }
 
+#[derive(Serialize)]
+struct Hf132BorrowedChain<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    start_height: u32,
+    blocks: &'a [Block],
+}
+
 fn send_chain(
     stream: &mut TcpStream,
     settings: &Settings,
@@ -9779,32 +10800,107 @@ fn send_chain(
     // byte-bounded response would deserialize on HF127 but silently stop its
     // sync. Framing changes therefore require an explicit negotiated
     // capability and are intentionally not introduced by HF128.
-    let blocks = if start < chain.blocks.len() {
-        chain.blocks[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    send_wire(
-        stream,
-        &WireMessage::Chain {
-            start_height: from_height,
-            blocks,
-        },
-    )
+    let blocks = chain.blocks.get(start..end).unwrap_or(&[]);
+    hf132_send_json(stream, &Hf132BorrowedChain {
+        kind: "chain", start_height: from_height, blocks,
+    })
 }
 
 fn send_wire(stream: &mut TcpStream, message: &WireMessage) -> Result<()> {
-    let mut raw = serde_json::to_vec(message)?;
-    raw.push(b'\n');
-    stream.write_all(&raw)?;
-    stream.flush()?;
-    Ok(())
+    hf132_send_json(stream, message)
+}
+
+struct Hf132WireWriter<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+    wrote_any: bool,
+}
+
+impl Write for Hf132WireWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() { return Ok(0); }
+        loop {
+            let left = hf130_io_remaining(self.deadline)?;
+            self.stream.set_write_timeout(Some(left.min(Duration::from_millis(200))))?;
+            match self.stream.write(&bytes[..bytes.len().min(64 * 1024)]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "peer write returned zero")),
+                Ok(count) => { self.wrote_any = true; return Ok(count); }
+                Err(err) if is_timeout(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> { self.stream.flush() }
+}
+
+fn hf132_send_json<T: Serialize + ?Sized>(stream: &mut TcpStream, message: &T) -> Result<()> {
+    let original_timeout = stream.write_timeout()?;
+    let timeout = original_timeout.unwrap_or(Duration::from_secs(30));
+    let deadline = hf130_effective_deadline(Instant::now() + timeout);
+    let _scope = Hf130IoScope::deadline(deadline);
+    // Serialize through a bounded 64 KiB buffer. Avoid a second, potentially
+    // full-chain JSON allocation for every slow peer. into_parts prevents
+    // BufWriter::drop from attempting to flush a failed partial frame again.
+    let (result, sent) = {
+        let writer = Hf132WireWriter { stream: &mut *stream, deadline, wrote_any: false };
+        let mut buffered = io::BufWriter::with_capacity(64 * 1024, writer);
+        let result = (|| -> Result<()> {
+            hf130_io_remaining(deadline)?;
+            serde_json::to_writer(&mut buffered, message)?;
+            buffered.write_all(b"\n")?;
+            buffered.flush()?;
+            Ok(())
+        })();
+        let (writer, _) = buffered.into_parts();
+        (result, writer.wrote_any)
+    };
+    let restored = stream.set_write_timeout(original_timeout);
+    if result.is_err() && sent {
+        // A partial JSON frame cannot safely be followed by another message.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+    if result.is_ok() { restored?; }
+    result
 }
 
 fn read_wire(reader: &mut BufReader<TcpStream>, max_bytes: usize) -> io::Result<WireMessage> {
+    let original_timeout = reader.get_ref().read_timeout()?;
+    let timeout = original_timeout.unwrap_or(Duration::from_secs(30));
+    let deadline = hf130_effective_deadline(Instant::now() + timeout);
+    let _scope = Hf130IoScope::deadline(deadline);
+    let result = read_wire_until(reader, max_bytes, deadline);
+    // Preserve the session timeout on success AND failure. Non-timeout errors
+    // close the stream so callers cannot retry a discarded partial frame.
+    let _ = reader.get_ref().set_read_timeout(original_timeout);
+    if result.as_ref().err().map_or(false, |err| !is_timeout(err)) {
+        let _ = reader.get_ref().shutdown(std::net::Shutdown::Both);
+    }
+    result
+}
+
+fn read_wire_until(
+    reader: &mut BufReader<TcpStream>,
+    max_bytes: usize,
+    deadline: Instant,
+) -> io::Result<WireMessage> {
     let mut raw = Vec::new();
     loop {
-        let available = reader.fill_buf()?;
+        let left = hf130_io_remaining(deadline).map_err(|err| {
+            if raw.is_empty() || err.kind() == io::ErrorKind::Interrupted {
+                err
+            } else {
+                // A partial frame cannot be discarded and then retried as if
+                // the next bytes began a fresh message on the same connection.
+                io::Error::new(io::ErrorKind::InvalidData, "incomplete frame at deadline")
+            }
+        })?;
+        reader.get_ref().set_read_timeout(Some(left.min(Duration::from_millis(200))))?;
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(err) if is_timeout(&err) => continue,
+            Err(err) => return Err(err),
+        };
         if available.is_empty() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
         }
@@ -9813,18 +10909,19 @@ fn read_wire(reader: &mut BufReader<TcpStream>, max_bytes: usize) -> io::Result<
             .position(|b| *b == b'\n')
             .map(|pos| pos + 1)
             .unwrap_or(available.len());
-        raw.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if raw.len() > max_bytes {
+        if take > max_bytes.saturating_sub(raw.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "message too large",
             ));
         }
+        raw.extend_from_slice(&available[..take]);
+        reader.consume(take);
         if raw.last() == Some(&b'\n') {
             break;
         }
     }
+    hf130_io_remaining(deadline)?;
     serde_json::from_slice(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
@@ -9853,18 +10950,115 @@ fn validate_remote_network(
     Ok(())
 }
 
-fn connect_peer(addr: &str, timeout: Duration) -> Result<TcpStream> {
-    let mut last_err = None;
-    for socket in addr
-        .to_socket_addrs()
-        .with_context(|| format!("bad peer address {addr}"))?
-    {
-        match TcpStream::connect_timeout(&socket, timeout) {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                return Ok(stream);
+// The platform resolver cannot be cancelled safely. Keep at most four pending
+// resolutions process-wide and share one pending request for the same name.
+// Completed entries are short-lived and the cache is bounded independently.
+struct Hf130DnsEntry {
+    created: Instant,
+    result: Mutex<Option<std::result::Result<Vec<SocketAddr>, String>>>,
+}
+
+fn hf130_dns_entries() -> &'static Mutex<HashMap<String, Arc<Hf130DnsEntry>>> {
+    static DNS: OnceLock<Mutex<HashMap<String, Arc<Hf130DnsEntry>>>> = OnceLock::new();
+    DNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hf130_resolve_peer(addr: &str, deadline: Instant) -> Result<Vec<SocketAddr>> {
+    hf130_io_remaining(deadline)?;
+    let entry = {
+        let mut entries = hf130_dns_entries().lock().map_err(|_| anyhow::anyhow!("DNS cache poisoned"))?;
+        entries.retain(|_, entry| {
+            entry.created.elapsed() < Duration::from_secs(60)
+                || entry.result.lock().map(|r| r.is_none()).unwrap_or(false)
+        });
+        if let Some(entry) = entries.get(addr) {
+            entry.clone()
+        } else {
+            let pending = entries.values().filter(|entry| {
+                entry.result.lock().map(|r| r.is_none()).unwrap_or(false)
+            }).count();
+            if pending >= 4 {
+                bail!("DNS resolver capacity busy; retry on the next bounded sync pass");
             }
-            Err(err) => last_err = Some(err),
+            if entries.len() >= 64 {
+                if let Some(oldest) = entries.iter()
+                    .filter(|(_, entry)| entry.result.lock().map(|r| r.is_some()).unwrap_or(false))
+                    .min_by_key(|(_, entry)| entry.created)
+                    .map(|(name, _)| name.clone())
+                {
+                    entries.remove(&oldest);
+                }
+            }
+            let entry = Arc::new(Hf130DnsEntry { created: Instant::now(), result: Mutex::new(None) });
+            let worker_entry = entry.clone();
+            let peer = addr.to_string();
+            thread::Builder::new().name("qub-peer-dns".to_string()).spawn(move || {
+                let resolved = peer.to_socket_addrs()
+                    .map(|iter| iter.take(32).collect::<Vec<SocketAddr>>())
+                    .map_err(|err| err.to_string());
+                if let Ok(mut slot) = worker_entry.result.lock() {
+                    *slot = Some(resolved);
+                }
+            }).with_context(|| format!("could not start resolver for {addr}"))?;
+            entries.insert(addr.to_string(), entry.clone());
+            entry
+        }
+    };
+    loop {
+        let left = hf130_io_remaining(deadline)?;
+        if let Some(result) = entry.result.lock()
+            .map_err(|_| anyhow::anyhow!("DNS result poisoned"))?.as_ref()
+        {
+            return result.clone().map_err(|err| anyhow::anyhow!("bad peer address {addr}: {err}"));
+        }
+        thread::sleep(left.min(Duration::from_millis(10)));
+    }
+}
+
+fn hf130_connect_slice(remaining: Duration, cooperative: bool) -> Duration {
+    if cooperative { remaining.min(Duration::from_secs(1)) } else { remaining }
+}
+
+fn connect_peer(addr: &str, timeout: Duration) -> Result<TcpStream> {
+    let deadline = hf130_effective_deadline(Instant::now() + timeout);
+    let _scope = Hf130IoScope::deadline(deadline);
+    let sockets = if let Ok(socket) = addr.parse::<SocketAddr>() {
+        vec![socket]
+    } else {
+        hf130_resolve_peer(addr, deadline)?
+    };
+    let mut last_err = None;
+    let socket_count = sockets.len();
+    for (index, socket) in sockets.into_iter().enumerate() {
+        let address_budget = hf130_io_remaining(deadline)? / (socket_count - index) as u32;
+        let address_deadline = Instant::now() + address_budget;
+        loop {
+            let left = match hf130_io_remaining(address_deadline) {
+                Ok(left) => left,
+                Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                    last_err = Some(err);
+                    break;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            // connect_timeout creates a NEW connection on each attempt. Do
+            // not use the 200ms IO polling interval here: that would repeatedly
+            // discard valid handshakes on slower routes. Cancellation may wait
+            // up to one second during connect; ordinary calls keep their full
+            // allotted per-address timeout.
+            let cooperative = hf130_io_context().cancel.is_some();
+            let slice = hf130_connect_slice(left, cooperative);
+            match TcpStream::connect_timeout(&socket, slice) {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Ok(stream);
+                }
+                Err(err) if is_timeout(&err) && left > slice => continue,
+                Err(err) => {
+                    last_err = Some(err);
+                    break;
+                }
+            }
         }
     }
     match last_err {
@@ -11239,20 +12433,36 @@ pub fn known_peer_addrs(settings: &Settings) -> Result<Vec<String>> {
     known_peers(settings)
 }
 
+fn hf131_probe_version(settings: &Settings) -> Result<WireMessage> {
+    let chain = load_chain_for_hf90_catchup(settings)?;
+    version_message_with_role(settings, &chain, if settings.mining.enabled { "miner" } else { "node" })
+}
+
 fn probe_peer(settings: &Settings, addr: &str, timeout: Duration) -> Result<P2PProbeInfo> {
+    let deadline = hf130_effective_deadline(Instant::now() + timeout);
+    let _scope = Hf130IoScope::deadline(deadline);
+    let version = hf131_probe_version(settings)?;
+    probe_peer_with_version(settings, addr, hf130_io_remaining(deadline)?, &version)
+}
+
+fn probe_peer_with_version(settings: &Settings, addr: &str, timeout: Duration, version: &WireMessage) -> Result<P2PProbeInfo> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + timeout);
+    let deadline = Instant::now() + timeout;
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     let mut stream = connect_peer(addr, timeout)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    // HF88/v1.6.2: peer status/version probes only need local height/tip for
-    // the Version message. Use the UI-fast loader so a bounded peer probe does
-    // not replay-validate the entire chain and stall GUI snapshots.
-    let chain =
-        load_or_init_chain_for_ui_fast(settings).or_else(|_| load_or_init_chain(settings))?;
-    send_version(&mut stream, settings, &chain)?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        bail!("peer probe deadline expired during connect");
+    }
+    stream.set_read_timeout(Some(left))?;
+    stream.set_write_timeout(Some(left))?;
+    // The batch captures this immutable Version once; a joined socket probe
+    // must not reload or wait for Fast Chain Engine storage on every endpoint.
+    send_wire(&mut stream, version)?;
     let mut reader = BufReader::new(stream.try_clone()?);
-    let deadline = Instant::now() + timeout.saturating_mul(2);
     while Instant::now() < deadline {
-        match read_wire(&mut reader, settings.p2p.max_message_bytes) {
+        match read_wire(&mut reader, settings.p2p.max_message_bytes.min(64 * 1024)) {
             Ok(WireMessage::Version {
                 protocol,
                 network,
@@ -11308,6 +12518,7 @@ fn fetch_peer_list(
     addr: &str,
     timeout: Duration,
 ) -> Result<Vec<P2PObservedPeer>> {
+    let _hf130_entry_scope = Hf130IoScope::deadline(Instant::now() + timeout);
     let mut stream = connect_peer(addr, timeout)?;
     stream.set_read_timeout(Some(timeout.saturating_mul(2)))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -11315,13 +12526,15 @@ fn fetch_peer_list(
     // the Version message. Use the UI-fast loader so a bounded peer probe does
     // not replay-validate the entire chain and stall GUI snapshots.
     let chain =
-        load_or_init_chain_for_ui_fast(settings).or_else(|_| load_or_init_chain(settings))?;
+        load_chain_for_hf90_catchup(settings)?;
     send_version(&mut stream, settings, &chain)?;
     send_wire(&mut stream, &WireMessage::GetPeerList)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let deadline = Instant::now() + timeout.saturating_mul(2);
+    let deadline = hf130_effective_deadline(deadline);
+    let _hf130_io_scope = Hf130IoScope::deadline(deadline);
     while Instant::now() < deadline {
-        match read_wire(&mut reader, settings.p2p.max_message_bytes) {
+        match read_wire(&mut reader, settings.p2p.max_message_bytes.min(64 * 1024)) {
             Ok(WireMessage::PeerList { peers }) => return Ok(peers),
             Ok(WireMessage::Version {
                 protocol,
@@ -11347,12 +12560,252 @@ fn finish_report(settings: &Settings, mut report: P2PSyncReport) -> Result<P2PSy
     let chain = load_chain_for_hf90_catchup(settings)?;
     report.height = chain.height();
     report.tip_hash = chain.tip_hash().to_string();
+    report.canonical_tip_proven = hf130_proof_matches_final(
+        &report, report.height, &report.tip_hash, pending_block_relay_waiting(settings, &chain),
+    );
+    if report.writer_busy {
+        report.progressed = false;
+        report.fresh_at_tip = false;
+        report.terminal = "busy".to_string();
+    } else if report.writer_acquired {
+        report.progressed = report.height > report.before_height
+            || (!report.before_tip_hash.trim().is_empty()
+                && report.tip_hash != report.before_tip_hash);
+        let no_conflicting_target = report.best_peer_height < report.height
+            || (report.best_peer_height == report.height
+                && !report.best_peer_tip_hash.trim().is_empty()
+                && report.best_peer_tip_hash == report.tip_hash);
+        report.fresh_at_tip = !report.progressed
+            && report.canonical_tip_proven
+            && no_conflicting_target;
+        // A report may have been finalized and merged before a later stage
+        // actually adopted a chain. Re-derive the terminal state from the
+        // final canonical identity so it cannot contradict `progressed`.
+        report.terminal = if report.progressed {
+            "progress"
+        } else if report.fresh_at_tip {
+            "fresh-at-tip"
+        } else {
+            "no-progress"
+        }
+        .to_string();
+    } else if report.terminal.trim().is_empty() {
+        report.terminal = "completed".to_string();
+    }
     Ok(report)
+}
+
+#[cfg(test)]
+mod hf131_peer_liveness_tests {
+    use super::*;
+
+    fn observation(addr: &str, node: &str, height: u32, tip: &str) -> (String, P2PProbeInfo) {
+        (addr.to_string(), P2PProbeInfo {
+            node_id: node.to_string(), height, tip_hash: tip.to_string(), ..P2PProbeInfo::default()
+        })
+    }
+
+    #[test]
+    fn hf131_silent_first_probe_does_not_hide_healthy_peers() {
+        let peers = vec!["silent-seed".to_string(), "healthy-a".to_string(), "healthy-b".to_string()];
+        let completed = AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let results = hf131_probe_batch(&peers, deadline, |addr, _| {
+            if addr == "silent-seed" {
+                while let Ok(left) = hf130_io_remaining(deadline) {
+                    thread::sleep(left.min(Duration::from_millis(5)));
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                None
+            } else {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Some(42)
+            }
+        });
+        assert_eq!(completed.load(Ordering::SeqCst), 3, "all owned probes must be joined");
+        assert_eq!(results.len(), 2, "a silent first source must not consume other sources' budgets");
+    }
+
+    #[test]
+    fn hf131_probe_cancellation_is_inherited_and_joined() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel = stop.clone();
+        let started = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let cancellation = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(35));
+            cancel.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let results = hf130_with_mining_cancellation(stop, || {
+            hf131_probe_batch(&["a".into(), "b".into()], start + Duration::from_secs(2), |_, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let deadline = start + Duration::from_secs(2);
+                while hf130_io_remaining(deadline).is_ok() { thread::sleep(Duration::from_millis(5)); }
+                completed.fetch_add(1, Ordering::SeqCst);
+                None::<usize>
+            })
+        });
+        cancellation.join().unwrap();
+        assert!(results.is_empty());
+        assert_eq!(completed.load(Ordering::SeqCst), started.load(Ordering::SeqCst), "every started worker must be joined before return");
+        assert!(start.elapsed() < Duration::from_secs(1), "cancelled probes must not wait for the two-second deadline");
+    }
+
+    #[test]
+    fn hf131_direct_quorum_counts_node_identity_once() {
+        let view = hf131_parent_view(100, "tip-100", vec![
+            observation("alias-a", "same-node", 100, "tip-100"),
+            observation("alias-b", "same-node", 100, "tip-100"),
+            observation("unknown", "", 100, "tip-100"),
+        ]);
+        assert_eq!(view.exact, 1);
+        assert_eq!(hf130_quorum_verdict(view.exact, false, false, true), Hf130QuorumVerdict::Rejected);
+        let independent = hf131_parent_view(100, "tip-100", vec![
+            observation("peer-a", "node-a", 100, "tip-100"),
+            observation("peer-b", "node-b", 100, "tip-100"),
+        ]);
+        assert_eq!(hf130_quorum_verdict(independent.exact, false, false, true), Hf130QuorumVerdict::Exact);
+    }
+
+    #[test]
+    fn hf131_ahead_quorum_is_exact_pair_and_deduplicated() {
+        let noisy = hf131_parent_view(100, "local", vec![
+            observation("a", "node-a", 200, "future"),
+            observation("alias-a", "node-a", 200, "future"),
+            observation("b", "node-b", 200, "different"),
+        ]);
+        assert_eq!(noisy.ahead_height, 0);
+        let quorum = hf131_parent_view(100, "local", vec![
+            observation("a", "node-a", 101, "next"),
+            observation("b", "node-b", 101, "next"),
+            observation("local-peer", "node-c", 100, "local"),
+        ]);
+        assert_eq!(quorum.ahead_height, 101);
+        assert!(hf131_parent_is_behind(100, 100, quorum.ahead_height));
+        assert!(hf131_parent_is_behind(100, 101, 0), "an older exact HTTP tip must not hide an ahead official sample");
+        assert!(!hf131_parent_is_behind(100, 99, 0));
+    }
+
+    #[test]
+    fn hf131_equal_height_tie_never_creates_exact_proof() {
+        let view = hf131_parent_view(100, "local", vec![
+            observation("a", "node-a", 100, "sibling"),
+            observation("b", "node-b", 100, "sibling"),
+        ]);
+        let verdict = hf130_quorum_verdict(view.exact, view.ahead_height > 100, !view.conflicts.is_empty(), true);
+        let mut report = P2PSyncReport::default();
+        assert!(hf130_apply_quorum_verdict(&mut report, verdict, 100, "local"));
+        assert!(!report.canonical_tip_proven);
+        assert!(report.canonical_proof.is_none());
+        assert_eq!(hf130_quorum_verdict(view.exact, false, true, false), Hf130QuorumVerdict::Rejected);
+    }
+
+    #[test]
+    fn hf131_repaired_block_acknowledgements_prove_direct_delivery() {
+        for first in ["ack", "ack_after_suffix", "ack_after_overlap"] {
+            for second in ["ack", "ack_after_suffix", "ack_after_overlap"] {
+                let mut report = BlockRelayReport { official_attempts: 2, ..BlockRelayReport::default() };
+                for (peer, transport) in [("198.51.100.1:17444", first), ("198.51.100.2:17444", second)] {
+                    update_block_relay_report(&mut report, BlockRelayPeerResult {
+                        peer: peer.into(), transport: transport.into(), status: "accepted".into(), ..BlockRelayPeerResult::default()
+                    });
+                }
+                assert!(report.delivered(), "explicit repaired ACK pair {first}/{second} must count");
+            }
+        }
+    }
+
+    #[test]
+    fn hf131_relay_duplicates_and_legacy_are_not_delivery() {
+        for (peer, transport, status) in [
+            ("198.51.100.1:17444", "ack_after_overlap", "accepted"),
+            ("198.51.100.2:17444", "legacy", "legacy_sent"),
+            ("198.51.100.2:17444", "ack_after_suffix", "rejected"),
+        ] {
+            let mut report = BlockRelayReport { official_attempts: 2, ..BlockRelayReport::default() };
+            for result in [
+                BlockRelayPeerResult { peer: "198.51.100.1:17444".into(), transport: "ack".into(), status: "accepted".into(), ..BlockRelayPeerResult::default() },
+                BlockRelayPeerResult { peer: peer.into(), transport: transport.into(), status: status.into(), ..BlockRelayPeerResult::default() },
+            ] { update_block_relay_report(&mut report, result); }
+            assert!(!report.delivered());
+        }
+    }
+
+    #[test]
+    fn hf131_reachable_sync_peers_precede_silent_candidates() {
+        let mut peers = vec!["silent-seed".to_string(), "direct-a".to_string(), "direct-b".to_string(), "healthy-seed".to_string()];
+        let reachable = ["direct-a".to_string(), "direct-b".to_string(), "healthy-seed".to_string()].into_iter().collect::<HashSet<_>>();
+        hf131_prefer_reachable(&mut peers, &reachable);
+        assert_eq!(peers, vec!["direct-a", "direct-b", "healthy-seed", "silent-seed"]);
+    }
+}
+
+#[cfg(test)]
+mod hf129_coordinator_tests {
+    use super::*;
+
+    #[test]
+    fn hf129_tip_observation_never_pairs_a_lower_hash_with_a_higher_height() {
+        let mut report = P2PSyncReport::default();
+        hf129_observe_tip(&mut report, 10, "hash-10");
+        hf129_observe_tip(&mut report, 11, "");
+        assert_eq!(report.best_peer_height, 11);
+        assert!(report.best_peer_tip_hash.is_empty());
+        hf129_observe_tip(&mut report, 11, "hash-11");
+        assert_eq!(report.best_peer_tip_hash, "hash-11");
+    }
+
+    #[test]
+    fn hf129_nested_writer_is_reentrant_and_background_coalesces() {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let deadline = hf130_effective_deadline(deadline);
+        let _hf130_io_scope = Hf130IoScope::deadline(deadline);
+        let outer = hf129_acquire_catchup_writer(true, deadline)
+            .expect("outer acquire")
+            .expect("outer writer");
+        let nested = hf129_acquire_catchup_writer(false, deadline)
+            .expect("nested acquire")
+            .expect("same-thread nested writer");
+        let other = thread::spawn(|| {
+            hf129_acquire_catchup_writer(false, Instant::now() + Duration::from_millis(50))
+                .expect("background acquire")
+                .is_none()
+        })
+        .join()
+        .expect("background thread");
+        assert!(other);
+        drop(nested);
+        drop(outer);
+        assert_eq!(
+            HF129_CATCHUP_WRITER_DEPTH.with(|depth| depth.get()),
+            0
+        );
+    }
 }
 
 #[cfg(test)]
 mod hf125_tests {
     use super::*;
+
+    #[test]
+    fn hf129_official_tip_freshness_is_fail_closed() {
+        let now = 2_000_000u64;
+        assert!(hf129_official_tip_timestamp_is_fresh(Some(now), now));
+        assert!(hf129_official_tip_timestamp_is_fresh(
+            Some(now.saturating_sub(HF129_OFFICIAL_TIP_MAX_AGE_SECS)),
+            now,
+        ));
+        assert!(!hf129_official_tip_timestamp_is_fresh(None, now));
+        assert!(!hf129_official_tip_timestamp_is_fresh(
+            Some(now.saturating_sub(HF129_OFFICIAL_TIP_MAX_AGE_SECS + 1)),
+            now,
+        ));
+        assert!(!hf129_official_tip_timestamp_is_fresh(
+            Some(now.saturating_add(HF129_OFFICIAL_TIP_FUTURE_SKEW_SECS + 1)),
+            now,
+        ));
+    }
 
     fn regtest_settings() -> Settings {
         toml::from_str(include_str!("../config/regtest.toml"))
@@ -11775,6 +13228,596 @@ mod hf125_tests {
             .expect("load cleared relay")
             .is_none());
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+}
+
+#[cfg(test)]
+mod hf130_sync_tests {
+    use super::*;
+
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture listener");
+        let client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect fixture");
+        let (server, _) = listener.accept().expect("accept fixture");
+        (client, server)
+    }
+
+    #[test]
+    fn hf130_drip_feed_frame_obeys_absolute_deadline() {
+        let (client, mut server) = socket_pair();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || {
+            for _ in 0..100 {
+                if server.write_all(b" ").is_err() { break; }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let start = Instant::now();
+        let _scope = Hf130IoScope::deadline(start + Duration::from_millis(120));
+        let mut reader = BufReader::new(client);
+        let error = read_wire(&mut reader, 64 * 1024).unwrap_err();
+        let elapsed = start.elapsed();
+        drop(reader);
+        peer.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(elapsed < Duration::from_millis(700), "drip feed escaped total deadline: {elapsed:?}");
+    }
+
+    #[test]
+    fn hf130_blocked_write_obeys_absolute_deadline() {
+        let (mut client, _server) = socket_pair();
+        client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Larger than a normal socket send buffer; the peer never consumes it.
+        let message = WireMessage::Reject { reason: "x".repeat(16 * 1024 * 1024) };
+        let start = Instant::now();
+        let _scope = Hf130IoScope::deadline(start + Duration::from_millis(120));
+        assert!(send_wire(&mut client, &message).is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn hf130_silent_peer_read_is_cancelled() {
+        let (client, _server) = socket_pair();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let trigger = stop.clone();
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let error = hf130_with_mining_cancellation(stop, || {
+            read_wire(&mut BufReader::new(client), 64 * 1024).unwrap_err()
+        });
+        cancel.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(hf130_io_context().cancel.is_none(), "cancellation context leaked after closure");
+    }
+
+    #[test]
+    fn hf130_nested_budget_cannot_extend_parent() {
+        assert_eq!(hf130_connect_slice(Duration::from_secs(5), false), Duration::from_secs(5));
+        assert_eq!(hf130_connect_slice(Duration::from_secs(5), true), Duration::from_secs(1));
+        assert_eq!(hf130_connect_slice(Duration::from_millis(650), true), Duration::from_millis(650));
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let _outer = Hf130IoScope::deadline(deadline);
+        {
+            let _inner = Hf130IoScope::deadline(Instant::now() + Duration::from_secs(10));
+            assert_eq!(hf130_effective_deadline(Instant::now() + Duration::from_secs(20)), deadline);
+            let inherited = hf130_io_context();
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _child = Hf130IoScope::enter(inherited.clone());
+                    assert_eq!(hf130_effective_deadline(Instant::now() + Duration::from_secs(30)), deadline);
+                }).join().unwrap();
+            });
+        }
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(remaining_ms(Instant::now() + Duration::from_secs(20)), 0);
+    }
+
+    #[test]
+    fn hf130_fresh_proof_rejects_ancestor_pending_and_changed_tip() {
+        let mut report = P2PSyncReport::default();
+        hf129_observe_tip(&mut report, 100, "official-100");
+        hf129_mark_canonical_tip_proven(&mut report);
+        assert!(!hf130_proof_matches_final(&report, 105, "local-105", true));
+        assert!(!report.canonical_tip_proven, "ancestor permission created exact acknowledgement");
+        report.canonical_proof = Some(Hf130CanonicalProof {
+            height: 100, tip_hash: "official-100".to_string(), observed_at: Instant::now(),
+            source: Hf130CanonicalEvidence::OfficialTcp,
+        });
+        assert!(hf130_proof_matches_final(&report, 100, "official-100", false));
+        assert!(!hf130_proof_matches_final(&report, 100, "official-100", true));
+        assert!(!hf130_proof_matches_final(&report, 101, "official-101", false));
+        assert!(!hf130_proof_matches_final(&report, 100, "competing-100", false));
+        let wire = serde_json::to_string(&report).unwrap();
+        let replay: P2PSyncReport = serde_json::from_str(&wire).unwrap();
+        assert!(!hf130_proof_matches_final(&replay, 100, "official-100", false));
+        report.canonical_proof.as_mut().unwrap().observed_at = Instant::now() - Duration::from_secs(46);
+        assert!(!hf130_proof_matches_final(&report, 100, "official-100", false));
+        let exact = hf130_quorum_verdict(2, false, false, true);
+        assert!(hf130_apply_quorum_verdict(&mut report, exact, 100, "official-100"));
+        assert!(hf130_proof_matches_final(&report, 100, "official-100", false));
+        let sibling = hf130_quorum_verdict(0, false, true, true);
+        assert!(hf130_apply_quorum_verdict(&mut report, sibling, 100, "official-100"));
+        assert!(!report.canonical_tip_proven, "mineable tie retained prior exact proof");
+        assert!(!hf130_proof_matches_final(&report, 100, "official-100", false));
+        let ahead = hf130_quorum_verdict(2, true, false, true);
+        assert!(!hf130_apply_quorum_verdict(&mut report, ahead, 100, "official-100"));
+        let pending_tie = hf130_quorum_verdict(0, false, true, false);
+        assert!(!hf130_apply_quorum_verdict(&mut report, pending_tie, 100, "official-100"));
+    }
+
+    #[test]
+    fn hf130_dns_cache_bounds_pending_work() {
+        let names = (0..4).map(|n| format!("hf130-unresolved-fixture-{n}.invalid:1")).collect::<Vec<_>>();
+        {
+            let mut entries = hf130_dns_entries().lock().unwrap();
+            for name in &names {
+                entries.insert(name.clone(), Arc::new(Hf130DnsEntry {
+                    created: Instant::now(), result: Mutex::new(None),
+                }));
+            }
+        }
+        // The actual resolution entry point must reject a fifth unresolved
+        // name before attempting any platform DNS work.
+        let result = hf130_resolve_peer("hf130-extra-fixture.invalid:1", Instant::now() + Duration::from_secs(1));
+        let coalesced = hf130_resolve_peer(&names[0], Instant::now() + Duration::from_millis(20));
+        {
+            let mut entries = hf130_dns_entries().lock().unwrap();
+            for name in &names { entries.remove(name); }
+        }
+        assert!(result.unwrap_err().to_string().contains("capacity busy"));
+        assert!(coalesced.unwrap_err().to_string().contains("deadline expired"),
+            "same unresolved name should share its pending slot, not request a fifth worker");
+    }
+
+    #[test]
+    fn hf130_probe_unrelated_messages_share_one_deadline() {
+        let (client, mut server) = socket_pair();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let peer = thread::spawn(move || {
+            let mut raw = serde_json::to_vec(&WireMessage::Ping { nonce: 1 }).unwrap();
+            raw.push(b'\n');
+            for _ in 0..100 {
+                if server.write_all(&raw).is_err() { break; }
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let start = Instant::now();
+        let _scope = Hf130IoScope::deadline(start + Duration::from_millis(120));
+        let mut reader = BufReader::new(client);
+        let mut received = 0;
+        while read_wire(&mut reader, 64 * 1024).is_ok() { received += 1; }
+        let elapsed = start.elapsed();
+        drop(reader);
+        peer.join().unwrap();
+        assert!(received > 1);
+        assert!(elapsed < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn hf130_snapshot_generation_pairing_rejects_mismatch() {
+        let tip = OfficialTipSnapshot {
+            network: "mainnet".to_string(), height: 100, tip_hash: "hash-100".to_string(),
+            chain_sha256: None, published_at_unix: Some(1),
+        };
+        let mut tail = OfficialTailSnapshot {
+            network: "mainnet".to_string(), start_height: 100, tip_height: 101,
+            tip_hash: "hash-101".to_string(), blocks: Vec::new(),
+        };
+        assert!(hf130_decode_tail_generation(&serde_json::to_string(&tail).unwrap(), &tip).is_err());
+        tail.tip_height = 100;
+        assert!(hf130_decode_tail_generation(&serde_json::to_string(&tail).unwrap(), &tip).is_err());
+        tail.tip_hash = "hash-100".to_string();
+        // Generation pairing accepts metadata here; consensus still rejects
+        // empty/invalid block payloads in apply_official_tail_snapshot.
+        assert!(hf130_decode_tail_generation(&serde_json::to_string(&tail).unwrap(), &tip).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod hf132_sync_liveness_tests {
+    use super::*;
+
+    fn settings(name: &str) -> Settings {
+        let mut settings: Settings = toml::from_str(include_str!("../config/regtest.toml")).unwrap();
+        settings.node.data_dir = std::env::temp_dir().join(format!(
+            "qub-hf132-p2p-{name}-{}-{}", std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        )).display().to_string();
+        settings.p2p.enabled = false;
+        NodePaths::from_settings(&settings).ensure_dirs().unwrap();
+        settings
+    }
+
+    fn extend(settings: &Settings, chain: &mut ChainState, count: usize) {
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let key = wallet.create_key(settings, "HF132 sync test", 0).unwrap();
+        let address = Address::parse_with_prefix(&key.address, &settings.network.address_prefix).unwrap();
+        for _ in 0..count {
+            let block = mine_next_block(chain, settings, &address, MiningOptions {
+                duty_cycle_percent: 100, max_hashes: Some(5_000_000),
+            }).unwrap();
+            chain.connect_block(block, settings).unwrap();
+        }
+    }
+
+    fn sockets() -> (TcpStream, BufReader<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        (client, BufReader::new(server))
+    }
+
+    #[test]
+    fn hf132_memory_idle_peer_releases_handshake_snapshot() {
+        let settings = settings("memory-idle-peer");
+        let local = load_or_init_chain(&settings).unwrap();
+        let live = Arc::new(Mutex::new(local));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (server, addr) = listener.accept().unwrap();
+        let worker_live = live.clone();
+        let worker = thread::spawn(move || handle_peer(
+            server, addr.to_string(), false, false, settings, worker_live,
+            Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        send_wire(&mut client, &WireMessage::Ping { nonce: 132 }).unwrap();
+        let mut pong = false;
+        for _ in 0..12 {
+            if matches!(read_wire(&mut reader, 1024 * 1024).unwrap(), WireMessage::Pong { nonce: 132 }) {
+                pong = true; break;
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let released = loop {
+            let counts = {
+                let chain = live.lock().unwrap();
+                (Arc::strong_count(&chain.blocks), Arc::strong_count(&chain.utxos),
+                 Arc::strong_count(&chain.mempool))
+            };
+            if counts == (1, 1, 1) { break true; }
+            if Instant::now() >= deadline { break false; }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        worker.join().unwrap().unwrap();
+        assert!(pong, "peer must have entered its persistent message loop");
+        assert!(released, "an idle peer still pins the handshake's canonical generation");
+    }
+
+    #[test]
+    fn hf132_memory_inbound_writers_drop_busy_candidates_then_retry() {
+        let settings = settings("memory-writer");
+        let local = load_or_init_chain(&settings).unwrap();
+        let mut remote = local.clone();
+        extend(&settings, &mut remote, 1);
+        let live = Arc::new(Mutex::new(local));
+        let guard = hf129_acquire_catchup_writer(true, Instant::now() + Duration::from_secs(10))
+            .unwrap().expect("test writer");
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..12 {
+            let settings = settings.clone(); let live = live.clone();
+            let block = remote.blocks[1].clone(); let done_tx = done_tx.clone();
+            workers.push(thread::spawn(move || {
+                let (mut stream, _reader) = sockets();
+                let result = process_peer_message(&settings, "fixture-peer", WireMessage::Chain {
+                    start_height: 1, blocks: vec![block],
+                }, &mut stream, &live, &Arc::new(Mutex::new(HashSet::new())),
+                    &Arc::new(AtomicBool::new(false)), &mut PeerSession::default(), false);
+                done_tx.send(result.is_ok()).unwrap();
+            }));
+        }
+        drop(done_tx);
+        for _ in 0..12 {
+            assert!(done_rx.recv_timeout(Duration::from_secs(3)).unwrap(), "busy frames must return promptly");
+        }
+        for worker in workers { worker.join().unwrap(); }
+        assert_eq!(live.lock().unwrap().height(), 0);
+        assert_eq!(load_committed_chain(&settings, true).unwrap().height(), 0);
+        // Same-thread nesting is intentional: it exercises the coordinator's
+        // ownership contract without a race against unrelated parallel tests.
+        let (mut stream, _reader) = sockets();
+        process_peer_message(&settings, "fixture-peer", WireMessage::Chain {
+            start_height: 1, blocks: vec![remote.blocks[1].clone()],
+        }, &mut stream, &live, &Arc::new(Mutex::new(HashSet::new())),
+            &Arc::new(AtomicBool::new(false)), &mut PeerSession::default(), false).unwrap();
+        assert_eq!(live.lock().unwrap().tip_hash(), remote.tip_hash());
+        assert_eq!(load_committed_chain(&settings, true).unwrap().tip_hash(), remote.tip_hash());
+        drop(guard);
+    }
+
+    #[test]
+    fn hf132_memory_overlap_extension_matches_full_replay() {
+        let settings = settings("memory-overlap");
+        let mut local = load_or_init_chain(&settings).unwrap();
+        extend(&settings, &mut local, 3);
+        let mut remote = local.clone(); extend(&settings, &mut remote, 2);
+        let reference = ChainState::from_blocks(remote.blocks.as_ref().clone(), &settings).unwrap();
+        assert!(try_adopt_overlapping_blocks(&mut local, 2, remote.blocks[2..].to_vec(), &settings, false).unwrap());
+        assert_eq!(local.blocks, reference.blocks);
+        assert_eq!(local.utxos, reference.utxos);
+        local.validate_all(&settings).unwrap();
+    }
+
+    #[test]
+    fn hf132_memory_invalid_overlap_and_suffix_preserve_parent() {
+        let settings = settings("memory-invalid");
+        let mut local = load_or_init_chain(&settings).unwrap();
+        extend(&settings, &mut local, 2);
+        let mut remote = local.clone(); extend(&settings, &mut remote, 2);
+        let before = local.clone();
+        let mut invalid_overlap = remote.blocks[1..].to_vec();
+        invalid_overlap[0].transactions.clear();
+        assert!(try_adopt_overlapping_blocks(&mut local, 1, invalid_overlap, &settings, false).is_err());
+        assert_eq!(local.blocks, before.blocks); assert_eq!(local.utxos, before.utxos);
+        let mut invalid_suffix = remote.blocks[1..].to_vec();
+        invalid_suffix.last_mut().unwrap().transactions.clear();
+        assert!(try_adopt_overlapping_blocks(&mut local, 1, invalid_suffix, &settings, false).is_err());
+        assert_eq!(local.blocks, before.blocks); assert_eq!(local.utxos, before.utxos);
+    }
+
+    #[test]
+    fn hf132_memory_real_fork_keeps_full_validation_and_work_selection() {
+        let settings = settings("memory-real-fork");
+        let genesis = load_or_init_chain(&settings).unwrap();
+        let mut local = genesis.clone(); extend(&settings, &mut local, 2);
+        let mut remote = genesis; extend(&settings, &mut remote, 4);
+        assert_ne!(local.blocks[1].block_hash(), remote.blocks[1].block_hash());
+        let mut reference = local.clone();
+        assert!(reference.try_adopt_peer_chain(remote.blocks.as_ref().clone(), &settings, false).unwrap());
+        assert!(try_adopt_overlapping_blocks(&mut local, 1, remote.blocks[1..].to_vec(), &settings, false).unwrap());
+        assert_eq!(local.blocks, reference.blocks); assert_eq!(local.utxos, reference.utxos);
+    }
+
+    #[test]
+    fn hf132_memory_streamed_chain_is_byte_identical_to_legacy_frames() {
+        let mut settings = settings("memory-wire");
+        settings.p2p.max_blocks_per_message = 2;
+        let mut local = load_or_init_chain(&settings).unwrap();
+        extend(&settings, &mut local, 4);
+        for start in [0u32, 1, 4, 99] {
+            let (mut stream, mut reader) = sockets();
+            send_chain(&mut stream, &settings, &local, start).unwrap();
+            let mut actual = Vec::new(); reader.read_until(b'\n', &mut actual).unwrap();
+            let end = local.blocks.len().min(start as usize + 2);
+            let blocks = local.blocks.get(start as usize..end).unwrap_or(&[]).to_vec();
+            let mut expected = serde_json::to_vec(&WireMessage::Chain { start_height: start, blocks }).unwrap();
+            expected.push(b'\n');
+            assert_eq!(actual, expected, "legacy protocol-2 bytes/count changed at {start}");
+        }
+    }
+
+    #[test]
+    fn hf132_memory_serialization_failure_closes_partial_frame_and_restores_timeout() {
+        use serde::ser::SerializeSeq;
+        use std::io::Read;
+        struct FailsAfterWrite;
+        impl Serialize for FailsAfterWrite {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(None)?;
+                let value = "x".repeat(4096);
+                for _ in 0..40 { seq.serialize_element(&value)?; }
+                Err(<S::Error as serde::ser::Error>::custom("forced serialization failure"))
+            }
+        }
+        let (mut stream, mut reader) = sockets();
+        reader.get_ref().set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        let receiver = thread::spawn(move || {
+            let mut data = Vec::new(); reader.read_to_end(&mut data).unwrap(); data
+        });
+        let result = hf132_send_json(&mut stream, &FailsAfterWrite);
+        assert!(result.is_err());
+        assert_eq!(stream.write_timeout().unwrap(), Some(Duration::from_secs(2)));
+        let bytes = receiver.join().unwrap();
+        assert!(!bytes.is_empty()); assert_ne!(bytes.last(), Some(&b'\n'));
+        assert!(send_wire(&mut stream, &WireMessage::Ping { nonce: 1 }).is_err());
+    }
+
+    #[test]
+    fn hf132_completed_suffix_survives_expired_network_slice() {
+        let settings = settings("expired-slice");
+        let mut local = load_or_init_chain(&settings).unwrap();
+        let mut remote = local.clone();
+        extend(&settings, &mut remote, 2);
+        {
+            let _network_scope = Hf130IoScope::deadline(Instant::now());
+            assert!(hf130_io_remaining(Instant::now()).is_err());
+            assert!(try_adopt_overlapping_blocks(&mut local, 1, remote.blocks[1..].to_vec(), &settings, false).unwrap());
+            save_chain(&settings, &local).unwrap();
+        }
+        let restarted = load_committed_chain(&settings, true).unwrap();
+        assert_eq!(restarted.blocks, remote.blocks);
+        assert_eq!(restarted.utxos, remote.utxos);
+    }
+
+    #[test]
+    fn hf132_cancelled_suffix_keeps_committed_parent() {
+        let settings = settings("cancelled-suffix");
+        let mut local = load_or_init_chain(&settings).unwrap();
+        let original_tip = local.tip_hash();
+        let mut remote = local.clone();
+        extend(&settings, &mut remote, 2);
+        let result = hf130_with_mining_cancellation(Arc::new(AtomicBool::new(true)), || {
+            try_adopt_overlapping_blocks(&mut local, 1, remote.blocks[1..].to_vec(), &settings, false)
+        });
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(local.tip_hash(), original_tip);
+        assert_eq!(load_committed_chain(&settings, true).unwrap().tip_hash(), original_tip);
+    }
+
+    #[test]
+    fn hf132_moving_tip_reuses_request_then_follows_committed_suffix() {
+        let settings = settings("moving-tip");
+        let local = load_or_init_chain(&settings).unwrap();
+        let mut remote = local.clone();
+        extend(&settings, &mut remote, 2);
+        let (mut client, mut reader) = sockets();
+        let mut session = PeerSession::default();
+        assert!(request_peer_chain_if_needed(&mut client, &local, 1, &remote.blocks[1].block_hash().to_string(), &mut session).unwrap());
+        assert!(!request_peer_chain_if_needed(&mut client, &local, 2, &remote.tip_hash().to_string(), &mut session).unwrap());
+        assert!(matches!(read_wire(&mut reader, settings.p2p.max_message_bytes).unwrap(), WireMessage::GetChain { from_height: 1 }));
+        session.height = 2;
+        session.tip_hash = remote.tip_hash().to_string();
+        let mut report = P2PSyncReport::default();
+        process_client_message(&settings, "fixture-peer", WireMessage::Chain {
+            start_height: 1, blocks: vec![remote.blocks[1].clone()],
+        }, &mut client, &mut report, &mut session).unwrap();
+        assert!(matches!(read_wire(&mut reader, settings.p2p.max_message_bytes).unwrap(), WireMessage::GetChain { from_height: 2 }));
+        assert_eq!(report.blocks_connected, 1);
+        assert_eq!(load_committed_chain(&settings, true).unwrap().height(), 1);
+        process_client_message(&settings, "fixture-peer", WireMessage::Chain {
+            start_height: 2, blocks: vec![remote.blocks[2].clone()],
+        }, &mut client, &mut report, &mut session).unwrap();
+        let complete = load_committed_chain(&settings, true).unwrap();
+        assert_eq!(complete.blocks, remote.blocks);
+        assert_eq!(complete.utxos, remote.utxos);
+        assert_eq!(report.blocks_connected, 2);
+    }
+
+    #[test]
+    fn hf132_duplicate_chunk_does_not_request_old_fork_window() {
+        let settings = settings("duplicate-chunk");
+        let mut local = load_or_init_chain(&settings).unwrap();
+        extend(&settings, &mut local, 1);
+        save_chain(&settings, &local).unwrap();
+        let (mut client, mut reader) = sockets();
+        let mut session = PeerSession::default();
+        session.height = 2;
+        session.tip_hash = "next-tip".into();
+        request_peer_chain_if_needed(&mut client, &local, 2, "next-tip", &mut session).unwrap();
+        assert!(matches!(read_wire(&mut reader, settings.p2p.max_message_bytes).unwrap(), WireMessage::GetChain { from_height: 2 }));
+        let mut report = P2PSyncReport::default();
+        process_client_message(&settings, "fixture-peer", WireMessage::Chain {
+            start_height: 1, blocks: vec![local.blocks[1].clone()],
+        }, &mut client, &mut report, &mut session).unwrap();
+        assert_eq!(report.blocks_connected, 0);
+        assert!(is_timeout(&read_wire(&mut reader, settings.p2p.max_message_bytes).unwrap_err()));
+    }
+
+    #[test]
+    fn hf132_slow_peer_network_slice_leaves_healthy_peer_time() {
+        let settings = settings("fair-peers");
+        let local = load_or_init_chain(&settings).unwrap();
+        let mut remote = local.clone();
+        extend(&settings, &mut remote, 1);
+        let mut version = version_message_with_role(&settings, &remote, "node").unwrap();
+        if let WireMessage::Version { node_id, .. } = &mut version { *node_id = "independent-fixture-peer".into(); }
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_addr = stalled.local_addr().unwrap().to_string();
+        let healthy_addr = healthy.local_addr().unwrap().to_string();
+        let stalled_version = version.clone();
+        let stalled_worker = thread::spawn(move || {
+            let (mut stream, _) = stalled.accept().unwrap();
+            stream.set_write_timeout(Some(Duration::from_millis(100))).unwrap();
+            send_wire(&mut stream, &stalled_version).unwrap();
+            // Advertising a valid tip and sending heartbeats is not block progress.
+            let until = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < until {
+                if send_wire(&mut stream, &WireMessage::Ping { nonce: 1 }).is_err() { break; }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let served_blocks = remote.blocks[1..].to_vec();
+        let healthy_worker = thread::spawn(move || {
+            let (mut stream, _) = healthy.accept().unwrap();
+            stream.set_write_timeout(Some(Duration::from_millis(500))).unwrap();
+            send_wire(&mut stream, &version).unwrap();
+            send_wire(&mut stream, &WireMessage::Chain { start_height: 1, blocks: served_blocks }).unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_ref().set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+            while read_wire(&mut reader, 1_000_000).is_ok() {}
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut report = P2PSyncReport::default();
+        let first_slice = hf132_peer_io_deadline(deadline, 2);
+        let _ = sync_peer_adaptive_session(&settings, &stalled_addr, first_slice, &mut report);
+        assert!(remaining_ms(deadline) >= 300, "the first peer exhausted the second peer's network opportunity");
+        sync_peer_adaptive_session(&settings, &healthy_addr, hf132_peer_io_deadline(deadline, 1), &mut report).unwrap();
+        stalled_worker.join().unwrap();
+        healthy_worker.join().unwrap();
+        assert_eq!(load_committed_chain(&settings, true).unwrap().tip_hash(), remote.tip_hash());
+    }
+
+    #[test]
+    fn hf132_reconcile_rejects_stale_capture_and_keeps_current_equal_work_commit() {
+        let settings = settings("capture");
+        let genesis = load_or_init_chain(&settings).unwrap();
+        let mut first = genesis.clone();
+        extend(&settings, &mut first, 1);
+        save_chain(&settings, &first).unwrap();
+        let first_identity = fast_storage_identity(&settings).unwrap().unwrap();
+        let mut second = genesis;
+        extend(&settings, &mut second, 1);
+        assert_ne!(first.tip_hash(), second.tip_hash());
+        // Model the exact next CURRENT identity for a committed equal-work
+        // reanchor; its storage authorization is tested in fast_storage tests.
+        let mut second_identity = first_identity.clone();
+        second_identity.generation += 1;
+        second_identity.state_revision += 1;
+        second_identity.tip_hash = second.tip_hash();
+        assert!(!hf132_committed_capture_is_current(Some(&first_identity), Some(&second_identity)));
+        assert!(hf132_committed_capture_is_current(Some(&second_identity), Some(&second_identity)));
+        assert!(!hf132_committed_capture_is_current(None, None));
+        let mut live = first;
+        hf132_reconcile_committed_view(&mut live, second.clone(), &settings).unwrap();
+        assert_eq!(live.tip_hash(), second.tip_hash());
+        let mut changed_revision = second_identity.clone();
+        changed_revision.state_revision += 1;
+        assert!(!hf132_committed_capture_is_current(Some(&second_identity), Some(&changed_revision)));
+    }
+
+    #[test]
+    fn hf132_stop_mining_waiter_does_not_cancel_active_sync_writer() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let auto = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let guard = loop {
+                if let Some(guard) = hf129_acquire_catchup_writer(false, deadline).unwrap() { break guard; }
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            };
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(HF129_CATCHUP_WRITER_DEPTH.with(|depth| depth.get()), 1);
+            drop(guard);
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter_stop = stop.clone();
+        let mining = thread::spawn(move || hf130_with_mining_cancellation(waiter_stop, || {
+            hf129_acquire_catchup_writer(true, Instant::now() + Duration::from_secs(3))
+                .map(|guard| guard.is_some())
+        }));
+        let until = Instant::now() + Duration::from_secs(2);
+        while HF129_PRIORITY_CATCHUP_WAITERS.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < until);
+            thread::yield_now();
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(mining.join().unwrap().unwrap_err().to_string().contains("cancelled"));
+        assert!(hf129_acquire_catchup_writer(false, Instant::now() + Duration::from_millis(50)).unwrap().is_none(),
+            "Stop released the independent auto-sync writer");
+        let mut report = P2PSyncReport::default();
+        hf129_mark_writer_busy(&mut report, "coalesced-auto");
+        assert!(report.writer_busy);
+        assert!(!report.progressed && !report.fresh_at_tip && !report.canonical_tip_proven);
+        release_tx.send(()).unwrap();
+        auto.join().unwrap();
+        let manual = hf129_acquire_catchup_writer(true, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(manual.is_some(), "writer did not become available after real completion");
     }
 
 }

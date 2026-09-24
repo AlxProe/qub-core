@@ -1,0 +1,19 @@
+{
+  "version": "1.8.6",
+  "hotfix": "HF133",
+  "network": "mainnet",
+  "mandatory": true,
+  "chain_upgrade": true,
+  "activation_feature": "asert_mtp",
+  "activation_height": 100000,
+  "activation_height_final": true,
+  "target_spacing_secs": 60,
+  "half_life_secs": 3600,
+  "median_time_window": 11,
+  "protocol_epoch": 3,
+  "protocol_epoch_2_activation_height": 24000,
+  "post_activation_block_version": 3,
+  "protocol_epoch_3_activation_height": 100000,
+  "distribution_origin": "https://download.qubit-coin.io",
+  "windows_trust_policy": "official-origin-unsigned"
+}

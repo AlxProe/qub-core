@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const APP_VERSION: &str = "v1.8.4";
+const APP_VERSION: &str = "v1.8.6";
 const MAX_TEMPLATE_BATCH: usize = 128;
 const DEFAULT_REFRESH_SECS: u64 = 20;
 

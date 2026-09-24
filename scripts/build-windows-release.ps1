@@ -1,23 +1,46 @@
 param(
-    [ValidateSet('regtest','regtest-lan','testnet','mainnet')]
-    [string]$Config = 'regtest-lan',
+    [ValidateSet('mainnet')]
+    [string]$Config = 'mainnet',
     [switch]$SkipTests,
     [switch]$Sign,
     [string]$CertSubject = '',
     [string]$CertThumbprint = '',
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [switch]$BuildInstaller,
-    [switch]$SkipPreflight
+    [switch]$SkipPreflight,
+    [switch]$OfficialOriginUnsigned,
+    [string]$NativeReceipt = '',
+    [string]$DistRoot = ''
 )
 
+throw 'HF133 candidate: this historical HF132 publisher is disabled. Run HF133-daa-r4/run-native.py first. Public packaging requires the HF133 native receipt and final activation review.'
+
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
+if ($SkipTests -or $SkipPreflight) { throw 'HF132 requires native evidence and shipping preflight. Reuse verified evidence with -NativeReceipt; skip switches are not supported.' }
+if (-not $DistRoot) { $DistRoot = Join-Path $Root 'dist' }
+if (-not [IO.Path]::IsPathRooted($DistRoot)) { throw '-DistRoot must be an absolute path.' }
+$DistRoot = [IO.Path]::GetFullPath($DistRoot)
+if (Test-Path -LiteralPath $DistRoot) { throw "Distribution destination already exists; use a new empty -DistRoot path. Nothing was removed: $DistRoot" }
 
-$Version = '1.8.4'
+$Version = '1.8.5'
 $Platform = 'windows-x64'
 $UpdateBaseUrl = 'https://download.qubit-coin.io'
 $env:QUB_BUILD_CONFIG = $Config
+
+$RequiredReleaseDocs = @(
+    'RELEASE_NOTES-v1.8.5-HF132.md',
+    'HF132-v185-RELIABILITY-REVIEW.md',
+    'HF132-v185-DEPLOY-RUNBOOK.md',
+    'HF132-v185-TEST-REPORT.md'
+)
+foreach ($Doc in $RequiredReleaseDocs) {
+    if (-not (Test-Path (Join-Path $Root $Doc) -PathType Leaf)) {
+        throw "Required HF132 release document missing before build: $Doc"
+    }
+}
 
 function Assert-NativeSuccess {
     param(
@@ -32,56 +55,81 @@ function Assert-NativeSuccess {
 # Avoid VCRUNTIME140.dll deployment failures on clean Windows installs.
 # .cargo/config.toml enables crt-static. Keep this explicit for direct script builds,
 # but avoid duplicating the flag when the caller already set it.
-if (($env:RUSTFLAGS -as [string]) -notmatch 'crt-static') {
+if ($env:CARGO_ENCODED_RUSTFLAGS) { throw 'CARGO_ENCODED_RUSTFLAGS overrides RUSTFLAGS; unset it before this release build.' }
+if (($env:RUSTFLAGS -as [string]) -match '-crt-static') { throw 'RUSTFLAGS disables the required static Windows CRT.' }
+if (($env:RUSTFLAGS -as [string]) -notmatch '\+crt-static') {
     $env:RUSTFLAGS = (($env:RUSTFLAGS, '-C target-feature=+crt-static') -join ' ').Trim()
 }
+$env:CARGO_BUILD_TARGET = 'x86_64-pc-windows-msvc'
+if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = Join-Path $Root 'target' }
+if (-not [IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR = Join-Path $Root $env:CARGO_TARGET_DIR }
+$env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
 
-if (-not $SkipTests) {
-    cargo test --locked
-    Assert-NativeSuccess -Operation 'cargo test --locked' -ExitCode $LASTEXITCODE
+if ($OfficialOriginUnsigned -and ($Sign -or $Config -ne 'mainnet' -or -not $BuildInstaller)) {
+    throw '-OfficialOriginUnsigned is only for an unsigned mainnet installer; it cannot be combined with -Sign.'
+}
+if ($Config -eq 'mainnet' -and $BuildInstaller) {
+    if (-not $Sign -and -not $OfficialOriginUnsigned) { throw 'Select -Sign with an exact certificate thumbprint, or the established -OfficialOriginUnsigned mainnet policy.' }
+    if ($SkipTests -or $SkipPreflight) { throw 'Public mainnet installer cannot skip tests or preflight.' }
+    if ($Sign -and $CertThumbprint -notmatch '^[0-9a-fA-F]{40}$') { throw 'Public mainnet signing requires the exact 40-digit certificate thumbprint.' }
+    if ($OfficialOriginUnsigned -and ($CertThumbprint -or $CertSubject)) { throw 'Unsigned mode cannot include a signing certificate selector.' }
 }
 
-$ReleaseDir = Join-Path $Root 'target\x86_64-pc-windows-msvc\release'
+function Find-InnoSetup {
+    $Command = Get-Command 'iscc.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($Command) { return $Command.Source }
+    foreach ($Candidate in @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    )) {
+        if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+    }
+    throw 'Inno Setup 6 compiler not found in PATH or the established machine/user installation paths.'
+}
+
+# Resolve the existing compiler before lengthy Cargo work. No WSL dependency.
+$InnoSetupCompiler = $null
+if ($BuildInstaller) { $InnoSetupCompiler = Find-InnoSetup }
+if (-not (Test-Path -LiteralPath (Join-Path $Root 'assets\qubit-coin-logo.png') -PathType Leaf)) { throw 'Restore known-good runtime assets first: qubit-coin-logo.png is required for Windows resource/version metadata.' }
+$NativeHelper = Join-Path $Root 'scripts\hf132-native-build.py'
+if ($NativeReceipt) {
+    python $NativeHelper verify --source $Root --receipt $NativeReceipt
+    Assert-NativeSuccess -Operation 'HF132 existing native evidence verification' -ExitCode $LASTEXITCODE
+} else {
+    $EvidenceRoot = Join-Path (Split-Path -Parent $Root) ('hf132-native-' + [guid]::NewGuid().ToString('N'))
+    $NativeReceipt = Join-Path $EvidenceRoot 'native-build.json'
+    python $NativeHelper build --source $Root --receipt $NativeReceipt
+    Assert-NativeSuccess -Operation 'HF132 native build and required tests' -ExitCode $LASTEXITCODE
+}
+$NativeReceipt = (Resolve-Path -LiteralPath $NativeReceipt).Path
+$NativeEvidence = Get-Content -LiteralPath $NativeReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
+$ReleaseDir = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc\release'
 $ExpectedReleaseExecutables = @(
     (Join-Path $ReleaseDir 'qub-core.exe'),
     (Join-Path $ReleaseDir 'qubd.exe'),
     (Join-Path $ReleaseDir 'qub-rpc-miner.exe')
 )
-
-# A failed native command must never fall through and package an executable
-# left by an older build. Remove only the three expected release outputs.
 foreach ($Exe in $ExpectedReleaseExecutables) {
-    Remove-Item -Force $Exe -ErrorAction SilentlyContinue
-}
-
-cargo build --locked --release --bin qub-core --target x86_64-pc-windows-msvc
-Assert-NativeSuccess -Operation 'cargo build qub-core' -ExitCode $LASTEXITCODE
-cargo build --locked --release --bin qubd --target x86_64-pc-windows-msvc
-Assert-NativeSuccess -Operation 'cargo build qubd' -ExitCode $LASTEXITCODE
-cargo build --locked --release --bin qub-rpc-miner --target x86_64-pc-windows-msvc
-Assert-NativeSuccess -Operation 'cargo build qub-rpc-miner' -ExitCode $LASTEXITCODE
-
-foreach ($Exe in $ExpectedReleaseExecutables) {
-    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
-        throw "Expected freshly built executable is missing: $Exe"
-    }
+    if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "Verified native output missing: $Exe" }
 }
 
 function Find-SignTool {
     $candidates = @(
-        "$env:ProgramFiles(x86)\Windows Kits\10\bin\*\x64\signtool.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe",
         "$env:ProgramFiles\Windows Kits\10\bin\*\x64\signtool.exe"
     )
     foreach ($pattern in $candidates) {
         $match = Get-ChildItem $pattern -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
         if ($match) { return $match.FullName }
     }
-    return 'signtool.exe'
+    return (Get-Command 'signtool.exe' -ErrorAction Stop).Source
 }
 
-$DistRoot = Join-Path $Root 'dist'
+# Reserve the destination without -Force. A concurrent creation is a failure,
+# never permission to merge into or replace an existing distribution.
+New-Item -ItemType Directory -Path $DistRoot -ErrorAction Stop | Out-Null
 $Dist = Join-Path $DistRoot "QUB-Core-v$Version-$Platform-$Config"
-if (Test-Path $Dist) { Remove-Item $Dist -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Dist 'config') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $Dist 'assets') | Out-Null
@@ -95,36 +143,27 @@ New-Item -ItemType Directory -Force -Path $ChannelUpdateDir | Out-Null
 Copy-Item (Join-Path $ReleaseDir 'qub-core.exe') (Join-Path $Dist 'QUB-Core.exe')
 Copy-Item (Join-Path $ReleaseDir 'qubd.exe') (Join-Path $Dist 'tools\qubd.exe')
 Copy-Item (Join-Path $ReleaseDir 'qub-rpc-miner.exe') (Join-Path $Dist 'tools\qub-rpc-miner.exe')
+# Confirm the copied bytes, not only the earlier shared-cache verification.
+$CopiedExecutables = @{
+    'qub-core.exe' = (Join-Path $Dist 'QUB-Core.exe')
+    'qubd.exe' = (Join-Path $Dist 'tools\qubd.exe')
+    'qub-rpc-miner.exe' = (Join-Path $Dist 'tools\qub-rpc-miner.exe')
+}
+foreach ($Name in $CopiedExecutables.Keys) {
+    $Entry = $NativeEvidence.binaries.PSObject.Properties[$Name].Value
+    if ((Get-FileHash -LiteralPath $CopiedExecutables[$Name] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Entry.sha256) {
+        throw "Copied distribution executable differs from verified native evidence: $Name"
+    }
+}
 Copy-Item (Join-Path $Root 'config\*.toml') (Join-Path $Dist 'config')
 if (Test-Path (Join-Path $Root 'README-MINER-WINDOWS.md')) { Copy-Item (Join-Path $Root 'README-MINER-WINDOWS.md') $Dist }
-foreach ($Doc in @(
-    'README-FAST-CHAIN-ENGINE.md',
-    'README-RPC-MINER.md',
-    'RELEASE_NOTES-v1.8.0-HF123.md',
-    'HF123-v180-ENTERPRISE-REVIEW.md',
-    'HF123-v180-DEPLOY-RUNBOOK.md',
-    'RELEASE_NOTES-v1.8.1-HF124.md',
-    'HF124-v181-RELIABILITY-REVIEW.md',
-    'HF124-v181-DEPLOY-RUNBOOK.md',
-    'RELEASE_NOTES-v1.8.2-HF125.md',
-    'HF125-v182-RELIABILITY-REVIEW.md',
-    'HF125-v182-DEPLOY-RUNBOOK.md',
-    'RELEASE_NOTES-v1.8.2-HF126.md',
-    'HF126-v182-RELIABILITY-REVIEW.md',
-    'HF126-v182-DEPLOY-RUNBOOK.md',
-    'RELEASE_NOTES-v1.8.3-HF127.md',
-    'HF127-v183-RELIABILITY-REVIEW.md',
-    'HF127-v183-DEPLOY-RUNBOOK.md',
-    'RELEASE_NOTES-v1.8.4-HF128.md',
-    'HF128-v184-RELIABILITY-REVIEW.md',
-    'HF128-v184-DEPLOY-RUNBOOK.md',
-    'QUB-Public-Release-Checksums-and-Signing-v1.0.0.md',
-    'QUB-Windows-Code-Signing-v1.0.0.md',
-    'QUB-Mainnet-Release-Readiness-v1.0.0.md',
-    'QUB-Automatic-Discovery-Production-Runbook-v1.0.0.md'
-)) {
+# End-user documentation only. Historical deploy/runbook evidence stays in source.
+foreach ($Doc in @('README-FAST-CHAIN-ENGINE.md', 'README-RPC-MINER.md', 'RELEASE_NOTES-v1.8.5-HF132.md')) {
     $DocPath = Join-Path $Root $Doc
-    if (Test-Path $DocPath) { Copy-Item $DocPath $Dist }
+    if (Test-Path -LiteralPath $DocPath -PathType Leaf) { Copy-Item -LiteralPath $DocPath -Destination $Dist }
+}
+foreach ($LegalFile in @(Get-ChildItem -LiteralPath $Root -File | Where-Object { $_.Name -match '^(LICENSE|COPYING|NOTICE)([.-].*)?$' })) {
+    Copy-Item -LiteralPath $LegalFile.FullName -Destination $Dist
 }
 $AssetsReadme = Join-Path $Root 'assets\README.md'
 if (Test-Path $AssetsReadme) {
@@ -375,10 +414,20 @@ cd /d "%QUB_HOME%"
 "@
 Set-Content -Encoding ASCII -Path (Join-Path $Dist 'tools\Sync-QUB-Once.cmd') -Value $SyncOnce
 
-if (-not $SkipPreflight) {
+& {
     $PreflightConfig = Join-Path $Dist "config\$Config.toml"
-    & (Join-Path $Dist 'tools\qubd.exe') --config $PreflightConfig preflight
-    if ($LASTEXITCODE -ne 0) { throw "QUB preflight failed for $Config. Fix config before building a public bundle, or use -SkipPreflight only for local debugging." }
+    # preflight calls load_or_init_chain; isolate its relative data_dir so it
+    # cannot create state in the source inventory or the shipping bundle.
+    $PreflightRoot = Join-Path ([IO.Path]::GetTempPath()) ('qub-hf132-preflight-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $PreflightRoot | Out-Null
+    Push-Location $PreflightRoot
+    try {
+        & (Join-Path $Dist 'tools\qubd.exe') --config $PreflightConfig preflight
+        if ($LASTEXITCODE -ne 0) { throw "QUB preflight failed for $Config in disposable data directory $PreflightRoot" }
+    } finally {
+        Pop-Location
+        Remove-Item -LiteralPath $PreflightRoot -Recurse -Force
+    }
 }
 
 if ($Sign) {
@@ -396,6 +445,14 @@ if ($Sign) {
         if ($LASTEXITCODE -ne 0) { throw "signtool failed for $Exe" }
         & $SignTool verify /pa /v $Exe
         if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $Exe" }
+        $Signature = Get-AuthenticodeSignature -LiteralPath $Exe
+        if ($Signature.Status -ne 'Valid') { throw "Authenticode chain invalid: $Exe" }
+        if ($CertThumbprint -and $Signature.SignerCertificate.Thumbprint -ne $CertThumbprint) { throw "Unexpected signing certificate: $Exe" }
+    }
+}
+if ($OfficialOriginUnsigned) {
+    foreach ($Exe in @((Join-Path $Dist 'QUB-Core.exe'), (Join-Path $Dist 'tools\qubd.exe'), (Join-Path $Dist 'tools\qub-rpc-miner.exe'))) {
+        if ((Get-AuthenticodeSignature -LiteralPath $Exe).Status -ne 'NotSigned') { throw "Official-origin unsigned mode requires NotSigned; it never accepts an invalid signature: $Exe" }
     }
 }
 
@@ -406,10 +463,13 @@ Get-ChildItem $Dist -Recurse -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt'
 } | Set-Content -Encoding ASCII $HashFile
 
 if ($BuildInstaller) {
-    $ISCC = 'iscc.exe'
+    $ISCC = $InnoSetupCompiler
+    $InstallerName = "QUB-Core-v$Version-Windows-x64-$Config-Setup.exe"
+    $InstallerPath = Join-Path $DistRoot "installer\$InstallerName"
+    if (Test-Path -LiteralPath $InstallerPath) { throw "Installer destination unexpectedly exists: $InstallerPath" }
     $Iss = Join-Path $Root 'installer\QUB-Core.iss'
     if (-not (Test-Path $Iss)) { throw "Missing installer script: $Iss" }
-    & $ISCC "/DMyAppSource=$Dist" "/DMyAppConfig=$Config" $Iss
+    & $ISCC ("/O" + (Join-Path $DistRoot 'installer')) "/DMyAppSource=$Dist" "/DMyAppConfig=$Config" $Iss
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup compiler failed' }
 
     $InstallerName = "QUB-Core-v$Version-Windows-x64-$Config-Setup.exe"
@@ -428,6 +488,12 @@ if ($BuildInstaller) {
         if ($LASTEXITCODE -ne 0) { throw "signtool failed for installer $InstallerPath" }
         & $SignTool verify /pa /v $InstallerPath
         if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for installer $InstallerPath" }
+        $Signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
+        if ($Signature.Status -ne 'Valid') { throw 'Installer Authenticode chain invalid' }
+        if ($CertThumbprint -and $Signature.SignerCertificate.Thumbprint -ne $CertThumbprint) { throw 'Installer signing certificate mismatch' }
+    }
+    if ($OfficialOriginUnsigned -and (Get-AuthenticodeSignature -LiteralPath $InstallerPath).Status -ne 'NotSigned') {
+        throw 'Official-origin unsigned installer must be NotSigned; an invalid signature is never accepted.'
     }
 
     $LatestExe = Join-Path $DistRoot 'updates\QUB-Core-Latest.exe'
@@ -451,14 +517,24 @@ if ($BuildInstaller) {
         version = $Version
         platform = 'windows-x64'
         kind = 'installer'
-        mandatory = $false
-        consensus_family = $ConsensusFamily
+        mandatory = ($Config -eq 'mainnet')
+        chain_upgrade = $false
+        hotfix = 'HF132'
+        activation_feature = 'none'
+        activation_height = 0
+        protocol_epoch = 2
+        protocol_epoch_2_activation_height = 24000
+        post_activation_block_version = 2
+        checkpoint_height = 10367
+        checkpoint_hash = '21dac61d5bd98053420870a68f323da4ba84145263921036504a8a9706000000'
+        consensus_family = if ($Config -eq 'mainnet') { 'qns-1000-jin-5555-qnsminer-8305-jinconv-8305-pools-9999-poolrename-forkcp-10367-daa2-10500-library-10550-blast-10600-jinsale-10720-qubjin-16777-verifiedgov-21000-epoch2-24000' } else { $ConsensusFamily }
+        hotfix_family = 'hf132-sync-catchup-reliability'
         published_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         url = "$UpdateBaseUrl/$Config/windows-x64/$InstallerName"
         latest_url = "$UpdateBaseUrl/$Config/windows-x64/QUB-Core-Latest.exe"
         sha256 = $VersionedHash
         size = [int64](Get-Item $VersionedUpdateInstaller).Length
-        notes = 'HF128 bounded manifest updater. Unsigned private builds are accepted only when both manifest and artifact stay on the exact official HTTPS origin; custom origins require the pinned Authenticode signer.'
+        notes = 'HF132 sync catch-up completion, moving-tip progress and pending solo/pool Start/Stop reliability, retaining HF131 fixes and unchanged mainnet consensus.'
     }
     $ManifestJson = $Manifest | ConvertTo-Json -Depth 8
     $ManifestPath = Join-Path $ChannelUpdateDir 'manifest.json'
@@ -466,8 +542,12 @@ if ($BuildInstaller) {
     [System.IO.File]::WriteAllText($ManifestPath, $ManifestJson, $Utf8NoBom)
     $ManifestHash = (Get-FileHash -Algorithm SHA256 $ManifestPath).Hash.ToLower()
     Set-Content -Encoding ASCII (Join-Path $ChannelUpdateDir 'manifest.json.sha256') $ManifestHash
+    Get-ChildItem -LiteralPath $ChannelUpdateDir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name | ForEach-Object {
+        "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+    } | Set-Content -Encoding ASCII (Join-Path $ChannelUpdateDir 'SHA256SUMS.txt')
 }
 
+Write-Host "Native evidence: $NativeReceipt"
 Write-Host "Built release bundle: $Dist"
 Write-Host "Normal users run: $Dist\QUB-Core.exe"
 Write-Host "Advanced tools: $Dist\tools"
@@ -477,3 +557,4 @@ if ($BuildInstaller) {
     Write-Host "Manifest channel output: $DistRoot\updates\$Config\windows-x64\manifest.json"
 }
 if ($Sign) { Write-Host "Executables were Authenticode-signed before SHA256SUMS.txt was generated." }
+if ($OfficialOriginUnsigned) { Write-Host 'Unsigned official-origin release: NotSigned verified before checksums; distribute only via the established download.qubit-coin.io HTTPS URLs.' }

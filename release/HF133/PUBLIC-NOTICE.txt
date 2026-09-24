@@ -1,0 +1,27 @@
+QUB Core 1.8.6 / HF133 is available.
+
+Mandatory mainnet upgrade: update before block #100000.
+This applies to wallets, solo miners, pool miners and node operators.
+Older releases, including 1.8.4, cannot follow the upgraded chain after activation.
+
+HF133 activates ASERT-MTP difficulty adjustment at #100000, with a 60-second
+target, to reduce repeated difficulty swings under changing mining power.
+It also includes synchronization and memory improvements. A 60-second target
+is not a guarantee for each block; mining power still affects block arrival.
+
+Download: https://download.qubit-coin.io/
+
+If the old Windows auto-updater closes the app without updating it: stop mining,
+close QUB Core, download the installer from the official page and run it over
+your existing installation. Reopen the app and confirm version 1.8.6.
+Keep your existing wallet and chain-data folders.
+
+Windows installer SHA256:
+f1dc68a7bfa04ea534b20194e88f107eaa338454f9c6d89912aa6dadcf3fce7e
+
+Release notes and checksums:
+https://download.qubit-coin.io/releases/v1.8.6-HF133/RELEASE_NOTES-v1.8.6-HF133.md
+https://download.qubit-coin.io/releases/v1.8.6-HF133/SHA256SUMS.txt
+
+Activation is by block height, not a fixed date. Update before #100000 and
+do not downgrade to an epoch-2-only release after activation.

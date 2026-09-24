@@ -41,7 +41,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.4";
+const APP_VERSION: &str = "v1.8.6";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -131,13 +131,95 @@ const FIATJ_APPROVE_GAS_LIMIT: u64 = 70_000;
 
 
 static HF105_CATCHUP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static HF105_CATCHUP_EPOCH: AtomicU64 = AtomicU64::new(0);
 static HF105_CATCHUP_STARTED_MS: AtomicU64 = AtomicU64::new(0);
-static HF128_CATCHUP_FORCE_PENDING: AtomicBool = AtomicBool::new(false);
+static HF130_CATCHUP_MANUAL_PENDING: AtomicBool = AtomicBool::new(false);
+static HF129_SNAPSHOT_CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "windows")]
 static HF128_UPDATE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
-static HF105_SNAPSHOT_WORKER_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static HF105_SNAPSHOT_WORKER_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Default)]
+struct Hf129CatchupOutcome {
+    epoch: u64,
+    terminal: String,
+    reason: String,
+    writer_acquired: bool,
+    writer_busy: bool,
+    progressed: bool,
+    fresh_at_tip: bool,
+    before_height: u32,
+    target_height: u32,
+    after_height: u32,
+    after_tip_hash: String,
+    error: String,
+}
+
+fn hf129_catchup_outcome_slot() -> &'static Mutex<Option<Hf129CatchupOutcome>> {
+    static SLOT: OnceLock<Mutex<Option<Hf129CatchupOutcome>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn hf129_publish_catchup_outcome(outcome: Hf129CatchupOutcome) {
+    if let Ok(mut slot) = hf129_catchup_outcome_slot().lock() {
+        *slot = Some(outcome);
+    }
+}
+
+fn hf129_latest_catchup_outcome() -> Option<Hf129CatchupOutcome> {
+    hf129_catchup_outcome_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn hf129_snapshot_capture_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+fn hf129_snapshot_capture_is_newer(last_applied: u64, candidate: u64) -> bool {
+    candidate > last_applied
+}
+
+fn hf129_preserve_newer_snapshot_head(current: &ChainSnapshot, incoming: &mut ChainSnapshot) {
+    incoming.head_capture_seq = current.head_capture_seq;
+    incoming.height = current.height;
+    incoming.best_hash = current.best_hash.clone();
+    incoming.recent_blocks = current.recent_blocks.clone();
+    incoming.recent_avg_10_secs = current.recent_avg_10_secs;
+    incoming.recent_avg_20_secs = current.recent_avg_20_secs;
+    incoming.daa_observation = current.daa_observation.clone();
+    incoming.mempool_txs = current.mempool_txs;
+    incoming.spendable = current.spendable.clone();
+    incoming.immature = current.immature.clone();
+    incoming.total = current.total.clone();
+    incoming.block_reward = current.block_reward.clone();
+    incoming.qub_jin_infusion_active = current.qub_jin_infusion_active;
+
+    // Peer visibility is not an independently sequenced lane. Preserve the
+    // highest paired observation, never a height with a hash from another tip.
+    if current.known_network_height > incoming.known_network_height
+        || (current.known_network_height == incoming.known_network_height
+            && !current.known_network_hash.trim().is_empty())
+    {
+        incoming.known_network_height = current.known_network_height;
+        incoming.known_network_hash = current.known_network_hash.clone();
+    }
+    incoming.direct_network_height = incoming
+        .direct_network_height
+        .max(current.direct_network_height);
+}
+
+fn hf131_peer_tip_for_display(peer: &p2p::P2PPeerStatus) -> Option<(u32, String)> {
+    if !peer.reachable || peer.seen_age_secs.unwrap_or(u64::MAX) > 30
+        || peer.error.as_deref().map(|error| !error.trim().is_empty()).unwrap_or(false)
+    {
+        return None;
+    }
+    let height = peer.height?;
+    let hash = peer.tip_hash.as_deref()?.trim();
+    Hash256::from_hex(hash).ok()?;
+    Some((height, hash.to_string()))
+}
 
 fn hf85_now_ms() -> u64 {
     SystemTime::now()
@@ -148,7 +230,9 @@ fn hf85_now_ms() -> u64 {
 }
 
 fn hf85_catchup_epoch() -> u64 {
-    HF105_CATCHUP_EPOCH.load(Ordering::SeqCst)
+    hf129_latest_catchup_outcome()
+        .map(|outcome| outcome.epoch)
+        .unwrap_or(0)
 }
 
 fn hf85_catchup_running() -> bool {
@@ -161,95 +245,196 @@ fn hf85_catchup_elapsed_secs() -> u64 {
     hf85_now_ms().saturating_sub(started) / 1000
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hf130CatchupRequest {
+    Automatic,
+    AutomaticDeep,
+    ManualRepair,
+}
+
 fn spawn_hf85_catchup_pulse(config_path: String, force: bool) {
-    // HF106/v1.6.9: chain catch-up is a detached writer, never a GUI reader gate.
-    // It is allowed to run longer than a UI snapshot, but the wallet/blocks view
-    // must remain visible and refresh through quick local snapshots.
-    let now_ms = hf85_now_ms();
-    // HF123/v1.8.0: a catch-up worker is true single-flight. Never release the
-    // gate merely because a slow worker crossed an elapsed-time threshold; that
-    // created phantom completion pulses and status churn while the original
-    // consensus writer was still alive.
-    if force {
-        // A manual Sync/Repair request must survive an already-running
-        // automatic pulse. HF127 silently discarded it at this point.
-        HF128_CATCHUP_FORCE_PENDING.store(true, Ordering::SeqCst);
+    spawn_hf130_catchup_pulse(config_path, if force {
+        Hf130CatchupRequest::ManualRepair
+    } else {
+        Hf130CatchupRequest::Automatic
+    });
+}
+
+fn hf130_queue_manual_repair(pending: &AtomicBool, request: Hf130CatchupRequest) {
+    // Periodic automatic requests must never extend an in-flight request.
+    if request == Hf130CatchupRequest::ManualRepair {
+        pending.store(true, Ordering::SeqCst);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hf130GuiCatchupRoute {
+    Disabled,
+    PublicAuto,
+    PublicRepair,
+    RegtestPeers,
+    RegtestLocal,
+}
+
+fn hf130_gui_catchup_route(settings: &Settings, run_deep: bool) -> Result<Hf130GuiCatchupRoute> {
+    if !settings.p2p.enabled {
+        return Ok(Hf130GuiCatchupRoute::Disabled);
+    }
+    match settings.network.name.as_str() {
+        "mainnet" | "testnet" if run_deep => Ok(Hf130GuiCatchupRoute::PublicRepair),
+        "mainnet" | "testnet" => Ok(Hf130GuiCatchupRoute::PublicAuto),
+        "regtest" if run_deep => Ok(Hf130GuiCatchupRoute::RegtestPeers),
+        "regtest" => Ok(Hf130GuiCatchupRoute::RegtestLocal),
+        name => anyhow::bail!("GUI Sync does not support network {name}"),
+    }
+}
+
+fn hf130_run_gui_catchup(settings: &Settings, run_deep: bool) -> Result<p2p::P2PSyncReport> {
+    match hf130_gui_catchup_route(settings, run_deep)? {
+        Hf130GuiCatchupRoute::PublicRepair => p2p::hf110_deep_official_repair(settings, 420_000),
+        Hf130GuiCatchupRoute::PublicAuto => p2p::hf90_auto_catchup(settings, 240_000),
+        Hf130GuiCatchupRoute::RegtestPeers => {
+            // The existing P2P path validates network, PoW and fork choice and
+            // shares the canonical writer/deadline. Regtest has no public seed
+            // fallback. Its peer observation is not an official canonical proof.
+            let mut report = p2p::sync_quick(settings, settings.p2p.max_outbound_peers.min(8), 60_000)?;
+            report.sync_reason = "regtest-peer-sync".to_string();
+            Ok(report)
+        }
+        Hf130GuiCatchupRoute::RegtestLocal => Ok(p2p::P2PSyncReport {
+            // Keep controlled regtest gaps intact until an explicit Sync click.
+            terminal: "local-only".to_string(),
+            sync_reason: "regtest-local-only".to_string(),
+            ..Default::default()
+        }),
+        Hf130GuiCatchupRoute::Disabled => Ok(p2p::P2PSyncReport {
+            terminal: "p2p-disabled".to_string(),
+            sync_reason: "p2p-disabled".to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
+fn spawn_hf130_catchup_pulse(config_path: String, request: Hf130CatchupRequest) {
+    hf130_queue_manual_repair(&HF130_CATCHUP_MANUAL_PENDING, request);
     if HF105_CATCHUP_IN_FLIGHT
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
     }
-    HF105_CATCHUP_STARTED_MS.store(now_ms, Ordering::SeqCst);
+    HF105_CATCHUP_STARTED_MS.store(hf85_now_ms(), Ordering::SeqCst);
     thread::spawn(move || {
-        let mut first_force = force;
-        loop {
-            // Always consume the queued flag, even when this worker was born
-            // from a force request. Using `force || swap(false)` leaves the
-            // flag set because `||` short-circuits and turns one click into an
-            // endless sequence of 420-second repairs.
-            let queued_force = HF128_CATCHUP_FORCE_PENDING.swap(false, Ordering::SeqCst);
-            let run_force = first_force || queued_force;
-            first_force = false;
-            let _ = std::panic::catch_unwind(|| {
-                let _ = (|| -> Result<()> {
-                    let settings = load_gui_settings(&config_path)?;
-                    if settings.p2p.enabled && matches!(settings.network.name.as_str(), "mainnet" | "testnet") {
-                        if run_force {
-                            // HF111/v1.7.1: force/manual/auto-heal repairs use a
-                            // deeper official-only chain repair path. This replaces
-                            // the user workaround of deleting local data while keeping
-                            // wallet.json safe.
-                            let _ = p2p::hf110_deep_official_repair(&settings, 420_000);
-                        } else {
-                            let _ = p2p::hf90_auto_catchup(&settings, 240_000);
-                        }
-                    }
-                    Ok(())
-                })();
+        // One initial pass plus one coalesced explicit manual request. Automatic
+        // timers cannot create a third pass, even when a pass lasts minutes.
+        for pass in 0..2 {
+            let manual = HF130_CATCHUP_MANUAL_PENDING.swap(false, Ordering::SeqCst);
+            let run_deep = manual || (pass == 0 && request != Hf130CatchupRequest::Automatic);
+            let reason = if manual { "manual-deep-repair" }
+                else if run_deep { "auto-deep-repair" } else { "auto" };
+            let result = std::panic::catch_unwind(|| -> Result<p2p::P2PSyncReport> {
+                let settings = load_gui_settings(&config_path)?;
+                hf130_run_gui_catchup(&settings, run_deep)
             });
-            if !HF128_CATCHUP_FORCE_PENDING.load(Ordering::SeqCst) {
-                break;
-            }
-            // A force request arrived while the automatic pass owned the
-            // writer. Run it in this same worker with no competing disk writer.
+            let mut outcome = match result {
+                Ok(Ok(report)) => Hf129CatchupOutcome {
+                    terminal: report.terminal.clone(),
+                    reason: if report.sync_reason.starts_with("regtest-") || report.terminal == "p2p-disabled" {
+                        report.sync_reason.clone()
+                    } else { reason.to_string() },
+                    writer_acquired: report.writer_acquired,
+                    writer_busy: report.writer_busy,
+                    progressed: report.progressed,
+                    fresh_at_tip: report.fresh_at_tip,
+                    before_height: report.before_height,
+                    target_height: report.best_peer_height,
+                    after_height: report.height,
+                    after_tip_hash: report.tip_hash,
+                    ..Default::default()
+                },
+                Ok(Err(err)) => Hf129CatchupOutcome {
+                    terminal: "failed".to_string(), reason: reason.to_string(),
+                    error: format!("{err:#}"), ..Default::default()
+                },
+                Err(_) => Hf129CatchupOutcome {
+                    terminal: "failed".to_string(), reason: reason.to_string(),
+                    error: "catch-up worker panicked".to_string(), ..Default::default()
+                },
+            };
+            outcome.epoch = hf85_catchup_epoch().saturating_add(1);
+            // Publish every pass, including a busy/failed manual repair. A busy
+            // deadline is an outcome, not permission to restart it forever.
+            hf129_publish_catchup_outcome(outcome);
+            if !HF130_CATCHUP_MANUAL_PENDING.load(Ordering::SeqCst) { break; }
             HF105_CATCHUP_STARTED_MS.store(hf85_now_ms(), Ordering::SeqCst);
         }
-        HF105_CATCHUP_EPOCH.fetch_add(1, Ordering::SeqCst);
         HF105_CATCHUP_IN_FLIGHT.store(false, Ordering::SeqCst);
-        // Close the tiny handoff race: if a force request arrived after the
-        // final loop check but before the gate opened, immediately reacquire it.
-        if HF128_CATCHUP_FORCE_PENDING.load(Ordering::SeqCst) {
-            spawn_hf85_catchup_pulse(config_path, true);
+        // Close the handoff race for a real click; do not enqueue another click.
+        if HF130_CATCHUP_MANUAL_PENDING.load(Ordering::SeqCst) {
+            spawn_hf130_catchup_pulse(config_path, Hf130CatchupRequest::Automatic);
         }
     });
 }
 
-
-fn hf88_try_begin_snapshot_worker() -> bool {
-    let now_ms = hf85_now_ms();
-    // HF123/v1.8.0: snapshot readers are also true single-flight. The Fast
-    // Chain Engine/live canonical owner removes the old JSON-reader deadlock;
-    // starting a replacement reader while the first one is alive only produces
-    // duplicate scans and misleading UI completion events.
-    if HF105_SNAPSHOT_WORKER_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        HF105_SNAPSHOT_WORKER_STARTED_MS.store(now_ms, Ordering::SeqCst);
-        true
-    } else {
-        false
+fn hf130_recapture_head<T: Clone>(
+    prior: &T,
+    prior_seq: u64,
+    read: impl FnOnce() -> Result<T>,
+    next_seq: impl FnOnce() -> u64,
+) -> (T, u64) {
+    match read() {
+        Ok(head) => (head, next_seq()),
+        Err(_) => (prior.clone(), prior_seq),
     }
 }
 
-fn hf88_finish_snapshot_worker() {
-    HF105_SNAPSHOT_WORKER_IN_FLIGHT.store(false, Ordering::SeqCst);
+
+fn hf132_snapshot_reader_gate() -> &'static Arc<AtomicBool> {
+    static GATE: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+struct Hf132SnapshotReaderLease(Arc<AtomicBool>);
+
+impl Drop for Hf132SnapshotReaderLease {
+    fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
 }
 
 fn hf88_snapshot_worker_running() -> bool {
-    HF105_SNAPSHOT_WORKER_IN_FLIGHT.load(Ordering::SeqCst)
+    hf132_snapshot_reader_gate().load(Ordering::SeqCst)
+}
+
+fn hf132_spawn_snapshot_reader<T: Send + 'static>(
+    gate: Arc<AtomicBool>,
+    read: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<Option<mpsc::Receiver<std::result::Result<T, String>>>> {
+    if gate.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Ok(None);
+    }
+    let lease = Hf132SnapshotReaderLease(gate);
+    let (tx, rx) = mpsc::channel();
+    // The captured lease also releases admission if the OS refuses the thread.
+    thread::Builder::new().name("qub-snapshot-reader".to_string()).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("QUB Core snapshot worker panicked")))
+            .map_err(|err| format!("{err:#}"));
+        drop(lease);
+        let _ = tx.send(result);
+    })?;
+    Ok(Some(rx))
+}
+
+fn hf132_observed_sync_fraction(local: u32, known: u32) -> f32 {
+    if known == 0 { 0.0 } else { (local as f32 / known as f32).clamp(0.0, 1.0) }
+}
+
+fn hf132_recent_sync_rate(rate: f32, sample_age: Duration) -> f32 {
+    if sample_age <= Duration::from_secs(30) { rate } else { 0.0 }
+}
+
+fn hf132_snapshot_read_deferred(error: &str) -> bool {
+    error.starts_with("live chain snapshot is busy;")
+        || error.starts_with("chain initialization is busy;")
 }
 
 const UI_ICON_NAMES: &[&str] = &[
@@ -1063,7 +1248,10 @@ enum UpdateEvent {
 
 #[derive(Debug, Clone)]
 struct ChainSnapshot {
+    capture_seq: u64,
+    head_capture_seq: u64,
     network: String,
+    address_prefix: String,
     height: u32,
     best_hash: String,
     known_network_height: u32,
@@ -1124,7 +1312,10 @@ struct ChainSnapshot {
 impl Default for ChainSnapshot {
     fn default() -> Self {
         Self {
+            capture_seq: 0,
+            head_capture_seq: 0,
             network: "not loaded".to_string(),
+            address_prefix: String::new(),
             height: 0,
             best_hash: "-".to_string(),
             known_network_height: 0,
@@ -1361,6 +1552,7 @@ impl Default for EnjinMatrixMetrics {
 
 #[derive(Debug)]
 enum MinerEvent {
+    PayoutResolved { requested: String, address: String },
     Started { threads: usize, duty: u8, target_height: u32 },
     Hashrate { hps: f64, total_hashes: u64, threads: usize, duty: u8, target_height: u32 },
     GpuStarted { device: String, workers: usize, power: u8, target_height: u32 },
@@ -1372,7 +1564,20 @@ enum MinerEvent {
     Status(String),
     Error(String),
     PlanRejected(String),
-    Stopped { restart_allowed: bool },
+    Stopped { reason: MinerExitReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinerExitReason {
+    Cancelled,
+    PlanRejected,
+    UnexpectedExit,
+}
+
+fn hf130_miner_exit_reason(cancelled: bool, restart_allowed: bool) -> MinerExitReason {
+    if !restart_allowed { MinerExitReason::PlanRejected }
+    else if cancelled { MinerExitReason::Cancelled }
+    else { MinerExitReason::UnexpectedExit }
 }
 
 #[derive(Debug)]
@@ -1381,14 +1586,84 @@ enum BenchmarkEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MinerRunMode {
+    Solo { payout_address: String },
+    Pool { pool_id: String, miner_address: String },
+}
+
+impl MinerRunMode {
+    fn pool_id(&self) -> Option<&str> {
+        match self {
+            Self::Solo { .. } => None,
+            Self::Pool { pool_id, .. } => Some(pool_id),
+        }
+    }
+
+    fn payout_address(&self) -> &str {
+        match self {
+            Self::Solo { payout_address } => payout_address,
+            Self::Pool { miner_address, .. } => miner_address,
+        }
+    }
+}
+
+fn hf131_mode_with_resolved_payout(
+    mode: &MinerRunMode, requested: &str, address: &str,
+) -> Option<MinerRunMode> {
+    match mode {
+        MinerRunMode::Solo { payout_address } if payout_address.trim() == requested.trim() => {
+            Some(MinerRunMode::Solo { payout_address: address.to_string() })
+        }
+        MinerRunMode::Pool { pool_id, miner_address } if miner_address.trim() == requested.trim() => {
+            Some(MinerRunMode::Pool { pool_id: pool_id.clone(), miner_address: address.to_string() })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiningRestartCause {
+    CanonicalCatchup,
+    Reconfigure,
+    UnexpectedExit,
+}
+
+#[derive(Debug, Clone)]
+struct MiningRestartPlan {
+    at: Instant,
+    mode: MinerRunMode,
+    cause: MiningRestartCause,
+    retiring_generation: u64,
+}
+
+fn hf129_authorized_restart_plan(
+    intent: &Option<MinerRunMode>,
+    plan: Option<&MiningRestartPlan>,
+    retiring_generation: u64,
+    retiring_mode: &MinerRunMode,
+) -> Option<MiningRestartPlan> {
+    plan.filter(|candidate| {
+        candidate.retiring_generation == retiring_generation
+            && &candidate.mode == retiring_mode
+            && intent.as_ref() == Some(&candidate.mode)
+    })
+    .cloned()
+}
+
 struct MinerHandle {
     stop: Arc<AtomicBool>,
     rx: mpsc::Receiver<MinerEvent>,
     join: Option<thread::JoinHandle<()>>,
+    generation: u64,
+    mode: MinerRunMode,
+    cancellation_requested: bool,
+    exit_reason: Option<MinerExitReason>,
 }
 
 impl MinerHandle {
     fn stop(&mut self) {
+        self.cancellation_requested = true;
         self.stop.store(true, Ordering::Relaxed);
     }
 }
@@ -1507,6 +1782,8 @@ struct QubCoreApp {
     last_send_status_poll: Instant,
     snapshot_rx: Option<mpsc::Receiver<std::result::Result<ChainSnapshot, String>>>,
     snapshot_in_flight: bool,
+    last_applied_snapshot_capture_seq: u64,
+    last_applied_snapshot_head_capture_seq: u64,
     last_theme_applied: ThemeChoice,
     logo: Option<egui::TextureHandle>,
     jin_logo: Option<egui::TextureHandle>,
@@ -1519,7 +1796,6 @@ struct QubCoreApp {
     online_icon: Option<egui::TextureHandle>,
     offline_icon: Option<egui::TextureHandle>,
     icons: IconSet,
-    wallet_sync_rx: Option<mpsc::Receiver<std::result::Result<ChainSnapshot, String>>>,
     wallet_sync_in_flight: bool,
     wallet_create_rx: Option<mpsc::Receiver<std::result::Result<String, String>>>,
     wallet_create_in_flight: bool,
@@ -1584,12 +1860,16 @@ struct QubCoreApp {
     manual_stop_requested: bool,
     desired_pool_mining_pool_id: String,
     auto_restart_mining_at: Option<Instant>,
-    hf110_autoheal_paused_mining: bool,
-    hf110_last_mining_auto_pause: Instant,
+    mining_intent: Option<MinerRunMode>,
+    mining_restart_plan: Option<MiningRestartPlan>,
+    next_miner_generation: u64,
+    mining_plan_rejected_generation: Option<u64>,
     hf85_last_auto_catchup_sync: Instant,
     hf85_auto_catchup_last_height: u32,
     hf85_auto_catchup_stale_since: Instant,
     hf85_seen_catchup_epoch: u64,
+    hf129_retained_catchup_target_height: u32,
+    hf129_retained_catchup_target_at: Option<Instant>,
     hf88_last_peer_probe: Instant,
     hf88_last_snapshot_height: u32,
     hf88_snapshot_stale_since: Instant,
@@ -1918,6 +2198,8 @@ impl QubCoreApp {
             last_send_status_poll: Instant::now() - Duration::from_secs(10),
             snapshot_rx: None,
             snapshot_in_flight: false,
+            last_applied_snapshot_capture_seq: 0,
+            last_applied_snapshot_head_capture_seq: 0,
             last_theme_applied: initial_theme,
             logo: load_logo_texture(&cc.egui_ctx),
             jin_logo: load_asset_texture(&cc.egui_ctx, JIN_LOGO_PATH, "jin-coin-logo"),
@@ -1932,7 +2214,6 @@ impl QubCoreApp {
             online_icon: load_asset_texture(&cc.egui_ctx, ONLINE_ICON_PATH, "online-icon"),
             offline_icon: load_asset_texture(&cc.egui_ctx, OFFLINE_ICON_PATH, "offline-icon"),
             icons: IconSet::load(&cc.egui_ctx),
-            wallet_sync_rx: None,
             wallet_sync_in_flight: false,
             wallet_create_rx: None,
             wallet_create_in_flight: false,
@@ -1998,12 +2279,16 @@ impl QubCoreApp {
             manual_stop_requested: false,
             desired_pool_mining_pool_id: String::new(),
             auto_restart_mining_at: None,
-            hf110_autoheal_paused_mining: false,
-            hf110_last_mining_auto_pause: Instant::now() - Duration::from_secs(600),
+            mining_intent: None,
+            mining_restart_plan: None,
+            next_miner_generation: 1,
+            mining_plan_rejected_generation: None,
             hf85_last_auto_catchup_sync: Instant::now() - Duration::from_secs(60),
             hf85_auto_catchup_last_height: 0,
             hf85_auto_catchup_stale_since: Instant::now(),
             hf85_seen_catchup_epoch: hf85_catchup_epoch(),
+            hf129_retained_catchup_target_height: 0,
+            hf129_retained_catchup_target_at: None,
             hf88_last_peer_probe: Instant::now() - Duration::from_secs(60),
             hf88_last_snapshot_height: 0,
             hf88_snapshot_stale_since: Instant::now(),
@@ -2123,6 +2408,13 @@ impl QubCoreApp {
             format!("{} (Testnet)", APP_VERSION)
         } else if self.snapshot.network.eq_ignore_ascii_case("regtest") || self.snapshot.network.eq_ignore_ascii_case("regtest-lan") {
             format!("{} ({})", APP_VERSION, self.snapshot.network)
+        } else if self.is_mainnet_network() {
+            let activation = qubd::MAINNET_DAA_V3_ACTIVATION_HEIGHT;
+            if self.snapshot.height >= activation {
+                format!("{} | HF133 active", APP_VERSION)
+            } else {
+                format!("{} | HF133 ready at #{}", APP_VERSION, activation)
+            }
         } else {
             APP_VERSION.to_string()
         }
@@ -2212,6 +2504,9 @@ impl QubCoreApp {
 
     fn mining_header_status(&self) -> (&'static str, egui::Color32) {
         if self.miner.is_none() {
+            if self.mining_restart_plan.is_some() {
+                return ("WAITING", egui::Color32::from_rgb(236, 190, 78));
+            }
             return ("IDLE", egui::Color32::GRAY);
         }
         if self.truly_mining_active() {
@@ -2246,7 +2541,12 @@ impl QubCoreApp {
     }
 
     fn mining_mode_short(&self) -> &'static str {
-        if self.miner.is_some() && !self.pool_mining_pool_id.trim().is_empty() { "P" } else { "S" }
+        let mode = self
+            .miner
+            .as_ref()
+            .map(|miner| &miner.mode)
+            .or_else(|| self.mining_restart_plan.as_ref().map(|plan| &plan.mode));
+        if matches!(mode, Some(MinerRunMode::Pool { .. })) { "P" } else { "S" }
     }
 
     fn mining_status_dot_text(&self, active: bool) -> &'static str {
@@ -2457,32 +2757,25 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         // advertise a future/local branch and should remain telemetry only. Use
         // the locally validated height plus official/direct seed-derived heights
         // only; recent block rows are rendered from this value, not vice versa.
-        let official_known = self.snapshot.known_network_height.max(self.snapshot.direct_network_height);
+        let official_known = self
+            .snapshot
+            .known_network_height
+            .max(self.snapshot.direct_network_height)
+            .max(if self
+                .hf129_retained_catchup_target_at
+                .map(|seen| seen.elapsed() <= Duration::from_secs(3 * 60))
+                .unwrap_or(false)
+            {
+                self.hf129_retained_catchup_target_height
+            } else {
+                0
+            });
         self.snapshot.height.max(official_known)
     }
 
     fn sync_progress_fraction(&self) -> f32 {
-        let local = self.snapshot.height;
-        let known = self.best_known_network_height();
-        if known > 0 && known > local {
-            return ((local as f32) / (known as f32)).clamp(0.05, 0.98);
-        }
-        if known > 0 && local >= known && (self.wallet_sync_in_flight || self.snapshot_in_flight || self.initial_loading) {
-            return 0.96;
-        }
-        if self.wallet_sync_in_flight {
-            let elapsed = self.last_wallet_sync.elapsed().as_secs_f32();
-            return (0.12 + elapsed / 240.0 * 0.82).clamp(0.12, 0.94);
-        }
-        if self.snapshot_in_flight {
-            let elapsed = self.last_refresh.elapsed().as_secs_f32();
-            return (0.10 + elapsed / 360.0 * 0.84).clamp(0.10, 0.94);
-        }
-        if self.initial_loading {
-            let elapsed = self.initial_loading_started_at.elapsed().as_secs_f32();
-            return (0.08 + elapsed / 120.0 * 0.86).clamp(0.08, 0.94);
-        }
-        1.0
+        // Elapsed time and queued work cannot advance a verified block count.
+        hf132_observed_sync_fraction(self.snapshot.height, self.best_known_network_height())
     }
 
     fn sync_progress_rows(&self, label: &str) -> (String, String, String) {
@@ -2495,14 +2788,15 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         };
         let local = self.snapshot.height;
         let known = self.best_known_network_height();
+        let rate = hf132_recent_sync_rate(self.sync_progress_rate_bps, self.sync_progress_last_sample.elapsed());
         let detail = if known > local {
             let remaining = known.saturating_sub(local);
             let source = if self.snapshot.known_network_height >= known { "official seeds" }
                 else if self.snapshot.direct_network_height >= known { "direct peers" }
                 else { "local block stream" };
-            let rate_extra = if self.sync_progress_rate_bps > 0.01 {
-                let bpm = self.sync_progress_rate_bps * 60.0;
-                let eta_secs = (remaining as f32 / self.sync_progress_rate_bps).max(1.0);
+            let rate_extra = if rate > 0.01 {
+                let bpm = rate * 60.0;
+                let eta_secs = (remaining as f32 / rate).max(1.0);
                 let eta = if eta_secs < 90.0 { format!("{:.0}s", eta_secs) } else { format!("{:.1}m", eta_secs / 60.0) };
                 format!(" | live rate {:.1} block(s)/min | ETA {eta}", bpm)
             } else {
@@ -2510,11 +2804,15 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             };
             format!("local #{local} -> {source} #{known} | {remaining} block(s) remaining{rate_extra}")
         } else if known > 0 {
-            format!("local #{local} is at known tip #{known} | verifying balances/activity")
+            if self.same_height_network_tip_conflict() {
+                format!("local #{local} matches the observed height, but the tip hash differs | canonical verification pending")
+            } else {
+                format!("local #{local} matches the last observed height #{known} | peer freshness and wallet verification are separate")
+            }
         } else {
             "discovering official/peer tip | waiting for first height sample".to_string()
         };
-        let meta = format!("{elapsed}s elapsed | QUB Core strong catch-up runs detached; UI stays live");
+        let meta = format!("{elapsed}s elapsed | Height ratio uses the last observed tip; wallet refresh and network verification finish separately");
         (label.to_string(), detail, meta)
     }
 
@@ -2544,7 +2842,51 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         self.update_runtime_identity();
     }
 
-    fn apply_snapshot(&mut self, snapshot: ChainSnapshot) {
+    fn apply_snapshot(&mut self, mut snapshot: ChainSnapshot) {
+        // HF129: background and wallet readers can finish out of order. The
+        // sequence is assigned while the immutable canonical chain is captured,
+        // not when a thread is requested, so an older capture can never roll the
+        // GUI height/hash/recent-block list back over a newer one.
+        let apply_full_snapshot = hf129_snapshot_capture_is_newer(
+            self.last_applied_snapshot_capture_seq,
+            snapshot.capture_seq,
+        );
+        let apply_head = hf129_snapshot_capture_is_newer(
+            self.last_applied_snapshot_head_capture_seq,
+            snapshot.head_capture_seq,
+        );
+        if !apply_full_snapshot && !apply_head {
+            return;
+        }
+        if apply_head && !apply_full_snapshot {
+            // A long wallet/derived reader may carry an older full capture but a
+            // newer final head capture. Apply only the canonical head lane; do
+            // not roll activity back over a newer full result. QUB balances
+            // were recomputed against this head and travel with its identity.
+            self.last_applied_snapshot_head_capture_seq = snapshot.head_capture_seq;
+            self.handle_snapshot_tip_change(&snapshot);
+            self.last_observed_tip_hash = snapshot.best_hash.clone();
+            self.last_observed_height = snapshot.height;
+            hf129_preserve_newer_snapshot_head(&snapshot, &mut self.snapshot);
+            if snapshot.height >= self.hf129_retained_catchup_target_height {
+                self.hf129_retained_catchup_target_height = 0;
+                self.hf129_retained_catchup_target_at = None;
+            }
+            self.last_refresh = Instant::now();
+            self.update_runtime_identity();
+            return;
+        }
+        if apply_full_snapshot && !apply_head {
+            // The full/derived lane can be newer while its final head capture
+            // is older (two independent receiver queues can be polled out of
+            // completion order). Keep the newer canonical head already shown
+            // by the GUI while accepting the newer derived payload.
+            hf129_preserve_newer_snapshot_head(&self.snapshot, &mut snapshot);
+        }
+        self.last_applied_snapshot_capture_seq = snapshot.capture_seq;
+        if apply_head {
+            self.last_applied_snapshot_head_capture_seq = snapshot.head_capture_seq;
+        }
         let now = Instant::now();
         let sample_secs = now.duration_since(self.sync_progress_last_sample).as_secs_f32();
         if sample_secs >= 1.0 {
@@ -2561,9 +2903,8 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 } else {
                     (self.sync_progress_rate_bps * 0.65) + (instant_rate * 0.35)
                 };
-            } else if self.wallet_sync_in_flight || self.snapshot_in_flight || self.initial_loading {
-                self.sync_progress_rate_bps *= 0.92;
-                if self.sync_progress_rate_bps < 0.005 { self.sync_progress_rate_bps = 0.0; }
+            } else {
+                self.sync_progress_rate_bps = 0.0;
             }
             self.sync_progress_last_height = snapshot.height;
             self.sync_progress_last_sample = now;
@@ -2574,6 +2915,10 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         self.handle_snapshot_tip_change(&snapshot);
         self.last_observed_tip_hash = snapshot.best_hash.clone();
         self.last_observed_height = snapshot.height;
+        if snapshot.height >= self.hf129_retained_catchup_target_height {
+            self.hf129_retained_catchup_target_height = 0;
+            self.hf129_retained_catchup_target_at = None;
+        }
         self.snapshot = snapshot;
         self.ensure_pool_selection_from_last();
         self.last_error = None;
@@ -2602,9 +2947,14 @@ Personal record: {}", format_hps(current), format_hps(peak)));
 
     fn maybe_start_hf85_auto_catchup_sync(&mut self) {
         if !self.prefs.setup_complete || self.initial_loading { return; }
+        // A timer tick while a request is running neither starts work nor
+        // observes progress. Preserve the worker's real status until it ends.
+        if hf85_catchup_running() { return; }
         // HF106: snapshot refresh is a UI read and must not suppress catch-up.
         // Otherwise a slow balance/activity snapshot can freeze network progress.
-        if self.wallet_sync_in_flight { return; }
+        // Wallet derivation is a reader and must not suppress the detached
+        // canonical writer. The snapshot capture gate is short and readers are
+        // independently ordered before application.
         if !matches!(self.snapshot.network.as_str(), "mainnet" | "testnet") { return; }
 
         let local = self.snapshot.height;
@@ -2623,14 +2973,16 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         }
 
         if known <= local {
-            self.hf85_auto_catchup_last_height = local;
-            self.hf85_auto_catchup_stale_since = Instant::now();
+            if local != self.hf85_auto_catchup_last_height {
+                self.hf85_auto_catchup_last_height = local;
+                self.hf85_auto_catchup_stale_since = Instant::now();
+            }
             // Even when the last fast snapshot only knows the local height, keep
             // a low-frequency official/peer pulse alive. This is the safety net
             // for users who leave QUB Core open overnight without pressing Sync.
             if self.hf85_last_auto_catchup_sync.elapsed() >= Duration::from_secs(18) {
                 self.hf85_last_auto_catchup_sync = Instant::now();
-                self.status_line = format!("QUB Core heartbeat catch-up: local #{} is reported at known tip; probing seeds/peers for a newer tip without blocking the UI.", local);
+                self.status_line = format!("QUB Core heartbeat catch-up: last visible local #{} matches the last observed height; checking peers for a fresh tip.", local);
                 spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), false);
             }
             return;
@@ -2645,15 +2997,11 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         let stalled_for = self.hf85_auto_catchup_stale_since.elapsed();
         let mining_or_waiting = self.miner.is_some() || matches!(self.mining_phase, MiningPhase::Preparing | MiningPhase::Mining);
 
-        // HF111/v1.7.1: if mining/preparing is present while official/direct
-        // chain stays ahead, pause hashing entirely and let a chain-only repair
-        // own disk/network resources. Users were fixing this manually by Stop ->
-        // restart -> Sync/Repair -> Start; do it automatically and resume after
-        // canonical catch-up. This is safety-first and prevents local-only forks.
-        if mining_or_waiting && gap > 0 && (stalled_for >= Duration::from_secs(60) || gap >= 4) {
-            self.hf110_pause_mining_for_canonical_catchup(gap, stalled_for.as_secs());
-            return;
-        }
+        // HF131: peer-display heights are discovery hints, never authority to
+        // stop a mining controller. Its canonical safety/template/watch/submit
+        // guards own that decision, with fresh height/hash evidence. In
+        // particular, a stale or falsely advertised high tip must not strand
+        // a Pool intent in an official-seed-only restart loop.
 
         let force_strong = stalled_for >= Duration::from_secs(45) || gap >= 4;
         let interval = if force_strong { Duration::from_secs(5) }
@@ -2663,27 +3011,95 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         if self.hf85_last_auto_catchup_sync.elapsed() >= interval {
             self.hf85_last_auto_catchup_sync = Instant::now();
             self.status_line = format!(
-                "QUB Core strong detached catch-up: local #{} -> live #{} ({} block(s) behind, stalled {}s). Wallet stays responsive; mining waits for green-light.",
+                "QUB Core detached catch-up: local #{} -> observed #{} ({} block(s) difference, unchanged for {}s). Mining validates its parent independently.",
                 local,
                 known,
                 gap,
                 stalled_for.as_secs()
             );
-            spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), force_strong);
+            spawn_hf130_catchup_pulse(self.prefs.config_path.clone(), Hf130CatchupRequest::Automatic);
         }
     }
 
 
     fn poll_hf85_catchup_completion(&mut self) {
-        let epoch = hf85_catchup_epoch();
+        let outcome = hf129_latest_catchup_outcome().unwrap_or_default();
+        let epoch = outcome.epoch;
         if epoch == self.hf85_seen_catchup_epoch {
             return;
         }
         self.hf85_seen_catchup_epoch = epoch;
-        self.hf85_auto_catchup_stale_since = Instant::now();
-        self.hf86_force_quick_snapshot = true;
-        self.hf88_snapshot_backoff_until = None;
-        self.status_line = "QUB Core catch-up pulse completed; refreshing local wallet/blocks/peers with a quick local snapshot.".to_string();
+        if outcome.writer_acquired && outcome.fresh_at_tip {
+            // A newer authoritative writer has proven the current canonical
+            // height/hash. Replace a stale prior target instead of retaining one
+            // bad/high observation forever and permanently blocking mining.
+            self.hf129_retained_catchup_target_height = outcome.after_height;
+            self.hf129_retained_catchup_target_at = Some(Instant::now());
+        } else if self.snapshot.network != "regtest"
+            && matches!(outcome.reason.as_str(), "manual-deep-repair" | "auto-deep-repair") {
+            // The deep repair path is official-only. Generic adaptive peer
+            // telemetry from ordinary auto ladders must never become a durable
+            // canonical target that can pause every miner indefinitely.
+            self.hf129_retained_catchup_target_height = self
+                .hf129_retained_catchup_target_height
+                .max(outcome.target_height);
+            self.hf129_retained_catchup_target_at = Some(Instant::now());
+        }
+        if outcome.progressed {
+            self.hf85_auto_catchup_stale_since = Instant::now();
+        }
+        // No-work outcomes must not turn a five-second writer-busy retry into
+        // a full wallet/registry scan. Normal refresh still updates peer hints.
+        let refresh_needed = outcome.progressed
+            || (outcome.writer_acquired && !outcome.after_tip_hash.is_empty()
+                && outcome.after_tip_hash != self.snapshot.best_hash);
+        self.hf86_force_quick_snapshot |= refresh_needed;
+        self.status_line = if outcome.reason == "regtest-local-only" {
+            "Regtest wallet refreshed locally. Press Sync to catch up from the configured peers.".to_string()
+        } else if outcome.terminal == "p2p-disabled" {
+            "Network Sync is disabled in the active configuration; the wallet refresh is local only.".to_string()
+        } else if outcome.reason == "regtest-peer-sync" {
+            if outcome.progressed {
+                format!("Regtest peer Sync progressed #{} -> #{} ({}); refreshing the wallet view.",
+                    outcome.before_height, outcome.after_height, shorten_hash(&outcome.after_tip_hash))
+            } else if outcome.writer_busy {
+                "Regtest peer Sync found an active writer. Wait for it to finish, then press Sync again.".to_string()
+            } else {
+                format!("Regtest peer Sync ended with {} at #{} ({}). No blocks were adopted; if behind, check the configured peer and press Sync again.",
+                    outcome.terminal, outcome.after_height, shorten_hash(&outcome.after_tip_hash))
+            }
+        } else if outcome.progressed {
+            format!(
+                "QUB Core catch-up progressed #{} -> #{} ({}); refreshing the live wallet and Recent Blocks view.",
+                outcome.before_height,
+                outcome.after_height,
+                shorten_hash(&outcome.after_tip_hash)
+            )
+        } else if outcome.fresh_at_tip {
+            format!(
+                "QUB Core catch-up verified the fresh canonical tip at #{}; refreshing the live wallet and Recent Blocks view.",
+                outcome.after_height
+            )
+        } else if outcome.writer_busy {
+            "QUB Core catch-up could not acquire the active writer. No blocks were checked by this request; automatic retry remains scheduled.".to_string()
+        } else if !outcome.error.trim().is_empty() {
+            self.last_error = Some(format!(
+                "QUB Core catch-up {} failed: {}",
+                outcome.reason, outcome.error
+            ));
+            if self.snapshot.network == "regtest" {
+                "Regtest peer Sync failed. Check the error and configured peer, then press Sync again.".to_string()
+            } else {
+                "QUB Core catch-up failed; automatic retry remains scheduled.".to_string()
+            }
+        } else {
+            format!(
+                "QUB Core catch-up ended with {} and no canonical progress; observed target #{}. Automatic retry remains scheduled.",
+                outcome.terminal,
+                outcome.target_height
+            )
+        };
+        if !refresh_needed { return; }
         if self.snapshot_in_flight || hf88_snapshot_worker_running() {
             // HF106: do not abandon an existing snapshot worker. Abandoning it
             // created the HF87 repeated timeout loop and queued extra readers
@@ -2699,18 +3115,38 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         let polled = self.snapshot_rx.as_ref().map(|rx| rx.try_recv());
         match polled {
             Some(Ok(Ok(snapshot))) => {
+                let wallet_requested = self.wallet_sync_in_flight;
+                self.wallet_sync_in_flight = false;
                 self.snapshot_in_flight = false;
                 self.snapshot_rx = None;
                 self.hf88_snapshot_backoff_until = None;
                 self.hf88_snapshot_timeout_count = 0;
                 self.hf88_last_snapshot_success = Instant::now();
+                self.last_refresh = self.hf88_last_snapshot_success;
                 self.apply_snapshot(snapshot);
+                if wallet_requested {
+                    // Space automatic scans from real completion. A slow read
+                    // must not make the next timer immediately start another.
+                    self.last_wallet_sync = Instant::now();
+                    self.status_line = "Local wallet snapshot refreshed. Network Sync/Repair reports its verified result separately.".to_string();
+                }
             }
             Some(Ok(Err(err))) => {
                 self.snapshot_in_flight = false;
                 self.snapshot_rx = None;
-                self.initial_loading = false;
-                self.last_error = Some(format!("Refresh failed: {err}"));
+                self.hf86_force_quick_snapshot = true;
+                self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(2));
+                if hf132_snapshot_read_deferred(&err) {
+                    self.status_line = "Local wallet snapshot deferred while the chain owner is busy; retaining the last view and retrying.".to_string();
+                    if self.initial_loading_started_at.elapsed() > Duration::from_secs(20) {
+                        self.initial_loading = false;
+                    }
+                } else {
+                    self.wallet_sync_in_flight = false;
+                    self.initial_loading = false;
+                    self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(15));
+                    self.last_error = Some(format!("Refresh failed: {err}"));
+                }
             }
             Some(Err(mpsc::TryRecvError::Empty)) | None => {
                 if self.snapshot_in_flight {
@@ -2720,7 +3156,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                         // receiver/gate while the worker was still alive produced
                         // repeated readers and rapidly alternating status lines.
                         self.status_line = format!(
-                            "Fast Chain Engine snapshot is still completing; no duplicate reader was started. {elapsed}s elapsed"
+                            "Local wallet snapshot has not returned after {elapsed}s; the displayed height is the last completed read. Network progress is reported separately."
                         );
                     } else if self.initial_loading && elapsed > 20 {
                         // HF72/v1.5.8: do not keep non-mining users trapped on the
@@ -2728,13 +3164,11 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                         // background and will apply the fresh snapshot when it returns.
                         self.initial_loading = false;
                         self.status_line = "QUB Core opened while the local snapshot is still loading. Network catch-up is paused until wallet/blocks are visible.".to_string();
-                        self.last_success = Some("QUB Core is keeping the UI open. If wallet/blocks are not visible within a few minutes, restart once and capture the bottom status.".to_string());
-                        self.last_error = None;
                     } else if self.miner.is_none() {
                         let local = self.snapshot.height;
                         let known = self.best_known_network_height();
                         if hf85_catchup_running() && known > local {
-                            self.status_line = format!("QUB Core catch-up writer active: local #{local} -> network #{known} ({} block(s) remaining). Snapshot waits; UI stays live... {}s elapsed", known.saturating_sub(local), hf85_catchup_elapsed_secs());
+                            self.status_line = format!("QUB Core catch-up request active for {}s. Last visible local #{local}, observed #{known}; awaiting the local wallet reader.", hf85_catchup_elapsed_secs());
                         } else if known > local {
                             self.status_line = format!("Startup/background chain refresh: local #{local} -> network #{known} ({} block(s) remaining)... {elapsed}s elapsed", known.saturating_sub(local));
                         } else {
@@ -2744,9 +3178,13 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 }
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.wallet_sync_in_flight = false;
                 self.snapshot_in_flight = false;
                 self.snapshot_rx = None;
                 self.initial_loading = false;
+                self.hf86_force_quick_snapshot = true;
+                self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(2));
+                self.last_error = Some("Local wallet snapshot reader disconnected; retrying.".to_string());
             }
         }
     }
@@ -2757,70 +3195,39 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             if Instant::now() < until { return; }
             self.hf88_snapshot_backoff_until = None;
         }
-        // HF106: do not start a UI snapshot reader while a detached catch-up
-        // writer owns storage. HF88/HF89 made the UI visible but could still
-        // show a long "snapshot refresh" spinner because the reader was waiting
-        // behind the writer. Keep the current local view and refresh immediately
-        // when the catch-up epoch completes.
-        if self.snapshot.height > 0 && hf85_catchup_running() && !self.hf86_force_quick_snapshot {
-            let local = self.snapshot.height;
-            let known = self.best_known_network_height();
-            let elapsed = hf85_catchup_elapsed_secs();
-            if known > local {
-                self.status_line = format!(
-                    "QUB Core catch-up writer active: local #{local} -> network #{known} ({} block(s) remaining). UI stays live; next snapshot waits for the writer. {elapsed}s elapsed",
-                    known.saturating_sub(local)
-                );
-            } else {
-                self.status_line = format!(
-                    "QUB Core catch-up writer active: probing official/direct tips while local UI stays live. {elapsed}s elapsed"
-                );
-            }
-            self.last_refresh = Instant::now();
-            return;
-        }
-        if !hf88_try_begin_snapshot_worker() {
-            // HF106: never queue repeated snapshot readers behind a still-running
-            // reader. Keep the existing local UI and let the next completed
-            // catch-up/snapshot epoch trigger a fresh render.
-            self.last_refresh = Instant::now();
-            if self.status_line.to_lowercase().contains("snapshot") || self.status_line.to_lowercase().contains("refresh") {
-                // Avoid noisy loops: do not overwrite an already useful status.
-            } else {
-                self.status_line = "QUB Core snapshot worker is already finishing; local UI remains live and no extra reader will be queued.".to_string();
-            }
-            return;
-        }
-        // HF106: snapshots are UI reads only. They never run network catch-up and
-        // never wait behind a previous abandoned read. The worker gate above
-        // prevents the repeated 45s release loop seen in HF87.
         let config_path = self.prefs.config_path.clone();
         let payout_address = self.prefs.payout_address.clone();
         let startup_sync = self.initial_loading;
-        let startup_snapshot = startup_sync || self.snapshot.height == 0;
-        let force_quick_snapshot = self.hf86_force_quick_snapshot;
-        self.hf86_force_quick_snapshot = false;
-        let _ = force_quick_snapshot;
-        let (tx, rx) = mpsc::channel();
-        self.snapshot_rx = Some(rx);
-        self.snapshot_in_flight = true;
-        self.last_refresh = Instant::now();
-        if startup_sync {
-            self.status_line = "Startup: loading local wallet/blocks first; network catch-up starts only after the local view is visible...".to_string();
-        }
-        thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| -> Result<ChainSnapshot> {
-                if startup_snapshot {
-                    read_snapshot_for_payout_startup(&config_path, &payout_address)
-                } else {
-                    read_snapshot_for_payout_quick(&config_path, &payout_address)
-                }
-            })
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("QUB Core snapshot worker panicked")))
-            .map_err(|err| format!("{err:#}"));
-            hf88_finish_snapshot_worker();
-            let _ = tx.send(result);
+        let startup_snapshot = startup_sync || self.snapshot.network == "not loaded";
+        let spawned = hf132_spawn_snapshot_reader(Arc::clone(hf132_snapshot_reader_gate()), move || {
+            if startup_snapshot {
+                read_snapshot_for_payout_startup(&config_path, &payout_address)
+            } else {
+                read_snapshot_for_payout_quick(&config_path, &payout_address)
+            }
         });
+        match spawned {
+            Ok(Some(rx)) => {
+                self.snapshot_rx = Some(rx);
+                self.snapshot_in_flight = true;
+                self.hf86_force_quick_snapshot = false;
+                self.last_refresh = Instant::now();
+                if startup_sync {
+                    self.status_line = "Startup: loading local wallet/blocks first; network catch-up starts after the local view is visible...".to_string();
+                }
+            }
+            Ok(None) => {
+                // All refresh sources share admission. A real attached worker
+                // remains responsible for its result; a timer never replaces it.
+                self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(2));
+            }
+            Err(err) => {
+                self.wallet_sync_in_flight = false;
+                self.hf86_force_quick_snapshot = true;
+                self.hf88_snapshot_backoff_until = Some(Instant::now() + Duration::from_secs(2));
+                self.last_error = Some(format!("Could not start wallet snapshot reader: {err:#}"));
+            }
+        }
     }
 
     fn start_tx_status_check(&mut self, txid: String) {
@@ -3002,75 +3409,32 @@ Personal record: {}", format_hps(current), format_hps(peak)));
 
 
     fn start_wallet_sync(&mut self, force: bool) {
-        if self.wallet_sync_in_flight {
-            if force && self.last_wallet_sync.elapsed() > Duration::from_secs(12) {
-                // HF106: release stale UI worker; catch-up pulses are detached and
-                // single-flight at the GUI layer, so Sync cannot freeze the wallet.
-                self.wallet_sync_rx = None;
-                self.wallet_sync_in_flight = false;
-            } else {
-                return;
-            }
-        }
         if !force {
-            if !self.prefs.auto_sync_wallet_balances { return; }
+            if self.wallet_sync_in_flight || !self.prefs.auto_sync_wallet_balances { return; }
             let interval = self.prefs.auto_sync_wallet_interval_secs.clamp(5, 600);
             if self.last_wallet_sync.elapsed() < Duration::from_secs(interval) { return; }
         }
-
-        let config_path = self.prefs.config_path.clone();
-        let payout_address = self.prefs.payout_address.clone();
-        let (tx, rx) = mpsc::channel();
-        self.wallet_sync_rx = Some(rx);
+        // A manual click queues its bounded network request even if the local
+        // reader is already running. It never drops that reader's receiver or
+        // starts a duplicate scan after an arbitrary 12/45-second UI timeout.
+        spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), force);
+        if !self.wallet_sync_in_flight { self.last_wallet_sync = Instant::now(); }
         self.wallet_sync_in_flight = true;
-        self.last_wallet_sync = Instant::now();
         if force {
-            self.status_line = "Starting HF110 deep official Sync/Repair pulse; wallet UI stays live and mining will wait for canonical green-light...".to_string();
+            self.status_line = if self.snapshot.network == "regtest" {
+                "Regtest Sync requested from configured peers; local wallet refresh shares the existing reader.".to_string()
+            } else {
+                "Sync/Repair requested. The local wallet reader stays attached; mining keeps its selected mode and validates its parent before hashing.".to_string()
+            };
         }
-        spawn_hf85_catchup_pulse(config_path.clone(), force);
-
-        thread::spawn(move || {
-            let result = (|| -> Result<ChainSnapshot> {
-                // Return a local snapshot immediately. The detached HF105 catch-up
-                // pulse updates chain.json; this or the next snapshot refresh will
-                // show the new height without blocking balances/activity.
-                read_snapshot_for_payout_quick(&config_path, &payout_address)
-            })().map_err(|err| format!("{err:#}"));
-            let _ = tx.send(result);
-        });
+        self.start_background_snapshot_refresh();
     }
 
     fn poll_wallet_sync(&mut self) {
-        let polled = self.wallet_sync_rx.as_ref().map(|rx| rx.try_recv());
-        match polled {
-            Some(Ok(Ok(snapshot))) => {
-                self.wallet_sync_in_flight = false;
-                self.wallet_sync_rx = None;
-                self.apply_snapshot(snapshot);
-                self.status_line = "Wallet balances synced.".to_string();
-            }
-            Some(Ok(Err(err))) => {
-                self.wallet_sync_in_flight = false;
-                self.wallet_sync_rx = None;
-                self.last_error = Some(format!("Wallet sync failed: {err}"));
-            }
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.wallet_sync_in_flight = false;
-                self.wallet_sync_rx = None;
-            }
-            Some(Err(mpsc::TryRecvError::Empty)) | None => {
-                if self.wallet_sync_in_flight {
-                    let elapsed = self.last_wallet_sync.elapsed().as_secs();
-                    if elapsed > 45 {
-                        // HF106: do not let a stale worker make the Sync button spin forever.
-                        self.wallet_sync_in_flight = false;
-                        self.wallet_sync_rx = None;
-                        self.last_error = Some("QUB Core Sync/Repair is taking longer than expected. The UI was released; HF110 deep official repair keeps retrying in the background.".to_string());
-                    } else {
-                        self.status_line = format!("QUB Core Sync pulse: local wallet view is live; fetching missing blocks... {elapsed}s elapsed");
-                    }
-                }
-            }
+        // Completion is delivered only by poll_snapshot_refresh. If admission
+        // was temporarily busy, retry the same request without another reader.
+        if self.wallet_sync_in_flight && !self.snapshot_in_flight {
+            self.start_background_snapshot_refresh();
         }
     }
 
@@ -3695,6 +4059,10 @@ del "%~f0"
     }
 
     fn start_mining(&mut self) {
+        self.start_solo_mining_with_payout(self.prefs.payout_address.trim().to_string());
+    }
+
+    fn start_solo_mining_with_payout(&mut self, payout: String) {
         if self.update_dialog.status == UpdateStatus::Ready || self.update_dialog.status == UpdateStatus::Installing {
             self.last_error = Some("A newer QUB Core version is pending. Install the update before mining again.".to_string());
             self.status_line = "Update required before mining resumes.".to_string();
@@ -3707,18 +4075,23 @@ del "%~f0"
         self.desired_pool_mining_pool_id.clear();
         self.manual_stop_requested = false;
         self.auto_restart_mining_at = None;
+        self.mining_restart_plan = None;
         let config_path = self.prefs.config_path.clone();
-        let payout = self.prefs.payout_address.trim().to_string();
         if payout.is_empty() {
+            self.mining_intent = None;
             self.last_error = Some("Set a payout address first.".to_string());
             return;
         }
+        let requested_mode = MinerRunMode::Solo { payout_address: payout.clone() };
+        self.mining_intent = Some(requested_mode.clone());
+        self.mining_plan_rejected_generation = None;
         self.update_runtime_identity();
         self.set_mining_phase(MiningPhase::Preparing);
         if let Err(message) = self.ensure_network_ready_to_mine() {
             self.last_error = Some(message);
             self.status_line = "Mining blocked until P2P is connected.".to_string();
             self.set_mining_phase(MiningPhase::Off);
+            self.mining_intent = None;
             return;
         }
         if hf127_unrestricted_mining_requested(&self.prefs)
@@ -3730,6 +4103,7 @@ del "%~f0"
             );
             self.status_line = "Mining blocked until high-power risk is confirmed.".to_string();
             self.set_mining_phase(MiningPhase::Off);
+            self.mining_intent = None;
             return;
         }
         let cpu_percent = self.prefs.cpu_percent.clamp(1, 100);
@@ -3758,6 +4132,8 @@ del "%~f0"
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let generation = self.next_miner_generation;
+        self.next_miner_generation = self.next_miner_generation.saturating_add(1);
         let join = match thread::Builder::new()
             .name("qub-solo-controller".to_string())
             .spawn(move || {
@@ -3778,12 +4154,21 @@ del "%~f0"
             Ok(join) => join,
             Err(err) => {
                 self.set_mining_phase(MiningPhase::Off);
+                self.mining_intent = None;
                 self.last_error = Some(format!("Could not start the solo mining controller: {err}"));
                 self.status_line = "Mining did not start; the operating system refused the controller thread.".to_string();
                 return;
             }
         };
-        self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
+        self.miner = Some(MinerHandle {
+            stop,
+            rx,
+            join: Some(join),
+            generation,
+            mode: requested_mode,
+            cancellation_requested: false,
+            exit_reason: None,
+        });
         self.status_line = "Starting solo miner in background: running QUB Core bounded green-light catch-up, then preparing the first candidate...".to_string();
         self.last_success = None;
         self.last_error = None;
@@ -3811,56 +4196,12 @@ del "%~f0"
         Ok(())
     }
 
-    fn hf110_pause_mining_for_canonical_catchup(&mut self, gap: u32, stalled_secs: u64) {
-        if self.miner.is_none() { return; }
-        if self.hf110_last_mining_auto_pause.elapsed() < Duration::from_secs(45) { return; }
-
-        let wanted_pool = if !self.desired_pool_mining_pool_id.trim().is_empty() {
-            self.desired_pool_mining_pool_id.clone()
-        } else if !self.pool_mining_pool_id.trim().is_empty() {
-            self.pool_mining_pool_id.clone()
-        } else {
-            String::new()
-        };
-
-        if let Some(miner) = &mut self.miner {
-            miner.stop();
-        }
-
-        self.hash_rate_hps = 0.0;
-        self.gpu_hash_rate_hps = 0.0;
-        self.total_hashes = 0;
-        self.gpu_total_hashes = 0;
-        self.gpu_workers = 0;
-        self.gpu_device_rates.clear();
-        self.miner_threads = 0;
-        self.miner_duty = 0;
-        self.miner_gpu_power = 0;
-        self.target_height = self.snapshot.height.saturating_add(1);
-        self.set_mining_phase(MiningPhase::Off);
-        self.manual_stop_requested = false;
-        self.hf110_autoheal_paused_mining = true;
-        self.hf110_last_mining_auto_pause = Instant::now();
-        self.desired_pool_mining_pool_id = wanted_pool.clone();
-        self.pool_mining_pool_id.clear();
-        self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(12));
-        self.hf85_last_auto_catchup_sync = Instant::now() - Duration::from_secs(60);
-        self.hf86_force_quick_snapshot = true;
-
-        self.status_line = format!(
-            "HF110 auto-heal paused mining for canonical catch-up: local #{} is {} block(s) behind official/direct tip (stalled {}s). Mining will resume automatically after catch-up.",
-            self.snapshot.height, gap, stalled_secs
-        );
-        self.last_error = Some("Mining paused by HF110 auto-heal because QUB Core was behind the official/direct chain. This prevents local-only forks; no reinstall is needed.".to_string());
-        spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), true);
-        self.start_wallet_sync(true);
-    }
-
     fn stop_mining(&mut self) {
         self.manual_stop_requested = true;
         self.auto_restart_mining_at = None;
+        self.mining_intent = None;
+        self.mining_restart_plan = None;
         self.desired_pool_mining_pool_id.clear();
-        self.pool_mining_pool_id.clear();
         if let Some(miner) = &mut self.miner {
             // Keep the controller handle until its Stopped acknowledgement.
             // The UI remains non-blocking, while a quick Start cannot overlap
@@ -3889,17 +4230,19 @@ del "%~f0"
         if self.manual_stop_requested {
             return;
         }
-        let reconfigure_pending = self.auto_restart_mining_at.is_some()
-            && !self.manual_stop_requested;
+        let reconfigure_pending = self.mining_restart_plan.is_some();
         if self.miner.is_none() && !reconfigure_pending {
             return;
         }
 
-        let wanted_pool = if !self.desired_pool_mining_pool_id.trim().is_empty() {
-            self.desired_pool_mining_pool_id.clone()
+        let (resume_mode, retiring_generation) = if let Some(miner) = self.miner.as_ref() {
+            (miner.mode.clone(), miner.generation)
+        } else if let Some(plan) = self.mining_restart_plan.as_ref() {
+            (plan.mode.clone(), plan.retiring_generation)
         } else {
-            self.pool_mining_pool_id.clone()
+            return;
         };
+        let wanted_pool = resume_mode.pool_id().unwrap_or("").to_string();
         if let Some(miner) = &mut self.miner {
             miner.stop();
         }
@@ -3921,18 +4264,27 @@ del "%~f0"
             self.auto_restart_mining_at = None;
             self.desired_pool_mining_pool_id = wanted_pool;
             self.manual_stop_requested = true;
+            self.mining_intent = None;
+            self.mining_restart_plan = None;
             self.status_line = "Mining paused safely: confirm the high-power warning, then press Start to apply the new plan.".to_string();
             self.last_error = Some("The requested mining plan was not applied because high-power authorization is not checked. The previous workers were stopped.".to_string());
             return;
         }
 
         self.desired_pool_mining_pool_id = wanted_pool;
-        self.pool_mining_pool_id.clear();
         self.manual_stop_requested = false;
+        self.mining_intent = Some(resume_mode.clone());
         // The old MinerHandle remains owned until its explicit Stopped event.
         // auto-restart additionally requires self.miner == None, so no wall
         // clock guess can overlap two OpenCL plan generations.
-        self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(2));
+        let restart_at = Instant::now() + Duration::from_secs(2);
+        self.mining_restart_plan = Some(MiningRestartPlan {
+            at: restart_at,
+            mode: resume_mode,
+            cause: MiningRestartCause::Reconfigure,
+            retiring_generation,
+        });
+        self.auto_restart_mining_at = Some(restart_at);
         self.status_line = format!(
             "Applying mining plan: CPU {}%, GPU {}%. Previous workers are stopping; the acknowledged plan restarts automatically.",
             self.prefs.cpu_percent,
@@ -3941,30 +4293,39 @@ del "%~f0"
     }
 
     fn poll_miner_events(&mut self) {
-        let mut should_drop_miner = false;
+        let mut exit_reason = None;
         let mut should_refresh_snapshot = false;
         let mut phase_change: Option<MiningPhase> = None;
         let mut plan_rejected = false;
         let miner_stopping = self
             .miner
             .as_ref()
-            .map(|miner| miner.stop.load(Ordering::Relaxed))
+            .map(|miner| miner.cancellation_requested)
             .unwrap_or(false);
 
         // HF78/v1.6.0 fixed: drain miner events while borrowing only the
         // receiver, then process the events after that borrow has ended. This
         // keeps GPU aggregate/status updates free to borrow `self` normally.
         let mut pending_events = Vec::new();
+        let mut controller_finished = false;
         if let Some(miner) = &mut self.miner {
             while let Ok(event) = miner.rx.try_recv() {
                 pending_events.push(event);
+            }
+            controller_finished = miner.join.as_ref().map(|join| join.is_finished()).unwrap_or(true);
+            if controller_finished {
+                if let Some(join) = miner.join.take() { let _ = join.join(); }
+                // Completion can race the first drain. After join, no sender in
+                // this controller generation can enqueue a late rejection.
+                while let Ok(event) = miner.rx.try_recv() { pending_events.push(event); }
             }
         }
         for event in pending_events {
             if miner_stopping
                 && !matches!(
                     &event,
-                    MinerEvent::PlanRejected(_)
+                    MinerEvent::PayoutResolved { .. }
+                        | MinerEvent::PlanRejected(_)
                         | MinerEvent::Stopped { .. }
                         | MinerEvent::BlockFound { .. }
                         | MinerEvent::BlockStale { .. }
@@ -3973,6 +4334,27 @@ del "%~f0"
                 continue;
             }
             match event {
+                    MinerEvent::PayoutResolved { requested, address } => {
+                        if let Some(miner) = self.miner.as_mut() {
+                            let old_mode = miner.mode.clone();
+                            if let Some(resolved_mode) = hf131_mode_with_resolved_payout(
+                                &old_mode, &requested, &address,
+                            ) {
+                                if self.mining_intent.as_ref() == Some(&old_mode) {
+                                    self.mining_intent = Some(resolved_mode.clone());
+                                }
+                                if let Some(plan) = self.mining_restart_plan.as_mut() {
+                                    if plan.retiring_generation == miner.generation && plan.mode == old_mode {
+                                        plan.mode = resolved_mode.clone();
+                                    }
+                                }
+                                miner.mode = resolved_mode;
+                            }
+                        }
+                        if !miner_stopping {
+                            self.status_line = format!("Mining payout fixed for this run: {address}");
+                        }
+                    }
                     MinerEvent::Started { threads, duty, target_height } => {
                         self.miner_threads = threads;
                         self.miner_duty = duty;
@@ -4079,17 +4461,22 @@ del "%~f0"
                     }
                     MinerEvent::PlanRejected(err) => {
                         plan_rejected = true;
+                        if let Some(miner) = self.miner.as_ref() {
+                            self.mining_plan_rejected_generation = Some(miner.generation);
+                        }
+                        self.mining_intent = None;
+                        self.mining_restart_plan = None;
                         self.last_error = Some(err.clone());
                         self.status_line = format!("Mining plan rejected: {err}");
                     }
-                    MinerEvent::Stopped { restart_allowed } => {
-                        if !restart_allowed {
+                    MinerEvent::Stopped { reason } => {
+                        if reason == MinerExitReason::PlanRejected {
                             plan_rejected = true;
                         }
                         if !plan_rejected {
                             self.status_line = "Miner stopped.".to_string();
                         }
-                        should_drop_miner = true;
+                        exit_reason = Some(reason);
                     }
                 }
         }
@@ -4097,13 +4484,30 @@ del "%~f0"
         if let Some(phase) = phase_change {
             self.set_mining_phase(phase);
         }
-        if should_drop_miner {
-            let wanted_pool = self.desired_pool_mining_pool_id.clone();
-            let should_auto_restart = !plan_rejected
+        // A Stopped event can be delivered just before the controller returns.
+        // Retain its handle until the actual thread has finished; on panic, the
+        // round-worker guard joins CPU/GPU children during unwinding first.
+        // A panic=abort build terminates instead of reaching this restart path.
+        let mut completed_reason = None;
+        if let Some(miner) = self.miner.as_mut() {
+            if exit_reason.is_some() { miner.exit_reason = exit_reason; }
+            if controller_finished {
+                completed_reason = Some(miner.exit_reason.unwrap_or(MinerExitReason::UnexpectedExit));
+            }
+        }
+        if let Some(completed_reason) = completed_reason {
+            let (retiring_generation, retiring_mode) = self
+                .miner
+                .as_ref()
+                .map(|miner| (miner.generation, miner.mode.clone()))
+                .unwrap_or((0, MinerRunMode::Solo { payout_address: String::new() }));
+            let generation_rejected = plan_rejected
+                || completed_reason == MinerExitReason::PlanRejected
+                || self.mining_plan_rejected_generation == Some(retiring_generation);
+            let restart_allowed = !generation_rejected
                 && !self.manual_stop_requested
                 && self.update_dialog.status != UpdateStatus::Ready
-                && self.update_dialog.status != UpdateStatus::Installing
-                && !self.prefs.payout_address.trim().is_empty();
+                && self.update_dialog.status != UpdateStatus::Installing;
             self.miner = None;
             self.hash_rate_hps = 0.0;
             self.gpu_hash_rate_hps = 0.0;
@@ -4116,21 +4520,61 @@ del "%~f0"
             self.miner_duty = 0;
             self.miner_gpu_power = 0;
             self.set_mining_phase(MiningPhase::Off);
-            if should_auto_restart {
-                if !wanted_pool.trim().is_empty() {
-                    self.pool_mining_pool_id = wanted_pool.clone();
-                    self.status_line = format!("Pool miner stopped unexpectedly; auto-restarting {} after sync...", shorten_hash(&wanted_pool));
-                } else {
-                    self.pool_mining_pool_id.clear();
-                    self.status_line = "Solo miner stopped unexpectedly; auto-restarting after sync...".to_string();
-                }
-                self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(3));
+            self.pool_mining_pool_id.clear();
+
+            let matching_plan = hf129_authorized_restart_plan(
+                &self.mining_intent,
+                self.mining_restart_plan.as_ref(),
+                retiring_generation,
+                &retiring_mode,
+            );
+            if restart_allowed
+                && matching_plan.is_some()
+            {
+                let plan = matching_plan.expect("matching restart plan checked");
+                self.auto_restart_mining_at = Some(plan.at);
+                self.status_line = match &plan.mode {
+                    MinerRunMode::Pool { pool_id, .. } => format!(
+                        "Pool miner generation {} stopped for {:?}; resuming the same pool {} only after the acknowledged gate.",
+                        retiring_generation,
+                        plan.cause,
+                        shorten_hash(pool_id)
+                    ),
+                    MinerRunMode::Solo { .. } => format!(
+                        "Solo miner generation {} stopped for {:?}; resuming Solo only after the acknowledged gate.",
+                        retiring_generation, plan.cause
+                    ),
+                };
+            } else if restart_allowed
+                && completed_reason == MinerExitReason::UnexpectedExit
+                && self.mining_intent.as_ref() == Some(&retiring_mode)
+            {
+                let restart_at = Instant::now() + Duration::from_secs(3);
+                self.mining_restart_plan = Some(MiningRestartPlan {
+                    at: restart_at,
+                    mode: retiring_mode.clone(),
+                    cause: MiningRestartCause::UnexpectedExit,
+                    retiring_generation,
+                });
+                self.auto_restart_mining_at = Some(restart_at);
+                self.status_line = match &retiring_mode {
+                    MinerRunMode::Pool { pool_id, .. } => format!(
+                        "Pool miner stopped unexpectedly; auto-restarting the same pool {} after sync...",
+                        shorten_hash(pool_id)
+                    ),
+                    MinerRunMode::Solo { .. } => {
+                        "Solo miner stopped unexpectedly; auto-restarting Solo after sync...".to_string()
+                    }
+                };
             } else {
                 self.pool_mining_pool_id.clear();
                 self.desired_pool_mining_pool_id.clear();
                 self.manual_stop_requested = false;
                 self.auto_restart_mining_at = None;
+                self.mining_intent = None;
+                self.mining_restart_plan = None;
             }
+            self.mining_plan_rejected_generation = None;
         }
         if should_refresh_snapshot {
             self.start_background_snapshot_refresh();
@@ -5003,8 +5447,8 @@ del "%~f0"
             self.manual_stop_requested = false;
             self.auto_restart_mining_at = None;
         }
-        let miner_address = if !self.pool_dialog.miner_address.trim().is_empty() { self.pool_dialog.miner_address.trim().to_string() } else if !self.prefs.payout_address.trim().is_empty() { self.prefs.payout_address.trim().to_string() } else { self.snapshot.default_address.clone() };
         let config_path = self.prefs.config_path.clone();
+        let miner_address = if !self.pool_dialog.miner_address.trim().is_empty() { self.pool_dialog.miner_address.trim().to_string() } else if !self.prefs.payout_address.trim().is_empty() { self.prefs.payout_address.trim().to_string() } else { self.snapshot.default_address.clone() };
         let pool_id_for_start = pool_id.clone();
         let (tx, rx) = mpsc::channel();
         self.pool_rx = Some(rx);
@@ -5185,24 +5629,44 @@ del "%~f0"
     }
 
     fn start_pool_mining(&mut self, pool_id: String) {
+        let miner_address = if !self.pool_dialog.miner_address.trim().is_empty() {
+            self.pool_dialog.miner_address.trim().to_string()
+        } else if !self.prefs.payout_address.trim().is_empty() {
+            self.prefs.payout_address.trim().to_string()
+        } else { self.snapshot.default_address.clone() };
+        self.start_pool_mining_with_address(pool_id, miner_address);
+    }
+
+    fn start_pool_mining_with_address(&mut self, pool_id: String, miner_address: String) {
         if self.update_dialog.status == UpdateStatus::Ready || self.update_dialog.status == UpdateStatus::Installing {
             self.last_error = Some("A newer QUB Core version is pending. Install the update before mining again.".to_string());
             return;
         }
         if self.miner.is_some() { return; }
         if pool_id.trim().is_empty() { self.last_error = Some("Select a pool before starting pool mining.".to_string()); return; }
+        let requested_mode = MinerRunMode::Pool {
+            pool_id: pool_id.trim().to_string(),
+            miner_address: miner_address.clone(),
+        };
         self.remember_pool_for_user(&pool_id);
         self.desired_pool_mining_pool_id = pool_id.trim().to_string();
         self.manual_stop_requested = false;
         self.auto_restart_mining_at = None;
-        let miner_address = if !self.pool_dialog.miner_address.trim().is_empty() { self.pool_dialog.miner_address.trim().to_string() } else if !self.prefs.payout_address.trim().is_empty() { self.prefs.payout_address.trim().to_string() } else { self.snapshot.default_address.clone() };
-        if miner_address.trim().is_empty() { self.last_error = Some("Create/import a local wallet key or set a miner address before pool mining.".to_string()); return; }
+        self.mining_restart_plan = None;
+        if miner_address.trim().is_empty() {
+            self.mining_intent = None;
+            self.last_error = Some("Create/import a local wallet key or set a miner address before pool mining.".to_string());
+            return;
+        }
+        self.mining_intent = Some(requested_mode.clone());
+        self.mining_plan_rejected_generation = None;
         self.update_runtime_identity();
         self.set_mining_phase(MiningPhase::Preparing);
         if let Err(message) = self.ensure_network_ready_to_mine() {
             self.last_error = Some(message);
             self.status_line = "Pool mining blocked until P2P is connected.".to_string();
             self.set_mining_phase(MiningPhase::Off);
+            self.mining_intent = None;
             return;
         }
         let config_path = self.prefs.config_path.clone();
@@ -5215,6 +5679,7 @@ del "%~f0"
             );
             self.status_line = "Mining blocked until high-power risk is confirmed.".to_string();
             self.set_mining_phase(MiningPhase::Off);
+            self.mining_intent = None;
             return;
         }
         let cpu_percent = self.prefs.cpu_percent.clamp(1, 100);
@@ -5232,6 +5697,8 @@ del "%~f0"
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let generation = self.next_miner_generation;
+        self.next_miner_generation = self.next_miner_generation.saturating_add(1);
         let pool_for_thread = pool_id.trim().to_string();
         let pool_for_status = pool_for_thread.clone();
         let join = match thread::Builder::new()
@@ -5255,13 +5722,22 @@ del "%~f0"
             Err(err) => {
                 self.set_mining_phase(MiningPhase::Off);
                 self.desired_pool_mining_pool_id.clear();
+                self.mining_intent = None;
                 self.last_error = Some(format!("Could not start the pool mining controller: {err}"));
                 self.status_line = "Pool mining did not start; the operating system refused the controller thread.".to_string();
                 return;
             }
         };
         self.pool_mining_pool_id = pool_for_status.clone();
-        self.miner = Some(MinerHandle { stop, rx, join: Some(join) });
+        self.miner = Some(MinerHandle {
+            stop,
+            rx,
+            join: Some(join),
+            generation,
+            mode: requested_mode,
+            cancellation_requested: false,
+            exit_reason: None,
+        });
         self.status_line = format!("Pool miner starting for {}: running fork-safety sync, submitting one current-parent share, then preparing a liveness-safe candidate...", shorten_hash(&pool_for_status));
         self.last_success = None;
         self.last_error = None;
@@ -5652,7 +6128,11 @@ del "%~f0"
 
             for pool in pools {
                 let is_last = self.prefs.last_pool_id.trim() == pool.pool_id;
-                let is_pool_mining = self.miner.is_some() && self.pool_mining_pool_id == pool.pool_id;
+                let is_pool_mining = self
+                    .miner
+                    .as_ref()
+                    .and_then(|miner| miner.mode.pool_id())
+                    == Some(pool.pool_id.as_str());
                 let fill = if is_pool_mining {
                     egui::Color32::from_rgba_unmultiplied(40, 92, 62, 150)
                 } else if is_last {
@@ -5860,8 +6340,8 @@ del "%~f0"
                 if self.ui_icon_button(ui, "stop-mining", "Stop mining").clicked() { self.stop_mining(); }
             }
         });
-        if self.miner.is_some() && !self.pool_mining_pool_id.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(66, 220, 120), format!("Currently pool mining {}", shorten_hash(&self.pool_mining_pool_id)));
+        if let Some(pool_id) = self.miner.as_ref().and_then(|miner| miner.mode.pool_id()) {
+            ui.colored_label(egui::Color32::from_rgb(66, 220, 120), format!("Currently pool mining {}", shorten_hash(pool_id)));
         }
         if self.snapshot.wallet_keys == 0 {
             ui.colored_label(egui::Color32::from_rgb(255, 170, 90), "Pool join/mining is disabled because this Core has no local private key.");
@@ -7194,31 +7674,33 @@ impl eframe::App for QubCoreApp {
         }
 
         if !self.initial_loading {
-            if let Some(restart_at) = self.auto_restart_mining_at {
-                if Instant::now() >= restart_at && self.miner.is_none() && !self.manual_stop_requested {
-                    let known = self.best_known_network_height();
-                    let local = self.snapshot.height;
-                    if known > local {
-                        // HF111/v1.7.1: an auto-heal restart must not start the
-                        // miner while we still know the canonical chain is ahead.
-                        // Keep repairing and re-check shortly.
-                        self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(15));
-                        self.status_line = format!(
-                            "HF110 auto-heal is still catching up before mining restart: local #{} -> official/direct #{} ({} block(s) remaining).",
-                            local, known, known.saturating_sub(local)
-                        );
-                        spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), true);
-                    } else if hf85_catchup_running() {
-                        self.auto_restart_mining_at = Some(Instant::now() + Duration::from_secs(8));
-                        self.status_line = "HF110 auto-heal repair is finishing; mining will resume automatically after the writer completes.".to_string();
-                    } else {
-                        let pool = self.desired_pool_mining_pool_id.clone();
-                        self.auto_restart_mining_at = None;
-                        self.hf110_autoheal_paused_mining = false;
-                        if !pool.trim().is_empty() {
-                            self.start_pool_mining(pool);
-                        } else {
-                            self.start_mining();
+            if let Some(plan) = self.mining_restart_plan.clone() {
+                if Instant::now() >= plan.at
+                    && self.miner.is_none()
+                    && !self.manual_stop_requested
+                    && self.update_dialog.status != UpdateStatus::Ready
+                    && self.update_dialog.status != UpdateStatus::Installing
+                    && self.mining_intent.as_ref() == Some(&plan.mode)
+                {
+                    // HF131: only controller ownership, explicit user intent,
+                    // and update state gate a restart here. A cached peer height
+                    // or a background probe is not a mining veto. The new
+                    // controller obtains the canonical writer and runs all
+                    // network/template/submit guards before it can hash.
+                    self.mining_restart_plan = None;
+                    self.auto_restart_mining_at = None;
+                    match plan.mode {
+                        MinerRunMode::Solo { payout_address } => self.start_solo_mining_with_payout(payout_address),
+                        MinerRunMode::Pool { pool_id, miner_address } if !pool_id.trim().is_empty() => {
+                            self.start_pool_mining_with_address(pool_id, miner_address)
+                        }
+                        MinerRunMode::Pool { .. } => {
+                            self.mining_intent = None;
+                            self.desired_pool_mining_pool_id.clear();
+                            self.last_error = Some(
+                                "Pool resume was cancelled because its typed Pool intent had no valid pool ID. QUB Core did not fall back to Solo."
+                                    .to_string(),
+                            );
                         }
                     }
                 }
@@ -7236,7 +7718,7 @@ impl eframe::App for QubCoreApp {
         } else {
             Duration::from_secs(15)
         };
-        if self.last_refresh.elapsed() >= refresh_every {
+        if self.hf86_force_quick_snapshot || self.last_refresh.elapsed() >= refresh_every {
             self.start_background_snapshot_refresh();
         }
         if self.last_enjin_metrics_refresh.elapsed() >= Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS) {
@@ -7428,16 +7910,16 @@ impl QubCoreApp {
 
     fn ui_opening_splash(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let elapsed = self.initial_loading_started_at.elapsed().as_secs_f32();
         let progress = self.sync_progress_fraction();
         let percent = (progress * 100.0).round() as u32;
         let local = self.snapshot.height;
         let known = self.best_known_network_height();
+        let rate = hf132_recent_sync_rate(self.sync_progress_rate_bps, self.sync_progress_last_sample.elapsed());
         let progress_detail = if known > local {
             let remaining = known.saturating_sub(local);
-            let rate_extra = if self.sync_progress_rate_bps > 0.01 {
-                let bpm = self.sync_progress_rate_bps * 60.0;
-                let eta_secs = (remaining as f32 / self.sync_progress_rate_bps).max(1.0);
+            let rate_extra = if rate > 0.01 {
+                let bpm = rate * 60.0;
+                let eta_secs = (remaining as f32 / rate).max(1.0);
                 let eta = if eta_secs < 90.0 { format!("{:.0}s", eta_secs) } else { format!("{:.1}m", eta_secs / 60.0) };
                 format!(" | {:.1} block(s)/min | ETA {eta}", bpm)
             } else {
@@ -7445,20 +7927,18 @@ impl QubCoreApp {
             };
             format!("local #{local} -> known #{known} | {remaining} block(s) remaining{rate_extra}")
         } else if known > 0 {
-            format!("local #{local} at known tip | final verification")
+            if self.same_height_network_tip_conflict() {
+                format!("local #{local} matches observed height; tip hash differs | canonical verification pending")
+            } else {
+                format!("local #{local} matches last observed height | checking peer freshness")
+            }
         } else {
             "discovering official/peer tip".to_string()
         };
         let message = if !self.status_line.trim().is_empty() && self.status_line != "Ready." {
             self.status_line.as_str()
-        } else if elapsed < 8.0 {
-            "Startup sync: contacting official seeds and checking the active chain..."
-        } else if elapsed < 18.0 {
-            "Fetching only missing canonical blocks from official seeds..."
-        } else if elapsed < 38.0 {
-            "Using verified HTTP tail snapshot if P2P suffix is slow..."
         } else {
-            "Finalizing wallet balances and local activity. Keep this window open."
+            "Loading the local wallet and chain view; waiting for the first completed read."
         };
 
         ui.allocate_ui_at_rect(rect, |ui| {
@@ -7493,7 +7973,7 @@ impl QubCoreApp {
                 painter.rect_stroke(bar_rect, 0.0, egui::Stroke::new(4.0, orange), egui::StrokeKind::Inside);
                 let fill_w = (bar_rect.width() * progress).clamp(0.0, bar_rect.width());
                 let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_rect.height()));
-                painter.rect_filled(fill_rect.shrink(4.0), 0.0, orange);
+                if fill_w > 8.0 { painter.rect_filled(fill_rect.shrink(4.0), 0.0, orange); }
                 painter.text(bar_rect.center(), egui::Align2::CENTER_CENTER, format!("{}%", percent), egui::FontId::proportional(30.0), egui::Color32::WHITE);
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new(progress_detail).size(15.0).color(egui::Color32::WHITE));
@@ -7612,8 +8092,38 @@ impl QubCoreApp {
         if self.prefs.left_mining_controls_expanded {
             ui.add_space(4.0);
             let mining = self.miner.is_some();
-            let pool_mining = mining && !self.pool_mining_pool_id.trim().is_empty();
-            if !mining {
+            let resume_pending = self.mining_restart_plan.is_some();
+            let pool_mining = matches!(
+                self.miner
+                    .as_ref()
+                    .map(|miner| &miner.mode)
+                    .or_else(|| self.mining_restart_plan.as_ref().map(|plan| &plan.mode)),
+                Some(MinerRunMode::Pool { .. })
+            );
+            if resume_pending {
+                self.ui_icon_button_enabled(
+                    ui,
+                    false,
+                    "start-mining",
+                    self.tr("Start solo mining", "Start solo mining"),
+                );
+                ui.small(if pool_mining {
+                    "Pool mining is paused for Sync/Repair; the same Pool resume is pending. Stop mining cancels the resume."
+                } else {
+                    "Solo mining is paused for Sync/Repair; its acknowledged resume is pending. Stop mining cancels the resume."
+                });
+                if self
+                    .ui_icon_button_sized(
+                        ui,
+                        "stop-mining",
+                        self.tr("Cancel mining resume", "Cancel mining resume"),
+                        22.0,
+                    )
+                    .clicked()
+                {
+                    self.stop_mining();
+                }
+            } else if !mining {
                 if self.ui_icon_button_sized(ui, "start-mining", self.tr("Start solo mining", "Start solo mining"), 22.0).clicked() {
                     self.start_mining();
                 }
@@ -7648,14 +8158,14 @@ impl QubCoreApp {
                 if self.ui_icon_button(ui, "sync", "Sync").clicked() {
                     self.start_wallet_sync(true);
                 }
-                if ui.button("Repair from official seed").clicked() {
+                if ui.add_enabled(matches!(self.snapshot.network.as_str(), "mainnet" | "testnet"), egui::Button::new("Repair from official seed")).clicked() {
                     self.status_line = "Repairing from official seed snapshot/tail with HF110 deep official repair...".to_string();
                     self.start_wallet_sync(true);
                 }
             });
             let payout_for_qr = self.prefs.payout_address.clone();
             self.ui_address_qr_hover(ui.ctx(), &payout_for_qr);
-            if let Some(warning) = qub_payout_address_warning(self.prefs.payout_address.trim()) {
+            if let Some(warning) = qub_payout_address_warning(self.prefs.payout_address.trim(), &self.snapshot.address_prefix) {
                 ui.colored_label(egui::Color32::from_rgb(255, 95, 95), warning);
             }
             if self.initial_loading || self.wallet_sync_in_flight || self.snapshot_in_flight {
@@ -7663,6 +8173,11 @@ impl QubCoreApp {
                 ui.small("Balances may temporarily show 0 and payout address may be blank until the automatic background sync/repair finishes. No manual Sync/Repair is needed unless this stays stuck.");
             } else if self.prefs.payout_address.trim().is_empty() && self.snapshot.default_address.is_empty() {
                 ui.small("No payout address is loaded yet. Create/import a wallet or paste any public qub1... / .qub address before mining.");
+            }
+            if let Some(miner) = &self.miner {
+                if miner.mode.payout_address() != self.prefs.payout_address.trim() {
+                    ui.small(format!("Payout for this run: {}. Stop and Start to use a different destination.", miner.mode.payout_address()));
+                }
             }
             ui.small("Pool mining is now the recommended default on mainnet. Solo mining is still available for advanced users, but pooled mining gives smaller miners smoother rewards.");
 
@@ -9388,7 +9903,7 @@ impl QubCoreApp {
                 } else {
                     shorten_hash(&entry.counterparty)
                 };
-                
+
                 ui.small(format!("Block: {} | Confirmations: {}", height, entry.confirmations));
                 ui.horizontal_wrapped(|ui| {
                     ui.small("Counterparty:");
@@ -10051,6 +10566,12 @@ impl QubCoreApp {
         let lower = status.to_ascii_lowercase();
         if lower.contains("catch-up pulse")
             || lower.contains("heartbeat catch-up")
+            || lower.contains("detached catch-up:")
+            || lower.contains("catch-up could not acquire")
+            || lower.contains("catch-up request active")
+            || lower.contains("catch-up ended with")
+            || lower.contains("catch-up verified the fresh")
+            || lower.contains("local wallet snapshot")
             || lower.contains("startup/background chain refresh")
             || lower.contains("catch-up writer active")
             || lower.contains("snapshot is still completing")
@@ -10591,7 +11112,7 @@ fn hf88_load_wallet_for_gui_snapshot(settings: &Settings) -> Result<WalletFile> 
     let paths = NodePaths::from_settings(settings);
     paths.ensure_dirs()?;
     if !paths.wallet_file.exists() {
-        return load_or_init_wallet(settings);
+        return Ok(WalletFile::new(&settings.network.name));
     }
     let raw = hf88_read_text_atomicish(&paths.wallet_file, "wallet.json")?;
     let wallet: WalletFile = serde_json::from_str(&raw)?;
@@ -10712,39 +11233,23 @@ fn jin_balance_units_for_address_confirmed(settings: &Settings, chain: &ChainSta
     Ok(ledger.get(address).copied().unwrap_or(0))
 }
 
-fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, include_network_probe: bool, fast_local: bool, include_cached_peer_view: bool) -> Result<ChainSnapshot> {
-    let settings = load_gui_settings(config_path)?;
-    // HF106/v1.6.9: quick/startup GUI snapshots use a UI-only fast chain loader.
-    // Full consensus replay stays in mining/sync/tx paths. This removes repeated
-    // 45s/90s snapshot releases caused by validating the entire chain on each paint.
-    let chain = if fast_local {
-        hf88_load_chain_for_gui_snapshot(&settings).or_else(|_| load_or_init_chain(&settings))?
-    } else {
-        load_or_init_chain(&settings)?
-    };
-    let wallet = if fast_local {
-        hf88_load_wallet_for_gui_snapshot(&settings).or_else(|_| load_or_init_wallet(&settings))?
-    } else {
-        load_or_init_wallet(&settings)?
-    };
-    let mut wallet_scripts = wallet.scripts().unwrap_or_default();
-    if let Ok(payout) = Address::parse_with_prefix(payout_address.trim(), &settings.network.address_prefix) {
-        wallet_scripts.insert(payout.script_pubkey().0);
-    }
-    let derived = hf123_gui_derived_cache(&settings, &chain);
-    let qns_by_address = &derived.qns_by_address;
-    let spendable = chain.balance_for_scripts(&wallet_scripts, &settings, false);
-    let total = chain.balance_for_scripts(&wallet_scripts, &settings, true);
-    let pools_registry = &derived.pools_registry;
-
-    let recent_blocks = chain.blocks
+fn hf129_recent_snapshot_blocks(
+    settings: &Settings,
+    chain: &ChainState,
+    wallet_scripts: &std::collections::HashSet<Vec<u8>>,
+    qns_by_address: &HashMap<String, Vec<String>>,
+    pools_registry: &HashMap<Hash256, PoolRecord>,
+) -> Vec<SnapshotBlock> {
+    chain
+        .blocks
         .iter()
         .enumerate()
         .skip(1)
         .rev()
         .take(BLOCK_HISTORY_LIMIT)
         .map(|(height, block)| {
-            let reward_atoms = block.transactions
+            let reward_atoms = block
+                .transactions
                 .first()
                 .map(|tx| tx.outputs.iter().map(|out| out.value.atoms()).sum::<u64>())
                 .unwrap_or(0);
@@ -10756,21 +11261,43 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
             let pool_name = pool_id_opt
                 .and_then(|id| pools_registry.get(&id).map(|p| p.name.clone()))
                 .unwrap_or_default();
-            let local = if pool_block { false } else {
-                block.transactions
+            let local = if pool_block {
+                false
+            } else {
+                block
+                    .transactions
                     .first()
-                    .map(|tx| tx.outputs.iter().any(|out| wallet_scripts.contains(&out.script_pubkey.0)))
+                    .map(|tx| {
+                        tx.outputs
+                            .iter()
+                            .any(|out| wallet_scripts.contains(&out.script_pubkey.0))
+                    })
                     .unwrap_or(false)
             };
-            let miner_address = block.transactions
+            let miner_address = block
+                .transactions
                 .first()
                 .and_then(|tx| tx.outputs.first())
-                .and_then(|out| address_from_script_pubkey(&settings.network.address_prefix, &out.script_pubkey))
+                .and_then(|out| {
+                    address_from_script_pubkey(
+                        &settings.network.address_prefix,
+                        &out.script_pubkey,
+                    )
+                })
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "Guest".to_string());
-            let miner_qns = qns_by_address.get(&miner_address).cloned().unwrap_or_default();
-            let jin_reward_units = block_jin_fee_units(&settings, block);
-            let reward = format!("{} QUB + {} JIN", Amount::from_atoms(reward_atoms).map(|a| a.to_string()).unwrap_or_else(|_| "0".to_string()), format_jin_amount(jin_reward_units));
+            let miner_qns = qns_by_address
+                .get(&miner_address)
+                .cloned()
+                .unwrap_or_default();
+            let jin_reward_units = block_jin_fee_units(settings, block);
+            let reward = format!(
+                "{} QUB + {} JIN",
+                Amount::from_atoms(reward_atoms)
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "0".to_string()),
+                format_jin_amount(jin_reward_units)
+            );
             SnapshotBlock {
                 height: height as u32,
                 hash: block.block_hash().to_string(),
@@ -10787,7 +11314,50 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
                 pool_name,
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, include_network_probe: bool, fast_local: bool, include_cached_peer_view: bool) -> Result<ChainSnapshot> {
+    let settings = load_gui_settings(config_path)?;
+    // HF106/v1.6.9: quick/startup GUI snapshots use a UI-only fast chain loader.
+    // Full consensus replay stays in mining/sync/tx paths. This removes repeated
+    // 45s/90s snapshot releases caused by validating the entire chain on each paint.
+    let (chain, capture_seq) = {
+        let _capture_guard = hf129_snapshot_capture_gate()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chain = if fast_local {
+            hf88_load_chain_for_gui_snapshot(&settings)?
+        } else {
+            load_or_init_chain(&settings)?
+        };
+        let capture_seq = HF129_SNAPSHOT_CAPTURE_SEQ
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        (chain, capture_seq)
+    };
+    let wallet = if fast_local {
+        hf88_load_wallet_for_gui_snapshot(&settings)?
+    } else {
+        load_or_init_wallet(&settings)?
+    };
+    let mut wallet_scripts = wallet.scripts().unwrap_or_default();
+    if let Ok(payout) = Address::parse_with_prefix(payout_address.trim(), &settings.network.address_prefix) {
+        wallet_scripts.insert(payout.script_pubkey().0);
+    }
+    let derived = hf123_gui_derived_cache(&settings, &chain);
+    let qns_by_address = &derived.qns_by_address;
+    let spendable = chain.balance_for_scripts(&wallet_scripts, &settings, false);
+    let total = chain.balance_for_scripts(&wallet_scripts, &settings, true);
+    let pools_registry = &derived.pools_registry;
+
+    let recent_blocks = hf129_recent_snapshot_blocks(
+        &settings,
+        &chain,
+        &wallet_scripts,
+        qns_by_address,
+        pools_registry,
+    );
 
     let recent_avg_10_secs = average_block_spacing_secs(&chain, 10).unwrap_or(0);
     let recent_avg_20_secs = average_block_spacing_secs(&chain, 20).unwrap_or(0);
@@ -10861,19 +11431,11 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     let mut known_network_height = chain.height();
     let mut known_network_hash = chain.tip_hash().to_string();
 
-    // HF106/v1.6.9: GUI canonical progress must be based only on official seed
-    // rows, not on arbitrary cached/reachable peers. Random peers can still be
-    // shown in the peer table as telemetry, but they must not create the blue
-    // "pending local validation / official-direct tip" row or make rewards look
-    // confirmed/stale against a fake future height.
+    // HF131: show a recent direct observation only. Registry gossip, remote
+    // role/user-agent strings and hostname substrings do not establish trust.
+    // This remains display/discovery information, never a mining permission.
     let official_peer_tip = p2p_snapshot.peers.iter()
-        .filter(|p| {
-            let role = p.role.as_deref().unwrap_or("").to_ascii_lowercase();
-            let ua = p.user_agent.as_deref().unwrap_or("").to_ascii_lowercase();
-            let addr = p.addr.to_ascii_lowercase();
-            role.contains("seed") || ua.contains("official") || addr.contains("seed-") || addr.contains("qubit-coin.io")
-        })
-        .filter_map(|p| p.height.map(|h| (h, p.tip_hash.clone().unwrap_or_default())))
+        .filter_map(hf131_peer_tip_for_display)
         .max_by(|a, b| a.0.cmp(&b.0));
 
     if let Some((official_h, official_hash)) = official_peer_tip.clone() {
@@ -10891,7 +11453,7 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
         known_network_height = known_network_height.max(official_h);
         if official_h > chain.height() && stale_warning.trim().is_empty() {
             stale_warning = format!(
-                "Local chain #{} is behind official seed network #{} ({}...). QUB Core detached catch-up is retrying automatically; wallet UI stays live.",
+                "Local chain #{} is behind a recent direct peer observation #{} ({}...). QUB Core is checking the chain in the background.",
                 chain.height(),
                 official_h,
                 shorten_hash(&known_network_hash)
@@ -10963,8 +11525,11 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
     reachable_peers = reachable_peers.max(peers.iter().filter(|p| p.reachable).count());
     direct_reachable_peers = direct_reachable_peers.max(peers.iter().filter(|p| p.reachable).count());
 
-    Ok(ChainSnapshot {
+    let mut snapshot = ChainSnapshot {
+        capture_seq,
+        head_capture_seq: capture_seq,
         network: settings.network.name.clone(),
+        address_prefix: settings.network.address_prefix.clone(),
         height: chain.height(),
         best_hash: chain.tip_hash().to_string(),
         known_network_height,
@@ -11020,7 +11585,61 @@ fn read_snapshot_for_payout_inner(config_path: &str, payout_address: &str, inclu
         peers,
         recent_blocks,
         activity,
-    })
+    };
+
+    // Wallet/QNS/pool derivation can be much slower than cloning the live FCE
+    // owner. Recapture the canonical head at delivery time so a valid but old
+    // derived snapshot cannot keep Recent Blocks minutes behind while mining is
+    // already advancing. The final head lane uses the same capture gate/sequence
+    // as every other snapshot producer, preserving latest-capture-wins ordering.
+    let (fresh_head, final_capture_seq) = {
+        let _capture_guard = hf129_snapshot_capture_gate()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        hf130_recapture_head(&chain, capture_seq,
+            || hf88_load_chain_for_gui_snapshot(&settings),
+            || HF129_SNAPSHOT_CAPTURE_SEQ.fetch_add(1, Ordering::SeqCst).saturating_add(1))
+    };
+    let old_local_height = snapshot.height;
+    let old_local_hash = snapshot.best_hash.clone();
+    snapshot.head_capture_seq = final_capture_seq;
+    snapshot.height = fresh_head.height();
+    snapshot.best_hash = fresh_head.tip_hash().to_string();
+    snapshot.mempool_txs = fresh_head.mempool.len();
+    snapshot.recent_blocks = hf129_recent_snapshot_blocks(
+        &settings,
+        &fresh_head,
+        &wallet_scripts,
+        qns_by_address,
+        pools_registry,
+    );
+    snapshot.recent_avg_10_secs = average_block_spacing_secs(&fresh_head, 10).unwrap_or(0);
+    snapshot.recent_avg_20_secs = average_block_spacing_secs(&fresh_head, 20).unwrap_or(0);
+    snapshot.daa_observation = daa_observation_text(
+        settings.consensus.target_spacing_secs,
+        snapshot.recent_avg_10_secs,
+        snapshot.recent_avg_20_secs,
+    );
+    let fresh_spendable = fresh_head.balance_for_scripts(&wallet_scripts, &settings, false);
+    let fresh_total = fresh_head.balance_for_scripts(&wallet_scripts, &settings, true);
+    snapshot.spendable = Amount::from_atoms(fresh_spendable)?.to_string();
+    snapshot.immature =
+        Amount::from_atoms(fresh_total.saturating_sub(fresh_spendable))?.to_string();
+    snapshot.total = Amount::from_atoms(fresh_total)?.to_string();
+    snapshot.block_reward =
+        Amount::from_atoms(block_subsidy(fresh_head.height() as u64 + 1, &settings))?.to_string();
+    snapshot.qub_jin_infusion_active =
+        qub_jin_infusion_active(&settings, fresh_head.height().saturating_add(1));
+    if snapshot.known_network_height < fresh_head.height()
+        || snapshot.known_network_hash.trim().is_empty()
+        || (snapshot.known_network_height == old_local_height
+            && snapshot.known_network_hash == old_local_hash)
+    {
+        snapshot.known_network_height = fresh_head.height();
+        snapshot.known_network_hash = fresh_head.tip_hash().to_string();
+    }
+
+    Ok(snapshot)
 }
 
 
@@ -11972,26 +12591,87 @@ fn wallet_key_for_gui_pool(settings: &Settings, wallet: &WalletFile, address: &s
     wallet.keys.iter().find(|k| k.address == target).cloned().with_context(|| format!("wallet does not contain private key for {target}"))
 }
 
-fn find_gui_pool_share_nonce(settings: &Settings, pool_id: Hash256, miner_address: &str, parent_height: u32, parent_hash: Hash256, start_nonce: u64) -> Result<u64> {
-    let mut nonce = start_nonce;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolShareSearch {
+    Found(u64),
+    Continue,
+    Cancelled,
+    ParentChanged,
+}
+
+fn hf130_search_pool_share_batch(
+    cursor: &mut u64,
+    stop: &AtomicBool,
+    deadline: Instant,
+    mut parent_is_current: impl FnMut() -> Result<bool>,
+    mut meets_target: impl FnMut(u64) -> Result<bool>,
+) -> Result<PoolShareSearch> {
+    if stop.load(Ordering::Relaxed) { return Ok(PoolShareSearch::Cancelled); }
+    if Instant::now() >= deadline { return Ok(PoolShareSearch::Continue); }
+    if !parent_is_current()? { return Ok(PoolShareSearch::ParentChanged); }
+    let start = *cursor;
     loop {
-        if pool_share_meets_target(settings, pool_id, miner_address, parent_height, parent_hash, nonce)? { return Ok(nonce); }
-        nonce = nonce.wrapping_add(1);
-        if nonce == start_nonce { anyhow::bail!("pool share nonce space exhausted"); }
+        // At most 256 ordinary share hashes between cancellation/time checks.
+        // The caller returns after one second to recheck the canonical parent.
+        for _ in 0..256 {
+            let nonce = *cursor;
+            *cursor = cursor.wrapping_add(1);
+            if meets_target(nonce)? {
+                if stop.load(Ordering::Relaxed) { return Ok(PoolShareSearch::Cancelled); }
+                if !parent_is_current()? { return Ok(PoolShareSearch::ParentChanged); }
+                if stop.load(Ordering::Relaxed) { return Ok(PoolShareSearch::Cancelled); }
+                return Ok(PoolShareSearch::Found(nonce));
+            }
+            if *cursor == start { anyhow::bail!("pool share nonce space exhausted"); }
+        }
+        if stop.load(Ordering::Relaxed) { return Ok(PoolShareSearch::Cancelled); }
+        if Instant::now() >= deadline { return Ok(PoolShareSearch::Continue); }
     }
 }
 
-fn create_gui_local_pool_share(settings: &Settings, chain: &mut ChainState, pool_id: Hash256, miner_key: &WalletKey, start_nonce: u64) -> Result<(Hash256, u64, usize)> {
+fn hf130_share_parent_is_current(settings: &Settings, parent: (u32, Hash256)) -> Result<bool> {
+    if let Some(live) = live_chain_arc(settings) {
+        // Never wait on the embedded writer from a cancellation checkpoint.
+        // Busy means rebuild/retry, not permission to hash an unchecked parent.
+        return Ok(live.try_lock().map(|chain| (chain.height(), chain.tip_hash()) == parent).unwrap_or(false));
+    }
+    if let Some(identity) = fast_storage_identity(settings)? {
+        return Ok((identity.committed_height, identity.tip_hash) == parent);
+    }
+    let current = hf88_load_chain_for_gui_snapshot(settings)?;
+    Ok((current.height(), current.tip_hash()) == parent)
+}
+
+fn find_gui_pool_share_nonce(
+    settings: &Settings, pool_id: Hash256, miner_address: &str,
+    parent: (u32, Hash256), cursor: &mut u64, stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<PoolShareSearch> {
+    hf130_search_pool_share_batch(cursor, stop, deadline,
+        || hf130_share_parent_is_current(settings, parent),
+        |nonce| pool_share_meets_target(settings, pool_id, miner_address, parent.0, parent.1, nonce))
+}
+
+fn create_gui_local_pool_share(
+    settings: &Settings, chain: &mut ChainState, pool_id: Hash256,
+    miner_key: &WalletKey, parent: (u32, Hash256), nonce: u64, stop: &AtomicBool,
+) -> Result<(Hash256, u64, usize)> {
+    // Search never persists the stale capture it started with. Re-admit against
+    // the latest canonical state using unchanged share validation rules.
+    if stop.load(Ordering::Relaxed) { anyhow::bail!("pool share preparation cancelled"); }
+    *chain = load_or_init_chain(settings)?;
+    if stop.load(Ordering::Relaxed) { anyhow::bail!("pool share preparation cancelled"); }
+    if (chain.height(), chain.tip_hash()) != parent { anyhow::bail!("pool share parent changed; rebuilding"); }
     let registry = cached_pools_registry_from_blocks(settings, &chain.blocks)?;
     if !registry.contains_key(&pool_id) { anyhow::bail!("unknown pool_id; create/confirm pool first"); }
-    let parent_height = chain.height();
-    let parent_hash = chain.tip_hash();
-    let nonce = find_gui_pool_share_nonce(settings, pool_id, &miner_key.address, parent_height, parent_hash, start_nonce)?;
-    let tx = create_pool_share_transaction(settings, pool_id, miner_key, parent_height, parent_hash, nonce)?;
+    let tx = create_pool_share_transaction(settings, pool_id, miner_key, parent.0, parent.1, nonce)?;
+    if stop.load(Ordering::Relaxed) { anyhow::bail!("pool share preparation cancelled"); }
     let txid = chain.accept_transaction_to_mempool(tx.clone(), settings)?;
     let _ = hf117_remember_pending_tx(settings, &tx, "gui-pool-share");
     save_chain(settings, chain)?;
-    let relayed = hf117_relay_exact_wallet_tx(settings, &tx, &txid);
+    // Once durable admission starts, finish it. Stop suppresses optional relay;
+    // the next normal pending-transaction relay can deliver the valid share.
+    let relayed = if stop.load(Ordering::Relaxed) { 0 } else { hf117_relay_exact_wallet_tx(settings, &tx, &txid) };
     Ok((txid, nonce, relayed))
 }
 
@@ -12002,7 +12682,23 @@ fn execute_gui_pool_join(config_path: &str, pool_id: &str, miner_address: &str) 
     let wallet = load_or_init_wallet(&settings)?;
     let pool_id_h = Hash256::from_hex(pool_id.trim())?;
     let key = wallet_key_for_gui_pool(&settings, &wallet, miner_address)?;
-    let (txid, nonce, relayed) = create_gui_local_pool_share(&settings, &mut chain, pool_id_h, &key, 0)?;
+    let stop = AtomicBool::new(false);
+    let parent = (chain.height(), chain.tip_hash());
+    let mut cursor = 0;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let nonce = loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Pool share preparation timed out after 30s. Start pool mining to continue automatic share preparation.");
+        }
+        match find_gui_pool_share_nonce(&settings, pool_id_h, &key.address, parent, &mut cursor, &stop,
+            deadline.min(Instant::now() + Duration::from_secs(1)))? {
+            PoolShareSearch::Found(nonce) => break nonce,
+            PoolShareSearch::Continue => {},
+            PoolShareSearch::Cancelled => anyhow::bail!("pool join cancelled"),
+            PoolShareSearch::ParentChanged => anyhow::bail!("Canonical parent changed during pool join. Retry, or start pool mining for automatic preparation."),
+        }
+    };
+    let (txid, nonce, relayed) = create_gui_local_pool_share(&settings, &mut chain, pool_id_h, &key, parent, nonce, &stop)?;
     Ok(PoolGuiEvent::Created {
         action: "join".to_string(),
         txid: txid.to_string(),
@@ -12128,10 +12824,11 @@ fn run_miner(
     stop: Arc<AtomicBool>,
 ) {
     let mut restart_allowed = true;
+    let mut pinned_address = None;
     let mut cpu_session_total = 0u64;
     let gpu_session_totals: GpuSessionTotals = Arc::new(Mutex::new(HashMap::new()));
     while !stop.load(Ordering::Relaxed) {
-        match run_miner_inner(
+        match p2p::hf130_with_mining_cancellation(stop.clone(), || run_miner_inner(
             config_path.clone(),
             payout.clone(),
             cpu_percent,
@@ -12143,8 +12840,9 @@ fn run_miner(
             &events,
             &mut cpu_session_total,
             gpu_session_totals.clone(),
+            &mut pinned_address,
             stop.clone(),
-        ) {
+        )) {
             Ok(_) => break,
             Err(err) => {
                 if let Some(message) = permanent_miner_plan_message(&err) {
@@ -12160,8 +12858,9 @@ fn run_miner(
             }
         }
     }
+    let reason = hf130_miner_exit_reason(stop.load(Ordering::Relaxed), restart_allowed);
     stop.store(true, Ordering::Relaxed);
-    let _ = events.send(MinerEvent::Stopped { restart_allowed });
+    let _ = events.send(MinerEvent::Stopped { reason });
 }
 
 fn run_pool_miner(
@@ -12177,10 +12876,11 @@ fn run_pool_miner(
     stop: Arc<AtomicBool>,
 ) {
     let mut restart_allowed = true;
+    let mut pinned_address = None;
     let mut cpu_session_total = 0u64;
     let gpu_session_totals: GpuSessionTotals = Arc::new(Mutex::new(HashMap::new()));
     while !stop.load(Ordering::Relaxed) {
-        match run_pool_miner_inner(
+        match p2p::hf130_with_mining_cancellation(stop.clone(), || run_pool_miner_inner(
             config_path.clone(),
             pool_id_s.clone(),
             miner_address.clone(),
@@ -12192,8 +12892,9 @@ fn run_pool_miner(
             &events,
             &mut cpu_session_total,
             gpu_session_totals.clone(),
+            &mut pinned_address,
             stop.clone(),
-        ) {
+        )) {
             Ok(_) => break,
             Err(err) => {
                 if let Some(message) = permanent_miner_plan_message(&err) {
@@ -12209,8 +12910,44 @@ fn run_pool_miner(
             }
         }
     }
+    let reason = hf130_miner_exit_reason(stop.load(Ordering::Relaxed), restart_allowed);
     stop.store(true, Ordering::Relaxed);
-    let _ = events.send(MinerEvent::Stopped { restart_allowed });
+    let _ = events.send(MinerEvent::Stopped { reason });
+}
+
+// Join on normal exits and when Rust unwinds. A panic=abort release terminates
+// the process instead; it does not run Drop and cannot resume in-process.
+struct MiningRoundWorkers {
+    joins: Vec<thread::JoinHandle<()>>,
+    round_stop: Arc<AtomicBool>,
+}
+
+// Workers stop sibling nonce lanes before publishing a found block. A hit can
+// therefore arrive while the controller is checking the network, or before it
+// first enters recv_timeout. After every worker is joined, its channel is the
+// complete result of the round; do not mistake the stop flag for an empty result.
+// An explicit user Stop still cancels submission, including an already received
+// candidate. The caller must also retain the canonical-parent submit guards.
+fn hf131_finish_round_candidate<T>(
+    received: Option<T>,
+    receiver: &mpsc::Receiver<T>,
+    cancelled: bool,
+) -> Option<T> {
+    if cancelled { None } else { received.or_else(|| receiver.try_recv().ok()) }
+}
+
+impl MiningRoundWorkers {
+    fn new(round_stop: Arc<AtomicBool>) -> Self { Self { joins: Vec::new(), round_stop } }
+    fn push(&mut self, join: thread::JoinHandle<()>) { self.joins.push(join); }
+    fn is_empty(&self) -> bool { self.joins.is_empty() }
+    fn join_all(&mut self) {
+        self.round_stop.store(true, Ordering::Relaxed);
+        for join in self.joins.drain(..) { let _ = join.join(); }
+    }
+}
+
+impl Drop for MiningRoundWorkers {
+    fn drop(&mut self) { self.join_all(); }
 }
 
 const PERMANENT_MINER_PLAN_PREFIX: &str = "PERMANENT_MINER_PLAN:";
@@ -12226,6 +12963,65 @@ fn permanent_miner_plan_message(err: &anyhow::Error) -> Option<String> {
         .map(|index| message[index + PERMANENT_MINER_PLAN_PREFIX.len()..].trim().to_string())
 }
 
+fn hf131_resolve_mining_address(
+    prefix: &str,
+    input: &str,
+    pinned_address: &mut Option<String>,
+    resolve_qns: impl FnOnce(&str) -> Result<Option<String>>,
+) -> Result<Address> {
+    // Keep one destination across controller retries. Changing QNS ownership
+    // or editing the textbox cannot redirect an already running mining plan.
+    if let Some(pinned) = pinned_address.as_deref() {
+        return Address::parse_with_prefix(pinned, prefix)
+            .map_err(|err| permanent_miner_plan_error(format!("Pinned mining payout does not match the active network: {err:#}")));
+    }
+    let input = input.trim();
+    let resolved = if input.to_ascii_lowercase().ends_with(".qub") {
+        resolve_qns(input)
+            .map_err(|err| permanent_miner_plan_error(format!("Could not resolve mining QNS name {input}: {err:#}")))?
+            .ok_or_else(|| permanent_miner_plan_error(format!("Mining QNS name not found in the validated chain: {input}. Check the name and press Start again.")))?
+    } else {
+        input.to_string()
+    };
+    let address = Address::parse_with_prefix(&resolved, prefix)
+        .map_err(|err| permanent_miner_plan_error(format!("Invalid mining payout for {prefix}: {err:#}. Correct the payout and press Start again.")))?;
+    *pinned_address = Some(address.to_string());
+    Ok(address)
+}
+
+fn hf131_mining_payout_syntax(settings: &Settings, input: &str) -> Result<()> {
+    if input.trim().to_ascii_lowercase().ends_with(".qub") {
+        normalize_qns_name(input, settings.qns.max_label_chars)
+            .map_err(|err| permanent_miner_plan_error(format!("Invalid mining QNS name: {err:#}")))?;
+    } else {
+        Address::parse_with_prefix(input.trim(), &settings.network.address_prefix)
+            .map_err(|err| permanent_miner_plan_error(format!("Invalid mining payout: {err:#}. Correct the payout and press Start again.")))?;
+    }
+    Ok(())
+}
+
+fn hf131_pool_mining_key(settings: &Settings, wallet: &WalletFile, address: &str) -> Result<WalletKey> {
+    wallet_key_for_gui_pool(settings, wallet, address)
+        .map_err(|err| permanent_miner_plan_error(format!("Pool payout needs its local wallet key: {err:#}. Select an owned address and press Start again.")))
+}
+
+fn hf131_pin_gui_mining_payout(
+    settings: &Settings, chain: &ChainState, input: &str,
+    pinned_address: &mut Option<String>, events: &mpsc::Sender<MinerEvent>,
+) -> Result<Address> {
+    let newly_resolved = pinned_address.is_none();
+    let address = hf131_resolve_mining_address(
+        &settings.network.address_prefix, input, pinned_address,
+        |name| Ok(qns_resolve(settings, chain, name)?.map(|record| record.address)),
+    )?;
+    if newly_resolved {
+        let _ = events.send(MinerEvent::PayoutResolved {
+            requested: input.to_string(), address: address.to_string(),
+        });
+    }
+    Ok(address)
+}
+
 fn run_pool_miner_inner(
     config_path: String,
     pool_id_s: String,
@@ -12238,16 +13034,20 @@ fn run_pool_miner_inner(
     events: &mpsc::Sender<MinerEvent>,
     cpu_session_total: &mut u64,
     gpu_session_totals: GpuSessionTotals,
+    pinned_address: &mut Option<String>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let pool_id = Hash256::from_hex(&pool_id_s)?;
+    let pool_id = Hash256::from_hex(&pool_id_s)
+        .map_err(|err| permanent_miner_plan_error(format!("Invalid pool ID: {err:#}")))?;
     let logical = logical_cpus();
     let (threads, duty) = resource_plan(logical, cpu_percent, cpu_worker_override);
     let mut share_nonce_start = 0u64;
+    let mut share_nonce_parent: Option<(u32, Hash256)> = None;
     let mut last_share_parent: Option<(u32, Hash256)> = None;
 
-    while !stop.load(Ordering::Relaxed) {
+    'pool_round: while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
+        hf131_mining_payout_syntax(&settings, pinned_address.as_deref().unwrap_or(&miner_address))?;
         settings.mining.enabled = true;
         settings.mining.miner_address = miner_address.clone();
         if settings.p2p.enabled {
@@ -12269,7 +13069,11 @@ fn run_pool_miner_inner(
 
         let mut chain = load_or_init_chain(&settings)?;
         let wallet = load_or_init_wallet(&settings)?;
-        let key = wallet_key_for_gui_pool(&settings, &wallet, &miner_address)?;
+        let payout = hf131_pin_gui_mining_payout(
+            &settings, &chain, &miner_address, pinned_address, events,
+        )?;
+        let key = hf131_pool_mining_key(&settings, &wallet, &payout.to_string())?;
+        settings.mining.miner_address = payout.to_string();
         if settings.p2p.enabled {
             match p2p::mining_parent_guard(&settings, chain.height(), chain.tip_hash()) {
                 Ok(report) if report.peers_contacted > 0 => {
@@ -12290,6 +13094,10 @@ fn run_pool_miner_inner(
         // The previous outer-loop behavior could mint another share whenever a
         // mining round restarted, feeding a self-amplifying mempool/rebuild loop.
         let share_parent = (chain.height(), chain.tip_hash());
+        if share_nonce_parent != Some(share_parent) {
+            share_nonce_start = 0;
+            share_nonce_parent = Some(share_parent);
+        }
         let own_share_pending = chain.mempool.iter().any(|tx| {
             parse_pool_share_tx(tx)
                 .map(|share| {
@@ -12321,31 +13129,45 @@ fn run_pool_miner_inner(
             }
         }
         if last_share_parent != Some(share_parent) {
-            match create_gui_local_pool_share(
-                &settings,
-                &mut chain,
-                pool_id,
-                &key,
-                share_nonce_start,
-            ) {
+            let _ = events.send(MinerEvent::Status(format!(
+                "Preparing pool share for parent #{}; Stop remains available.", share_parent.0)));
+            let mut last_status = Instant::now();
+            let nonce = loop {
+                match find_gui_pool_share_nonce(&settings, pool_id, &key.address, share_parent,
+                    &mut share_nonce_start, &stop, Instant::now() + Duration::from_secs(1))? {
+                    PoolShareSearch::Found(nonce) => break nonce,
+                    PoolShareSearch::Cancelled => return Ok(()),
+                    PoolShareSearch::ParentChanged => {
+                        let _ = events.send(MinerEvent::Status("Pool share parent changed or writer busy; rebuilding from canonical state.".to_string()));
+                        continue 'pool_round;
+                    }
+                    PoolShareSearch::Continue => {
+                        if last_status.elapsed() >= Duration::from_secs(5) {
+                            let _ = events.send(MinerEvent::Status(format!(
+                                "Preparing pool share for parent #{} (nonce cursor {}); checking Stop and canonical parent.",
+                                share_parent.0, share_nonce_start)));
+                            last_status = Instant::now();
+                        }
+                    }
+                }
+            };
+            if stop.load(Ordering::Relaxed) { return Ok(()); }
+            match create_gui_local_pool_share(&settings, &mut chain, pool_id, &key, share_parent, nonce, &stop) {
                 Ok((share_txid, nonce, _relayed)) => {
-                    share_nonce_start = nonce.wrapping_add(1);
                     last_share_parent = Some(share_parent);
                     let _ = events.send(MinerEvent::Status(format!(
                         "Pool share submitted once for parent #{}: {} nonce={}",
-                        share_parent.0,
-                        shorten_hash(&share_txid.to_string()),
-                        nonce
-                    )));
+                        share_parent.0, shorten_hash(&share_txid.to_string()), nonce)));
                     chain = load_or_init_chain(&settings)?;
                 }
                 Err(err) => {
-                    let _ = events.send(MinerEvent::Status(format!(
-                        "Pool share warning: {err:#}"
-                    )));
+                    let _ = events.send(MinerEvent::Status(format!("Pool share warning: {err:#}")));
+                    if stop.load(Ordering::Relaxed) { return Ok(()); }
+                    continue 'pool_round;
                 }
             }
         }
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
 
         // HF128/v1.8.4: one centralized planner selects an ordinary
         // consensus-marked PPLNS block, a markerless Melt compatibility block,
@@ -12384,7 +13206,8 @@ fn run_pool_miner_inner(
         let gpu_enabled = gpu_percent > 0;
         let gpu_selectors = if gpu_enabled { gpu_device_selectors_for_mining(&gpu_device_selector) } else { Vec::new() };
         let (found_tx, found_rx) = mpsc::channel::<Block>();
-        let mut joins = Vec::new();
+        let mut joins = MiningRoundWorkers::new(round_stop.clone());
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
         let mut cpu_worker_start_error = None::<String>;
 
         for worker_id in 0..threads {
@@ -12426,9 +13249,7 @@ fn run_pool_miner_inner(
         if let Some(message) = cpu_worker_start_error {
             round_stop.store(true, Ordering::Relaxed);
             drop(found_tx);
-            for join in joins {
-                let _ = join.join();
-            }
+            joins.join_all();
             let _ = events.send(MinerEvent::Status(message.clone()));
             return Err(permanent_miner_plan_error(message));
         }
@@ -12530,7 +13351,10 @@ fn run_pool_miner_inner(
         }
 
         round_stop.store(true, Ordering::Relaxed);
-        for join in joins { let _ = join.join(); }
+        joins.join_all();
+        found_block = hf131_finish_round_candidate(
+            found_block, &found_rx, stop.load(Ordering::Relaxed),
+        );
         let delta = hash_counter.swap(0, Ordering::Relaxed);
         *cpu_session_total = (*cpu_session_total).saturating_add(delta);
         if delta > 0 {
@@ -12552,6 +13376,7 @@ fn run_pool_miner_inner(
                 }
             }
             let mut active = load_or_init_chain(&settings)?;
+            if stop.load(Ordering::Relaxed) { break; }
             if active.height() != candidate_parent_height || active.tip_hash() != candidate_parent_hash {
                 let _ = events.send(MinerEvent::Status("Tip changed while pool mining; candidate discarded before submit.".to_string()));
                 continue;
@@ -12613,6 +13438,7 @@ fn run_miner_inner(
     events: &mpsc::Sender<MinerEvent>,
     cpu_session_total: &mut u64,
     gpu_session_totals: GpuSessionTotals,
+    pinned_address: &mut Option<String>,
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let logical = logical_cpus();
@@ -12620,6 +13446,7 @@ fn run_miner_inner(
 
     while !stop.load(Ordering::Relaxed) {
         let mut settings = load_gui_settings(&config_path)?;
+        hf131_mining_payout_syntax(&settings, pinned_address.as_deref().unwrap_or(&payout))?;
         settings.mining.enabled = true;
         settings.mining.miner_address = payout.clone();
         if settings.p2p.enabled {
@@ -12655,7 +13482,10 @@ fn run_miner_inner(
                 }
             }
         }
-        let miner = Address::parse_with_prefix(&payout, &settings.network.address_prefix)?;
+        let miner = hf131_pin_gui_mining_payout(
+            &settings, &base_chain, &payout, pinned_address, events,
+        )?;
+        settings.mining.miner_address = miner.to_string();
         // HF124/v1.8.1: assemble and contextually validate the transaction set
         // once per canonical parent. All CPU/GPU workers share these immutable
         // parts and vary only coinbase extra-nonce/header nonce.
@@ -12675,7 +13505,8 @@ fn run_miner_inner(
         let round_stop = Arc::new(AtomicBool::new(false));
         let hash_counter = Arc::new(AtomicU64::new(0));
         let (found_tx, found_rx) = mpsc::channel::<Block>();
-        let mut joins = Vec::new();
+        let mut joins = MiningRoundWorkers::new(round_stop.clone());
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
         let mut cpu_worker_start_error = None::<String>;
 
         for worker_id in 0..threads {
@@ -12715,9 +13546,7 @@ fn run_miner_inner(
         if let Some(message) = cpu_worker_start_error {
             round_stop.store(true, Ordering::Relaxed);
             drop(found_tx);
-            for join in joins {
-                let _ = join.join();
-            }
+            joins.join_all();
             let _ = events.send(MinerEvent::Status(message.clone()));
             return Err(permanent_miner_plan_error(message));
         }
@@ -12824,7 +13653,10 @@ fn run_miner_inner(
         }
 
         round_stop.store(true, Ordering::Relaxed);
-        for join in joins { let _ = join.join(); }
+        joins.join_all();
+        found_block = hf131_finish_round_candidate(
+            found_block, &found_rx, stop.load(Ordering::Relaxed),
+        );
         let delta = hash_counter.swap(0, Ordering::Relaxed);
         *cpu_session_total = (*cpu_session_total).saturating_add(delta);
         if delta > 0 {
@@ -12846,6 +13678,7 @@ fn run_miner_inner(
                 }
             }
             let mut chain = load_or_init_chain(&settings)?;
+            if stop.load(Ordering::Relaxed) { break; }
             if chain.height() != candidate_parent_height || chain.tip_hash() != candidate_parent_hash {
                 let _ = events.send(MinerEvent::Status("Tip changed while mining; candidate discarded before submit.".to_string()));
                 continue;
@@ -14140,19 +14973,21 @@ fn play_mining_loop_tick_sound() {}
 
 
 
-fn qub_payout_address_warning(input: &str) -> Option<String> {
+fn qub_payout_address_warning(input: &str, prefix: &str) -> Option<String> {
     let trimmed = input.trim();
-    if trimmed.is_empty() { return None; }
+    // Wait for the active settings snapshot instead of guessing the build's
+    // network. Mining itself still validates against the loaded configuration.
+    if trimmed.is_empty() || prefix.is_empty() { return None; }
     if trimmed.to_ascii_lowercase().starts_with("0x") {
-        return Some("Wrong payout address format: Ethereum 0x... addresses cannot receive QUB mining rewards. Create/import a QUB Chain wallet in Create / import address -> QUB Chain, then use its qub1... address here.".to_string());
+        return Some(format!("Wrong payout address format: Ethereum 0x... addresses cannot receive QUB mining rewards. Create/import a QUB Chain wallet for the active network, then use its {prefix}1... address here."));
     }
     if trimmed.contains(':') || trimmed.contains('@') || trimmed.contains('/') {
-        return Some("Wrong payout address format: use a QUB Chain qub1... address or a .qub QNS name for mining payout. Create/import a QUB wallet in Create / import address -> QUB Chain.".to_string());
+        return Some(format!("Wrong payout address format: use a {prefix}1... address for the active QUB network or a .qub QNS name for mining payout."));
     }
     if trimmed.ends_with(".qub") { return None; }
-    match Address::parse_with_prefix(trimmed, "qub") {
+    match Address::parse_with_prefix(trimmed, prefix) {
         Ok(_) => None,
-        Err(_) => Some("Wrong payout address format: mining payout must be a QUB Chain qub1... address or .qub name. Create/import a QUB wallet in Create / import address -> QUB Chain.".to_string()),
+        Err(_) => Some(format!("Wrong payout address format: mining payout must be a {prefix}1... address for the active QUB network or a .qub name.")),
     }
 }
 
@@ -15297,11 +16132,350 @@ fn windows_check_and_stage_update(_url: &str, current_version: &str, last_signat
 }
 
 #[cfg(test)]
+mod hf131_mining_tests {
+    use super::*;
+
+    #[test]
+    fn hf131_found_candidate_survives_stop_before_publication() {
+        let round_stop = Arc::new(AtomicBool::new(false));
+        let (found_tx, found_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let worker_stop = round_stop.clone();
+        let mut workers = MiningRoundWorkers::new(round_stop.clone());
+        workers.push(thread::spawn(move || {
+            worker_stop.store(true, Ordering::Relaxed);
+            stopped_tx.send(()).unwrap();
+            publish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            found_tx.send(131u64).unwrap();
+        }));
+        stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Reproduce the controller missing recv_timeout because round_stop was
+        // set while a template/network check was running. Publication is later.
+        assert!(round_stop.load(Ordering::Relaxed));
+        assert!(found_rx.try_recv().is_err());
+        publish_tx.send(()).unwrap();
+        workers.join_all();
+        assert_eq!(hf131_finish_round_candidate(None, &found_rx, false), Some(131));
+    }
+
+    #[test]
+    fn hf131_found_candidate_honors_manual_stop_and_first_result() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(2u64).unwrap();
+        assert_eq!(hf131_finish_round_candidate(Some(1), &rx, false), Some(1));
+        // Both already received and queued work are cancelled by explicit Stop.
+        assert_eq!(hf131_finish_round_candidate(Some(1), &rx, true), None);
+        assert_eq!(hf131_finish_round_candidate(None, &rx, true), None);
+        assert_eq!(hf131_finish_round_candidate(None, &rx, false), Some(2));
+        drop(tx);
+        assert_eq!(hf131_finish_round_candidate(None, &rx, false), None);
+    }
+
+    #[test]
+    fn hf131_gui_peer_roles_cannot_promote_stale_or_gossip_tips() {
+        let mut peer = p2p::P2PPeerStatus {
+            addr: "fake.qubit-coin.io.example:17444".to_string(),
+            role: Some("official seed".to_string()),
+            user_agent: Some("official-direct-tip".to_string()),
+            global_live: true,
+            height: Some(u32::MAX),
+            tip_hash: Some("11".repeat(32)),
+            seen_age_secs: Some(0),
+            ..Default::default()
+        };
+        assert!(hf131_peer_tip_for_display(&peer).is_none());
+        peer.reachable = true;
+        peer.seen_age_secs = Some(31);
+        assert!(hf131_peer_tip_for_display(&peer).is_none());
+        peer.seen_age_secs = None;
+        assert!(hf131_peer_tip_for_display(&peer).is_none());
+        peer.seen_age_secs = Some(0);
+        peer.role = Some("ordinary peer".to_string());
+        peer.user_agent = None;
+        assert_eq!(hf131_peer_tip_for_display(&peer), Some((u32::MAX, "11".repeat(32))));
+        peer.tip_hash = Some("invalid hash".to_string());
+        assert!(hf131_peer_tip_for_display(&peer).is_none());
+    }
+
+    #[test]
+    fn hf131_mining_qns_resolution_is_pinned_across_retries() {
+        let original = Address::new("qub", [3; 20]).to_string();
+        let replacement = Address::new("qub", [4; 20]).to_string();
+        let mut pinned = None;
+        let resolved = hf131_resolve_mining_address("qub", " Miner.QUB ", &mut pinned, |name| {
+            assert_eq!(name, "Miner.QUB");
+            Ok(Some(original.clone()))
+        }).unwrap();
+        assert_eq!(resolved.to_string(), original);
+        let again = hf131_resolve_mining_address("qub", "changed.qub", &mut pinned, |_| {
+            panic!("an active mining plan must not re-resolve its destination")
+        }).unwrap();
+        assert_eq!(again.to_string(), original);
+        let mut new_run = None;
+        let changed = hf131_resolve_mining_address("qub", "changed.qub", &mut new_run, |_| {
+            Ok(Some(replacement.clone()))
+        }).unwrap();
+        assert_eq!(changed.to_string(), replacement);
+    }
+
+    #[test]
+    fn hf131_mining_invalid_or_cross_network_payout_is_permanent() {
+        let mainnet = Address::new("qub", [5; 20]).to_string();
+        let mut pinned = None;
+        let missing = hf131_resolve_mining_address("qub", "missing.qub", &mut pinned, |_| Ok(None)).unwrap_err();
+        assert!(permanent_miner_plan_message(&missing).is_some());
+        assert!(pinned.is_none());
+        let wrong_network = hf131_resolve_mining_address("rqub", "miner.qub", &mut pinned, |_| Ok(Some(mainnet.clone()))).unwrap_err();
+        assert!(permanent_miner_plan_message(&wrong_network).is_some());
+        assert!(pinned.is_none());
+        let invalid = hf131_resolve_mining_address("qub", "not-an-address", &mut pinned, |_| panic!("direct payout queried QNS")).unwrap_err();
+        assert!(permanent_miner_plan_message(&invalid).is_some());
+        let direct = hf131_resolve_mining_address("qub", &mainnet, &mut pinned, |_| panic!("direct payout queried QNS")).unwrap();
+        assert_eq!(direct.to_string(), mainnet);
+        let changed_network = hf131_resolve_mining_address("rqub", "miner.qub", &mut pinned, |_| panic!("pinned payout queried QNS")).unwrap_err();
+        assert!(permanent_miner_plan_message(&changed_network).is_some());
+    }
+
+    #[test]
+    fn hf131_pool_mining_requires_owned_resolved_address() {
+        let settings: Settings = toml::from_str(include_str!("../../config/mainnet.toml")).unwrap();
+        let payout = Address::new(&settings.network.address_prefix, [6; 20]).to_string();
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let absent = hf131_pool_mining_key(&settings, &wallet, &payout).unwrap_err();
+        assert!(permanent_miner_plan_message(&absent).is_some());
+        // This fixture tests ownership selection only. Share creation separately
+        // validates the real public/private key relationship before signing.
+        wallet.keys.push(WalletKey {
+            address: payout.clone(), public_key_hex: String::new(),
+            secret_key_hex: String::new(), label: "ownership fixture".to_string(), created_height: 0,
+        });
+        assert_eq!(hf131_pool_mining_key(&settings, &wallet, &payout).unwrap().address, payout);
+        let other = Address::new(&settings.network.address_prefix, [7; 20]).to_string();
+        assert!(hf131_pool_mining_key(&settings, &wallet, &other).is_err());
+    }
+
+    #[test]
+    fn hf131_resolved_payout_preserves_restart_mode_and_generation() {
+        let payout = Address::new("qub", [8; 20]).to_string();
+        for requested in [
+            MinerRunMode::Solo { payout_address: "miner.qub".to_string() },
+            MinerRunMode::Pool { pool_id: "selected-pool".to_string(), miner_address: "miner.qub".to_string() },
+        ] {
+            assert!(hf131_mode_with_resolved_payout(&requested, "another.qub", &payout).is_none());
+            let resolved = hf131_mode_with_resolved_payout(&requested, "miner.qub", &payout).unwrap();
+            assert_eq!(resolved.pool_id(), requested.pool_id());
+            assert_eq!(resolved.payout_address(), payout);
+            let plan = MiningRestartPlan {
+                at: Instant::now(), mode: resolved.clone(),
+                cause: MiningRestartCause::Reconfigure, retiring_generation: 8,
+            };
+            assert_eq!(hf129_authorized_restart_plan(&Some(resolved.clone()), Some(&plan), 8, &resolved).unwrap().mode, resolved);
+            assert!(hf129_authorized_restart_plan(&Some(requested), Some(&plan), 8, &resolved).is_none());
+            assert!(hf129_authorized_restart_plan(&None, Some(&plan), 8, &resolved).is_none());
+            assert!(hf129_authorized_restart_plan(&Some(resolved.clone()), Some(&plan), 9, &resolved).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod hf130_gui_sync_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn regtest_settings() -> Settings {
+        toml::from_str(include_str!("../../config/regtest.toml")).expect("regtest settings")
+    }
+
+    #[test]
+    fn hf130_gui_sync_routes_preserve_public_repair() {
+        let mut settings = regtest_settings();
+        settings.p2p.enabled = true;
+        for network in ["mainnet", "testnet"] {
+            settings.network.name = network.to_string();
+            assert_eq!(hf130_gui_catchup_route(&settings, false).unwrap(), Hf130GuiCatchupRoute::PublicAuto);
+            assert_eq!(hf130_gui_catchup_route(&settings, true).unwrap(), Hf130GuiCatchupRoute::PublicRepair);
+        }
+        settings.network.name = "regtest".to_string();
+        let automatic = hf130_run_gui_catchup(&settings, false).unwrap();
+        assert_eq!(automatic.terminal, "local-only");
+        assert_eq!(automatic.sync_reason, "regtest-local-only");
+        assert!(!automatic.writer_acquired && !automatic.progressed && !automatic.fresh_at_tip);
+        settings.p2p.enabled = false;
+        let disabled = hf130_run_gui_catchup(&settings, true).unwrap();
+        assert_eq!(disabled.terminal, "p2p-disabled");
+        assert!(!disabled.writer_acquired && !disabled.progressed && !disabled.fresh_at_tip);
+        settings.p2p.enabled = true;
+        settings.network.name = "unknown".to_string();
+        assert!(hf130_run_gui_catchup(&settings, true).is_err());
+    }
+
+    #[test]
+    fn hf130_gui_payout_warning_uses_active_prefix() {
+        for prefix in ["qub", "tqub", "rqub"] {
+            let address = Address::new(prefix, [7; 20]).to_string();
+            assert!(qub_payout_address_warning(&address, prefix).is_none());
+            for other in ["qub", "tqub", "rqub"].into_iter().filter(|other| *other != prefix) {
+                assert!(qub_payout_address_warning(&address, other).is_some());
+            }
+            let mut corrupt = address.clone();
+            let last = corrupt.pop().unwrap();
+            corrupt.push(if last == '0' { '1' } else { '0' });
+            assert!(qub_payout_address_warning(&corrupt, prefix).is_some());
+            assert!(qub_payout_address_warning("miner.qub", prefix).is_none());
+            assert!(qub_payout_address_warning("0x1234", prefix).unwrap().contains(&format!("{prefix}1")));
+        }
+        assert!(qub_payout_address_warning("", "rqub").is_none());
+        assert!(qub_payout_address_warning("not-loaded-yet", "").is_none());
+    }
+
+    #[test]
+    fn hf130_regtest_gui_sync_adopts_configured_peer_block() {
+        let mut settings = regtest_settings();
+        let root = std::env::temp_dir().join(format!("qub-hf130-gui-peer-{}-{}",
+            std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        settings.node.data_dir = root.display().to_string();
+        settings.p2p.enabled = true;
+        settings.p2p.bind = "127.0.0.1:0".to_string();
+        settings.p2p.advertise_addr.clear();
+        settings.p2p.max_outbound_peers = 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        settings.p2p.bootnodes = vec![address.clone()];
+        let before = load_or_init_chain(&settings).unwrap();
+        let mut remote = before.clone();
+        let miner = Address::new(&settings.network.address_prefix, [9; 20]);
+        let block = mine_next_block(&remote, &settings, &miner, MiningOptions {
+            duty_cycle_percent: 100, max_hashes: Some(5_000_000),
+        }).unwrap();
+        remote.connect_block(block.clone(), &settings).unwrap();
+        let version = serde_json::json!({
+            "type": "version", "protocol": 2, "network": settings.network.name,
+            "magic": settings.network.magic, "user_agent": "/HF130-regtest-fixture/",
+            "height": remote.height(), "tip_hash": remote.tip_hash().to_string(),
+            "work": remote.total_work_hex().unwrap(), "genesis_hash": before.tip_hash().to_string(),
+            "listen_addr": address, "node_id": "hf130-gui-peer-fixture", "role": "node", "miner_address": "",
+        });
+        let suffix = serde_json::json!({"type": "chain", "start_height": 1, "blocks": [block]});
+        listener.set_nonblocking(true).unwrap();
+        let peer = thread::spawn(move || -> std::io::Result<(usize, usize)> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut probes = 0;
+            let mut chains_sent = 0;
+            loop {
+                let mut stream = loop {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                            "fixture never received the GUI chain request"));
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => return Err(err),
+                    }
+                };
+                // HF131 first opens a Version-only reachability probe, then a
+                // separate sync session. Serve both; never send an unsolicited
+                // Chain to the probe that is about to close its socket.
+                stream.set_nonblocking(false)?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let mut handshake = false;
+                let mut requested_chain = false;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut,
+                            "fixture session exceeded its deadline"));
+                    }
+                    stream.set_read_timeout(Some(left))?;
+                    stream.set_write_timeout(Some(left))?;
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        // Closing a completed Version probe or sync connection
+                        // can be reported as EOF or reset on Windows. Other
+                        // I/O errors, including timeouts and failed writes, fail.
+                        Err(err) if handshake && err.kind() == std::io::ErrorKind::ConnectionReset => break,
+                        Err(err) => return Err(err),
+                        Ok(_) => {}
+                    }
+                    // Version handling can queue overlapping suffix requests
+                    // after the initial GetChain. One valid response is enough
+                    // for this one-block fixture; drain the rest without writing
+                    // into a client that may already have adopted and closed.
+                    if requested_chain { continue; }
+                    let incoming: serde_json::Value = serde_json::from_str(&line)
+                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+                    if !handshake {
+                        assert_eq!(incoming["type"], "version");
+                        assert_eq!(incoming["network"], "regtest");
+                        writeln!(stream, "{version}")?;
+                        stream.flush()?;
+                        handshake = true;
+                    } else {
+                        match incoming["type"].as_str() {
+                            Some("get_chain") => {
+                                assert_eq!(incoming["from_height"], 1);
+                                writeln!(stream, "{suffix}")?;
+                                stream.flush()?;
+                                requested_chain = true;
+                                chains_sent += 1;
+                            }
+                            Some("get_addr" | "get_peer_list" | "get_mempool" | "get_headers") => {}
+                            _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                format!("unexpected fixture request: {incoming}"))),
+                        }
+                    }
+                }
+                if requested_chain {
+                    // Drain the sync request burst until the client closes so
+                    // unread requests cannot reset the delivered block on Windows.
+                    return Ok((probes, chains_sent));
+                }
+                if handshake { probes += 1; }
+            }
+        });
+        let result = hf130_run_gui_catchup(&settings, true);
+        let (probes, chains_sent) = peer.join().expect("fixture peer panicked")
+            .expect("fixture could not serve the GUI probe and sync sessions");
+        assert!(probes >= 1, "GUI did not complete the HF131 reachability probe");
+        assert_eq!(chains_sent, 1);
+        let report = result.expect("regtest GUI Sync failed");
+        assert!(report.writer_acquired && report.progressed);
+        assert_eq!(report.terminal, "progress");
+        assert_eq!(report.sync_reason, "regtest-peer-sync");
+        assert_eq!(report.peers_contacted, 1);
+        assert_eq!(report.peer_errors, 0);
+        assert_eq!(report.before_height, 0);
+        assert_eq!(report.height, 1);
+        assert_eq!(report.tip_hash, remote.tip_hash().to_string());
+        assert!(!report.canonical_tip_proven && !report.fresh_at_tip);
+        let adopted = load_or_init_chain(&settings).unwrap();
+        adopted.validate_all(&settings).unwrap();
+        assert_eq!(adopted.tip_hash(), remote.tip_hash());
+        // Retain this small temporary fixture: detached GUI maintenance may
+        // still be using it. Never remove storage beneath a live worker.
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        hf127_unrestricted_mining_requested, resource_plan, GuiPrefs,
+        hf127_unrestricted_mining_requested, hf129_authorized_restart_plan,
+        hf129_preserve_newer_snapshot_head, hf129_snapshot_capture_is_newer,
+        hf130_miner_exit_reason, hf130_queue_manual_repair, hf130_recapture_head,
+        hf130_search_pool_share_batch, resource_plan, ChainSnapshot, GuiPrefs,
+        Hf130CatchupRequest, MinerExitReason, MinerRunMode, MiningRestartCause,
+        MiningRestartPlan, MiningRoundWorkers, PoolShareSearch, SnapshotBlock,
         HF127_HIGH_POWER_WARNING_PERCENT,
     };
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn resource_plan_is_bounded() {
@@ -15350,5 +16524,621 @@ mod tests {
         let (threads, duty) = resource_plan(8, 75, 513);
         assert_eq!(threads, 513);
         assert_eq!(duty, 75);
+    }
+
+    #[test]
+    fn hf129_pool_restart_is_generation_bound_and_never_solo() {
+        let pool = MinerRunMode::Pool {
+            pool_id: "pool-a".to_string(),
+            miner_address: "miner-a".to_string(),
+        };
+        let intent = Some(pool.clone());
+        let plan = MiningRestartPlan {
+            at: Instant::now(),
+            mode: pool.clone(),
+            cause: MiningRestartCause::CanonicalCatchup,
+            retiring_generation: 7,
+        };
+        assert_eq!(
+            hf129_authorized_restart_plan(&intent, Some(&plan), 7, &pool)
+                .map(|authorized| authorized.mode),
+            Some(pool.clone()),
+        );
+        assert!(hf129_authorized_restart_plan(
+            &intent,
+            Some(&plan),
+            8,
+            &pool,
+        )
+        .is_none());
+        assert!(hf129_authorized_restart_plan(
+            &intent,
+            Some(&plan),
+            7,
+            &MinerRunMode::Solo { payout_address: "solo-a".to_string() },
+        )
+        .is_none());
+        assert!(hf129_authorized_restart_plan(&None, Some(&plan), 7, &pool).is_none());
+    }
+
+    #[test]
+    fn hf129_snapshot_capture_order_is_latest_wins() {
+        assert!(hf129_snapshot_capture_is_newer(40, 41));
+        assert!(!hf129_snapshot_capture_is_newer(41, 41));
+        assert!(!hf129_snapshot_capture_is_newer(42, 41));
+    }
+
+    #[test]
+    fn hf129_full_newer_head_older_preserves_visible_tip() {
+        let mut current = ChainSnapshot::default();
+        current.head_capture_seq = 10;
+        current.height = 12_345;
+        current.best_hash = "new-head".to_string();
+        current.recent_avg_10_secs = 61;
+        current.recent_avg_20_secs = 62;
+        current.mempool_txs = 7;
+        current.block_reward = "25.00000000".to_string();
+        current.known_network_height = 12_346;
+        current.known_network_hash = "known-new".to_string();
+        current.direct_network_height = 12_347;
+        current.recent_blocks.push(SnapshotBlock {
+            height: 12_345,
+            hash: "new-head".to_string(),
+            ..Default::default()
+        });
+
+        let mut incoming = ChainSnapshot::default();
+        incoming.capture_seq = 2;
+        incoming.head_capture_seq = 5;
+        incoming.height = 12_340;
+        incoming.best_hash = "old-head".to_string();
+        incoming.known_network_height = 12_341;
+        incoming.known_network_hash = "known-old".to_string();
+        incoming.direct_network_height = 12_342;
+
+        hf129_preserve_newer_snapshot_head(&current, &mut incoming);
+
+        assert_eq!(incoming.capture_seq, 2);
+        assert_eq!(incoming.head_capture_seq, 10);
+        assert_eq!(incoming.height, 12_345);
+        assert_eq!(incoming.best_hash, "new-head");
+        assert_eq!(incoming.recent_blocks.len(), 1);
+        assert_eq!(incoming.recent_blocks[0].height, 12_345);
+        assert_eq!(incoming.known_network_height, 12_346);
+        assert_eq!(incoming.known_network_hash, "known-new");
+        assert_eq!(incoming.direct_network_height, 12_347);
+    }
+
+    #[test]
+    fn hf130_pool_share_cancel_during_search_never_yields_work() {
+        let stop = AtomicBool::new(false);
+        let mut cursor = 10u64;
+        let mut attempts = 0;
+        let result = hf130_search_pool_share_batch(&mut cursor, &stop,
+            Instant::now() + Duration::from_secs(1), || Ok(true), |_| {
+                attempts += 1;
+                if attempts == 3 { stop.store(true, Ordering::Relaxed); }
+                Ok(false)
+            }).unwrap();
+        assert_eq!(result, PoolShareSearch::Cancelled);
+        assert!(attempts <= 256);
+        assert_eq!(cursor, 10 + attempts);
+        let cancelled_cursor = cursor;
+        let result = hf130_search_pool_share_batch(&mut cursor, &stop,
+            Instant::now() + Duration::from_secs(1), || panic!("parent read after Stop"),
+            |_| panic!("nonce search after Stop")).unwrap();
+        assert_eq!(result, PoolShareSearch::Cancelled);
+        assert_eq!(cursor, cancelled_cursor);
+    }
+
+    #[test]
+    fn hf130_pool_share_parent_change_rejects_found_nonce() {
+        let stop = AtomicBool::new(false);
+        let mut parent_reads = 0;
+        let mut cursor = 17;
+        let result = hf130_search_pool_share_batch(&mut cursor, &stop,
+            Instant::now() + Duration::from_secs(1), || {
+                parent_reads += 1;
+                Ok(parent_reads == 1)
+            }, |_| Ok(true)).unwrap();
+        assert_eq!(result, PoolShareSearch::ParentChanged);
+        assert_eq!(parent_reads, 2);
+        assert_eq!(cursor, 18);
+    }
+
+    #[test]
+    fn hf130_pool_share_deadline_preserves_cursor_for_next_batch() {
+        let stop = AtomicBool::new(false);
+        let mut cursor = 42;
+        let result = hf130_search_pool_share_batch(&mut cursor, &stop, Instant::now(),
+            || panic!("read after deadline"), |_| panic!("hash after deadline")).unwrap();
+        assert_eq!(result, PoolShareSearch::Continue);
+        assert_eq!(cursor, 42);
+        let result = hf130_search_pool_share_batch(&mut cursor, &stop,
+            Instant::now() + Duration::from_secs(1), || Ok(true), |nonce| Ok(nonce == 43)).unwrap();
+        assert_eq!(result, PoolShareSearch::Found(43));
+        assert_eq!(cursor, 44);
+    }
+
+    #[test]
+    fn hf130_failed_snapshot_recapture_cannot_overtake_newer_reader() {
+        let seq = AtomicU64::new(1);
+        // Reader A captured height 100; reader B successfully delivered 101.
+        let reader_a = (100, "hash-100");
+        let reader_b = hf130_recapture_head(&reader_a, 1, || Ok((101, "hash-101")),
+            || seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let reader_a_final = hf130_recapture_head(&reader_a, 1,
+            || anyhow::bail!("injected final read failure"),
+            || seq.fetch_add(1, Ordering::SeqCst) + 1);
+        assert_eq!(reader_b, ((101, "hash-101"), 2));
+        assert_eq!(reader_a_final, (reader_a, 1));
+        assert_eq!(seq.load(Ordering::SeqCst), 2);
+        assert!(!hf129_snapshot_capture_is_newer(reader_b.1, reader_a_final.1));
+        // A real shorter reorg must still be eligible when its read succeeds.
+        let reorg = hf130_recapture_head(&reader_b.0, 2, || Ok((99, "reorg")),
+            || seq.fetch_add(1, Ordering::SeqCst) + 1);
+        assert!(hf129_snapshot_capture_is_newer(reader_b.1, reorg.1));
+    }
+
+    #[test]
+    fn hf130_head_merge_keeps_balance_and_tip_in_same_capture() {
+        let mut current = ChainSnapshot::default();
+        current.head_capture_seq = 7;
+        current.height = 101;
+        current.best_hash = "head-101".to_string();
+        current.spendable = "5.00".to_string();
+        current.immature = "2.00".to_string();
+        current.total = "7.00".to_string();
+        let mut incoming = ChainSnapshot::default();
+        incoming.head_capture_seq = 6;
+        incoming.spendable = "1.00".to_string();
+        hf129_preserve_newer_snapshot_head(&current, &mut incoming);
+        assert_eq!((incoming.height, incoming.head_capture_seq), (101, 7));
+        assert_eq!(incoming.best_hash, "head-101");
+        assert_eq!((incoming.spendable.as_str(), incoming.immature.as_str(), incoming.total.as_str()),
+            ("5.00", "2.00", "7.00"));
+    }
+
+    #[test]
+    fn hf130_automatic_catchup_ticks_cannot_queue_another_pass() {
+        let pending = AtomicBool::new(false);
+        // Simulate 100+ blocks of lag spanning many five-second UI ticks.
+        for _ in 0..150 {
+            hf130_queue_manual_repair(&pending, Hf130CatchupRequest::AutomaticDeep);
+        }
+        assert!(!pending.load(Ordering::SeqCst));
+        hf130_queue_manual_repair(&pending, Hf130CatchupRequest::ManualRepair);
+        for _ in 0..150 {
+            hf130_queue_manual_repair(&pending, Hf130CatchupRequest::AutomaticDeep);
+        }
+        assert!(pending.swap(false, Ordering::SeqCst));
+        assert!(!pending.swap(false, Ordering::SeqCst));
+    }
+
+    #[test]
+    fn hf130_miner_exit_reason_distinguishes_stop_and_failure() {
+        assert_eq!(hf130_miner_exit_reason(true, true), MinerExitReason::Cancelled);
+        assert_eq!(hf130_miner_exit_reason(false, true), MinerExitReason::UnexpectedExit);
+        assert_eq!(hf130_miner_exit_reason(false, false), MinerExitReason::PlanRejected);
+        assert_eq!(hf130_miner_exit_reason(true, false), MinerExitReason::PlanRejected);
+    }
+
+    #[test]
+    fn hf130_pool_resume_pins_address_and_rejects_changed_intent() {
+        let original = MinerRunMode::Pool { pool_id: "pool-a".to_string(), miner_address: "address-a".to_string() };
+        let changed = MinerRunMode::Pool { pool_id: "pool-a".to_string(), miner_address: "address-b".to_string() };
+        for cause in [MiningRestartCause::CanonicalCatchup, MiningRestartCause::Reconfigure, MiningRestartCause::UnexpectedExit] {
+            let plan = MiningRestartPlan { at: Instant::now(), mode: original.clone(), cause, retiring_generation: 3 };
+            assert!(hf129_authorized_restart_plan(&Some(original.clone()), Some(&plan), 3, &original).is_some());
+            assert!(hf129_authorized_restart_plan(&Some(changed.clone()), Some(&plan), 3, &original).is_none());
+            assert!(hf129_authorized_restart_plan(&None, Some(&plan), 3, &original).is_none());
+        }
+    }
+
+    #[test]
+    fn hf130_controller_unwind_joins_all_round_workers() {
+        let round_stop = Arc::new(AtomicBool::new(false));
+        let retired = Arc::new(AtomicU64::new(0));
+        let outcome = std::panic::catch_unwind({
+            let round_stop = round_stop.clone();
+            let retired = retired.clone();
+            move || {
+                let mut workers = MiningRoundWorkers::new(round_stop.clone());
+                for _ in 0..2 {
+                    let stop = round_stop.clone();
+                    let retired = retired.clone();
+                    workers.push(thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) { thread::yield_now(); }
+                        retired.fetch_add(1, Ordering::SeqCst);
+                    }));
+                }
+                panic!("injected controller panic");
+            }
+        });
+        assert!(outcome.is_err());
+        assert!(round_stop.load(Ordering::Relaxed));
+        assert_eq!(retired.load(Ordering::SeqCst), 2);
+    }
+
+}
+
+#[cfg(test)]
+mod hf132_gui_sync_tests {
+    use super::*;
+
+    // No-window/no-device fixture for exercising the real GUI callbacks.
+    // Every field is initialized; no external app state or unsafe zeroing.
+    fn callback_app(mut prefs: GuiPrefs) -> QubCoreApp {
+        prefs.setup_complete = false;
+        let initial_theme = prefs.theme.clone();
+        QubCoreApp {
+            prefs,
+            snapshot: ChainSnapshot::default(),
+            status_line: "Ready.".to_string(),
+            status_history: VecDeque::from(["[+0s] Ready.".to_string()]),
+            last_recorded_status: "Ready.".to_string(),
+            last_error: None,
+            last_success: None,
+            last_block_card: None,
+            miner: None,
+            benchmark_rx: None,
+            benchmark_running: false,
+            benchmark_result: None,
+            delete_private_key_confirm: false,
+            import_key_dialog: ImportKeyDialog::default(),
+            send_dialog: SendDialog::default(),
+            send_rx: None,
+            eth_wallets: EthereumWalletBook::default(),
+            eth_wallet_dialog: EthereumWalletDialog::default(),
+            eth_balances: EthereumBalanceState::default(),
+            eth_balance_rx: None,
+            eth_balance_in_flight: false,
+            eth_send_dialog: EthereumSendDialog::default(),
+            eth_send_rx: None,
+            usdj_vault_dialog: UsdjVaultDialog::default(),
+            usdj_vault_rx: None,
+            conversion_dialog: ConversionDialog::default(),
+            conversion_rx: None,
+            qub_jin_dialog: QubJinDialog::default(),
+            qub_jin_rx: None,
+            qub_jin_preview_rx: None,
+            qub_jin_preview_in_flight: false,
+            buy_jin_dialog: BuyJinDialog::default(),
+            buy_jin_rx: None,
+            qns_dialog: QnsDialog::default(),
+            qns_rx: None,
+            pool_dialog: PoolDialog::default(),
+            pool_rx: None,
+            library_dialog: LibraryDialog::default(),
+            library_state_cache: None,
+            library_state_rx: None,
+            library_state_in_flight: false,
+            library_state_last_started: Instant::now() - Duration::from_secs(60),
+            library_state_last_loaded: None,
+            library_state_error: None,
+            library_action_rx: None,
+            library_action_in_flight: false,
+            pool_mining_pool_id: String::new(),
+            right_balances_collapsed: false,
+            right_activity_collapsed: false,
+            last_send_status_poll: Instant::now() - Duration::from_secs(10),
+            snapshot_rx: None,
+            snapshot_in_flight: false,
+            last_applied_snapshot_capture_seq: 0,
+            last_applied_snapshot_head_capture_seq: 0,
+            last_theme_applied: initial_theme,
+            logo: None,
+            jin_logo: None,
+            mining_off_icon: None,
+            mining_off_icon_white: None,
+            // v1.2.0: GIF frames are decoded once at startup into egui textures.
+            // This restores v1.0.6 mining visuals without disk reads during frames.
+            mining_prep_anim: None,
+            mining_prep_anim_white: None,
+            mining_on_anim: None,
+            mining_on_anim_white: None,
+            online_icon: None,
+            offline_icon: None,
+            icons: IconSet { textures: HashMap::new() },
+            wallet_sync_in_flight: false,
+            wallet_create_rx: None,
+            wallet_create_in_flight: false,
+            send_qns_resolve_rx: None,
+            send_qns_resolve_in_flight: false,
+            multi_qns_resolve_rx: None,
+            last_wallet_sync: Instant::now() - Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS),
+
+            app_started: Instant::now(),
+            last_refresh: Instant::now() - Duration::from_secs(10),
+            hash_rate_hps: 0.0,
+            total_hashes: 0,
+            gpu_hash_rate_hps: 0.0,
+            gpu_total_hashes: 0,
+            gpu_workers: 0,
+            gpu_device: String::new(),
+            gpu_device_options: Vec::new(),
+            gpu_device_last_scan: Instant::now(),
+            gpu_device_rates: HashMap::new(),
+            miner_threads: 0,
+            miner_duty: 0,
+            miner_gpu_power: 0,
+            target_height: 0,
+            block_history: VecDeque::new(),
+            last_local_mined_at: None,
+            mining_phase: MiningPhase::Off,
+            mining_phase_started_at: None,
+            mining_on_next_sound_at: None,
+            last_observed_tip_hash: String::new(),
+            last_observed_height: 0,
+            sync_progress_last_height: 0,
+            sync_progress_last_sample: Instant::now(),
+            sync_progress_rate_bps: 0.0,
+            prefs_dirty: false,
+            p2p_node_started: false,
+            p2p_node_rx: None,
+            update_dialog: UpdateDialog::default(),
+            update_rx: None,
+            update_check_in_flight: false,
+            update_check_forced: false,
+            update_check_started_at: None,
+            last_update_check: Instant::now() - Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS),
+            qr_cache_address: String::new(),
+            qr_cache_texture: None,
+            qr_hover_until: None,
+            qr_hover_address: String::new(),
+            qr_scan_dialog_open: false,
+            qr_scan_message: String::new(),
+            qr_camera_devices: Vec::new(),
+            qr_camera_selected: 0,
+            tx_status_rx: None,
+            tx_status_in_flight: false,
+            enjin_metrics: EnjinMatrixMetrics::default(),
+            enjin_metrics_rx: None,
+            enjin_metrics_in_flight: false,
+            last_enjin_metrics_refresh: Instant::now() - Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS),
+            opening_banner: None,
+            initial_loading: false,
+            initial_loading_started_at: Instant::now(),
+            pending_start_mining_on_open: false,
+            pending_start_mining_mode: AutoMiningMode::Solo,
+            hf86_force_quick_snapshot: false,
+            manual_stop_requested: false,
+            desired_pool_mining_pool_id: String::new(),
+            auto_restart_mining_at: None,
+            mining_intent: None,
+            mining_restart_plan: None,
+            next_miner_generation: 1,
+            mining_plan_rejected_generation: None,
+            hf85_last_auto_catchup_sync: Instant::now() - Duration::from_secs(60),
+            hf85_auto_catchup_last_height: 0,
+            hf85_auto_catchup_stale_since: Instant::now(),
+            hf85_seen_catchup_epoch: hf85_catchup_epoch(),
+            hf129_retained_catchup_target_height: 0,
+            hf129_retained_catchup_target_at: None,
+            hf88_last_peer_probe: Instant::now() - Duration::from_secs(60),
+            hf88_last_snapshot_height: 0,
+            hf88_snapshot_stale_since: Instant::now(),
+            hf88_snapshot_backoff_until: None,
+            hf88_snapshot_timeout_count: 0,
+            hf88_last_snapshot_success: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn hf132_pending_solo_pool_intent_survives_sync_callbacks_and_stop() {
+        for requested in [
+            MinerRunMode::Solo { payout_address: "pinned-solo-address".to_string() },
+            MinerRunMode::Pool { pool_id: "pinned-pool-id".to_string(), miner_address: "pinned-pool-address".to_string() },
+        ] {
+            for force in [false, true] {
+                let mut prefs = GuiPrefs::default();
+                // The controller state below is the state recorded by Start.
+                // No hashing or external network is needed to test callbacks.
+                // A missing config yields a real bounded catch-up error.
+                prefs.config_path = std::env::temp_dir().join(format!("qub-hf132-absent-{}-{}.toml", std::process::id(), hf85_now_ms())).to_string_lossy().to_string();
+                prefs.payout_address = requested.payout_address().to_string();
+                prefs.auto_sync_wallet_balances = true;
+                let mut app = callback_app(prefs);
+                let selected_pool = requested.pool_id().unwrap_or("").to_string();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (_events_tx, events_rx) = mpsc::channel();
+                app.miner = Some(MinerHandle {
+                    stop: Arc::clone(&stop), rx: events_rx, join: None,
+                    generation: 41, mode: requested.clone(), cancellation_requested: false,
+                    exit_reason: None,
+                });
+                app.mining_intent = Some(requested.clone());
+                app.pool_mining_pool_id = selected_pool.clone();
+                app.desired_pool_mining_pool_id = selected_pool.clone();
+                app.set_mining_phase(MiningPhase::Preparing);
+
+                let (snapshot_tx, snapshot_rx) = mpsc::channel();
+                app.snapshot_rx = Some(snapshot_rx);
+                app.snapshot_in_flight = true;
+                app.start_wallet_sync(force);
+                assert!(app.wallet_sync_in_flight && app.snapshot_in_flight);
+                // This original sender proves Sync retained its reader even
+                // when a Solo or Pool controller was already preparing.
+                snapshot_tx.send(Err("live chain snapshot is busy; retry after the active writer".to_string())).unwrap();
+                app.poll_snapshot_refresh();
+                assert_eq!(app.mining_intent, Some(requested.clone()));
+                assert_eq!(app.desired_pool_mining_pool_id, selected_pool);
+                assert!(!stop.load(Ordering::Relaxed));
+                assert!(app.wallet_sync_in_flight);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while hf85_catchup_running() {
+                    assert!(Instant::now() < deadline, "fixture catch-up did not report its missing-config error");
+                    thread::yield_now();
+                }
+                app.poll_hf85_catchup_completion();
+                assert_eq!(app.mining_intent, Some(requested.clone()));
+                assert!(!stop.load(Ordering::Relaxed));
+
+                let (snapshot_tx, snapshot_rx) = mpsc::channel();
+                app.snapshot_rx = Some(snapshot_rx);
+                app.snapshot_in_flight = true;
+                snapshot_tx.send(Err("fixture invalid generation".to_string())).unwrap();
+                app.poll_snapshot_refresh();
+                assert_eq!(app.mining_intent, Some(requested.clone()));
+                assert_eq!(app.miner.as_ref().unwrap().mode, requested);
+
+                let mut snapshot = ChainSnapshot::default();
+                snapshot.network = "regtest".to_string();
+                snapshot.height = 71_515;
+                snapshot.known_network_height = 71_515;
+                snapshot.best_hash = "11".repeat(32);
+                snapshot.known_network_hash = "22".repeat(32);
+                snapshot.capture_seq = 1;
+                snapshot.head_capture_seq = 1;
+                let (snapshot_tx, snapshot_rx) = mpsc::channel();
+                app.snapshot_rx = Some(snapshot_rx);
+                app.snapshot_in_flight = true;
+                app.wallet_sync_in_flight = true;
+                app.last_wallet_sync = Instant::now() - Duration::from_secs(1921);
+                app.last_refresh = Instant::now() - Duration::from_secs(1921);
+                snapshot_tx.send(Ok(snapshot.clone())).unwrap();
+                app.poll_snapshot_refresh();
+                assert!(app.last_wallet_sync.elapsed() < Duration::from_secs(1), "automatic interval was not reset after real completion");
+                assert!(app.last_refresh.elapsed() < Duration::from_secs(1), "background refresh interval was not reset after real completion");
+                assert_eq!(app.mining_intent, Some(requested.clone()));
+                assert_eq!(app.miner.as_ref().unwrap().generation, 41);
+                assert_eq!(app.prefs.payout_address, requested.payout_address());
+                assert_eq!(app.desired_pool_mining_pool_id, selected_pool);
+                assert!(!stop.load(Ordering::Relaxed));
+                assert!(app.sync_progress_rows("Sync").1.contains("tip hash differs"));
+
+                let (snapshot_tx, snapshot_rx) = mpsc::channel();
+                app.snapshot_rx = Some(snapshot_rx);
+                app.snapshot_in_flight = true;
+                app.wallet_sync_in_flight = true;
+                app.stop_mining();
+                assert!(stop.load(Ordering::Relaxed));
+                assert!(app.mining_intent.is_none() && app.mining_restart_plan.is_none());
+                assert!(app.snapshot_in_flight && app.wallet_sync_in_flight);
+                snapshot.capture_seq = 2;
+                snapshot.head_capture_seq = 2;
+                snapshot_tx.send(Ok(snapshot)).unwrap();
+                app.poll_snapshot_refresh();
+                assert_eq!(app.snapshot.height, 71_515);
+                assert!(app.manual_stop_requested);
+                assert!(app.mining_intent.is_none() && app.mining_restart_plan.is_none());
+                assert!(app.miner.as_ref().unwrap().cancellation_requested);
+            }
+        }
+    }
+
+    #[test]
+    fn hf132_refresh_and_manual_sync_share_one_attached_reader() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicU64::new(0));
+        let reader_count = Arc::clone(&reads);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let rx = hf132_spawn_snapshot_reader(Arc::clone(&gate), move || {
+            reader_count.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(71_515u32)
+        }).unwrap().unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let pending_manual = AtomicBool::new(false);
+        for request in [Hf130CatchupRequest::Automatic, Hf130CatchupRequest::ManualRepair]
+            .into_iter().cycle().take(64)
+        {
+            hf130_queue_manual_repair(&pending_manual, request);
+            let duplicate_count = Arc::clone(&reads);
+            assert!(hf132_spawn_snapshot_reader(Arc::clone(&gate), move || {
+                duplicate_count.fetch_add(1, Ordering::SeqCst);
+                Ok(0u32)
+            }).unwrap().is_none());
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        assert!(pending_manual.load(Ordering::SeqCst), "manual repair was lost behind the reader");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), 71_515);
+        assert!(!gate.load(Ordering::SeqCst));
+        let next = hf132_spawn_snapshot_reader(gate, || Ok(71_516u32)).unwrap().unwrap();
+        assert_eq!(next.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(), 71_516);
+    }
+
+    #[test]
+    fn hf132_reader_panic_and_error_release_admission_with_real_outcome() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let rx = hf132_spawn_snapshot_reader::<u32>(Arc::clone(&gate), || panic!("injected reader panic"))
+            .unwrap().unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err().contains("panicked"));
+        assert!(!gate.load(Ordering::SeqCst));
+        let rx = hf132_spawn_snapshot_reader::<u32>(Arc::clone(&gate), || anyhow::bail!("fixture invalid generation"))
+            .unwrap().unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap_err(), "fixture invalid generation");
+        assert!(!gate.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn hf132_busy_gui_snapshot_defers_without_authoritative_replay_then_recovers() {
+        let mut settings: Settings = toml::from_str(include_str!("../../config/regtest.toml")).unwrap();
+        settings.p2p.enabled = false;
+        let root = std::env::temp_dir().join(format!("qub-hf132-gui-{}-{}", std::process::id(), hf85_now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        settings.node.data_dir = root.join("node").to_string_lossy().to_string();
+        let config = root.join("settings.toml");
+        std::fs::write(&config, toml::to_string(&settings).unwrap()).unwrap();
+        let loaded = load_gui_settings(config.to_str().unwrap()).unwrap();
+        let owner = Arc::new(Mutex::new(ChainState::new_with_genesis(&loaded).unwrap()));
+        register_live_chain(&loaded, &owner);
+        struct Cleanup(Settings, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unregister_live_chain(&self.0);
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(loaded.clone(), root);
+        let held = owner.lock().unwrap();
+        let path = config.to_string_lossy().to_string();
+        let gate = Arc::new(AtomicBool::new(false));
+        let rx = hf132_spawn_snapshot_reader(Arc::clone(&gate), move || {
+            read_snapshot_for_payout_startup(&path, "")
+        }).unwrap().unwrap();
+        let error = rx.recv_timeout(Duration::from_secs(5))
+            .expect("GUI fell back to the blocking authoritative loader")
+            .unwrap_err();
+        assert!(hf132_snapshot_read_deferred(&error), "{error}");
+        assert!(!gate.load(Ordering::SeqCst));
+        drop(held);
+        let snapshot = read_snapshot_for_payout_startup(config.to_str().unwrap(), "").unwrap();
+        assert_eq!(snapshot.height, owner.lock().unwrap().height());
+        assert_eq!(snapshot.network, "regtest");
+        assert_eq!(snapshot.wallet_keys, 0);
+        assert!(!NodePaths::from_settings(&loaded).wallet_file.exists(), "a UI read initialized the wallet");
+    }
+
+    #[test]
+    fn hf132_progress_requires_observed_blocks_and_expiring_rate() {
+        assert_eq!(hf132_observed_sync_fraction(0, 0), 0.0);
+        assert_eq!(hf132_observed_sync_fraction(0, 100), 0.0);
+        assert_eq!(hf132_observed_sync_fraction(50, 100), 0.5);
+        assert_eq!(hf132_observed_sync_fraction(100, 100), 1.0);
+        let old_gap = hf132_observed_sync_fraction(71_487, 71_515);
+        assert!(hf132_observed_sync_fraction(71_487, 71_520) < old_gap);
+        assert_eq!(hf132_recent_sync_rate(4.0, Duration::from_secs(30)), 4.0);
+        assert_eq!(hf132_recent_sync_rate(4.0, Duration::from_secs(1921)), 0.0);
+        assert!(!hf132_snapshot_read_deferred("Fast Chain Engine UI load failed; checksum mismatch"));
+        assert!(!hf132_snapshot_read_deferred("live chain mutex poisoned"));
+    }
+
+    #[test]
+    fn hf132_wait_history_coalesces_without_hiding_block_progress() {
+        for status in [
+            "QUB Core detached catch-up: local #71487 -> observed #71515",
+            "QUB Core catch-up could not acquire the active writer.",
+            "QUB Core catch-up request active for 30s.",
+            "Local wallet snapshot has not returned after 1921s.",
+            "Local wallet snapshot deferred while the chain owner is busy; retaining the last view and retrying.",
+        ] {
+            assert_eq!(QubCoreApp::status_history_category(status), Some("background-sync"));
+        }
+        assert_eq!(QubCoreApp::status_history_category("QUB Core catch-up progressed #71487 -> #71515"), None);
     }
 }

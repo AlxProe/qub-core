@@ -1,6 +1,7 @@
 fn main() {
     let build_config = std::env::var("QUB_BUILD_CONFIG").unwrap_or_else(|_| "mainnet".to_string());
     println!("cargo:rerun-if-env-changed=QUB_BUILD_CONFIG");
+    println!("cargo:rerun-if-changed=assets/qubit-coin-logo.png");
     println!("cargo:rustc-env=QUB_BUILD_CONFIG={}", build_config);
 
     #[cfg(target_os = "windows")]
@@ -40,8 +41,8 @@ fn main() {
         // the GUI, P2P/RPC identity and the installer. The updater verifies
         // installer metadata, while operators commonly use the executable
         // metadata for incident response and release diagnostics.
-        res.set("ProductVersion", "1.8.4");
-        res.set("FileVersion", "1.8.4.0");
+        res.set("ProductVersion", "1.8.6");
+        res.set("FileVersion", "1.8.6.0");
         res.compile().expect("compile windows resources");
     }
 }

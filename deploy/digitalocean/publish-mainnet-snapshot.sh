@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# HF123 / v1.8.0: Fast Chain Engine aware, bounded-memory exact-schema publisher.
+# HF130 / v1.8.5: committed-generation, bounded-memory exact-schema publisher.
 #
 # Safety properties:
 # - never runs full `qubd validate` inside the timer path;
 # - exports one committed QUB-FCE-1 generation through qubd when available;
-# - retains the legacy chain.json fallback for isolated tests and pre-migration recovery;
+# - fails closed on production unless the source is an exact CURRENT QUB-FCE-1 export;
+# - allows legacy/PREVIOUS recovery only through explicit operator/test flags;
 # - scans blocks incrementally and keeps only the latest 4096 in memory;
 # - verifies network, full hash-link continuity, and the HF120 #24000 version gate;
 # - writes every artifact through a staging directory;
-# - publishes tip.json last as the generation commit marker;
+# - commits every public artifact through one atomic generation-pointer switch;
+# - migrates legacy flat files without changing their bytes before that switch;
+# - preserves the previous generations for diagnostics;
 # - preserves the exact JSON schemas consumed by QUB Core and Explorer.
 # - supports an overridable LOCK_FILE so isolated self-tests never touch the live timer lock.
 
@@ -24,14 +27,16 @@ EPOCH2_HEIGHT=${EPOCH2_HEIGHT:-24000}
 EPOCH1_VERSION=${EPOCH1_VERSION:-1}
 EPOCH2_VERSION=${EPOCH2_VERSION:-2}
 LOCK_FILE=${LOCK_FILE:-/tmp/qub-mainnet-snapshot-publish.lock}
+ALLOW_LEGACY_SOURCE=${ALLOW_LEGACY_SOURCE:-0}
+ALLOW_PREVIOUS_RECOVERY=${ALLOW_PREVIOUS_RECOVERY:-0}
 
 umask 022
 LOCK_DIR=$(dirname -- "$LOCK_FILE")
 mkdir -p "$LOCK_DIR"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  echo "snapshot publish already running; skipping"
-  exit 0
+  echo "snapshot publish lock contention: another generation is still running" >&2
+  exit 75
 fi
 
 DATA_DIR=$(grep -E '^[[:space:]]*data_dir[[:space:]]*=' "$CFG" | head -n1 | cut -d= -f2- | tr -d ' "')
@@ -40,7 +45,7 @@ if [ -z "${DATA_DIR:-}" ]; then
 fi
 
 mkdir -p "$OUT_DIR" "$(dirname "$ALT")"
-STAGE=$(mktemp -d "$OUT_DIR/.publish-hf123.XXXXXX")
+STAGE=$(mktemp -d "$OUT_DIR/.publish-hf130.XXXXXX")
 cleanup() {
   rm -rf "$STAGE"
 }
@@ -49,6 +54,13 @@ trap cleanup EXIT INT TERM
 LEGACY_SRC="$DATA_DIR/chain.json"
 FAST_POINTER="$DATA_DIR/chain-v2/CURRENT.json"
 EXPORT_SRC="$STAGE/export-source.json"
+SOURCE_KIND=""
+EXPORT_HEIGHT="0"
+EXPORT_TIP_HASH=""
+EXPORT_GENERATION="0"
+EXPORT_STATE_REVISION="0"
+EXPORT_COMMITTED_AT_UNIX="0"
+EXPORT_RECOVERED_FROM_PREVIOUS="false"
 
 if [ -f "$FAST_POINTER" ]; then
   if [ ! -x "$BIN" ]; then
@@ -56,21 +68,57 @@ if [ -f "$FAST_POINTER" ]; then
     exit 1
   fi
   echo "exporting committed Fast Chain Engine generation via qubd"
-  timeout \
+  EXPORT_REPORT=$(timeout \
     --signal=TERM \
     --kill-after=30s \
     "${EXPORT_TIMEOUT_SECS}s" \
-    "$BIN" --config "$CFG" export-chain-json "$EXPORT_SRC"
+    "$BIN" --config "$CFG" export-chain-json "$EXPORT_SRC")
+  echo "$EXPORT_REPORT"
+  IFS=$'\t' read -r EXPORT_HEIGHT EXPORT_TIP_HASH EXPORT_GENERATION EXPORT_STATE_REVISION EXPORT_COMMITTED_AT_UNIX EXPORT_RECOVERED_FROM_PREVIOUS < <(
+    python3 - "$EXPORT_REPORT" <<'PY'
+import json
+import sys
+
+report = json.loads(sys.argv[1])
+if report.get("ok") is not True:
+    raise SystemExit("exporter did not report ok=true")
+if report.get("source") != "fce" or report.get("storage_engine") != "QUB-FCE-1":
+    raise SystemExit("production exporter did not use QUB-FCE-1")
+tip = str(report.get("tip_hash", "")).strip().lower()
+if int(report.get("height", -1)) < 0 or len(tip) != 64:
+    raise SystemExit("exporter returned an invalid height/tip identity")
+print(
+    int(report["height"]),
+    tip,
+    int(report.get("generation", 0)),
+    int(report.get("state_revision", 0)),
+    int(report.get("committed_at_unix", 0)),
+    "true" if report.get("recovered_from_previous") else "false",
+    sep="\t",
+)
+PY
+  )
+  if [ "$EXPORT_RECOVERED_FROM_PREVIOUS" = "true" ] && [ "$ALLOW_PREVIOUS_RECOVERY" != "1" ]; then
+    echo "publisher refused a PREVIOUS-recovered export; repair CURRENT or set ALLOW_PREVIOUS_RECOVERY=1 for explicit recovery" >&2
+    exit 1
+  fi
+  SOURCE_KIND="fce"
   SRC="$EXPORT_SRC"
 elif [ -f "$LEGACY_SRC" ]; then
-  echo "using pre-migration legacy chain source: $LEGACY_SRC"
+  if [ "$ALLOW_LEGACY_SOURCE" != "1" ]; then
+    echo "publisher refused legacy chain.json without ALLOW_LEGACY_SOURCE=1; production publication requires QUB-FCE-1 CURRENT" >&2
+    exit 1
+  fi
+  echo "using explicitly authorized recovery/test legacy chain source: $LEGACY_SRC"
+  SOURCE_KIND="legacy"
   SRC="$LEGACY_SRC"
 else
   echo "canonical chain source not found under $DATA_DIR" >&2
   exit 1
 fi
 
-python3 - "$SRC" "$STAGE" "$OUT_DIR" "$ALT" "$EXPECTED_NETWORK" "$EPOCH2_HEIGHT" "$EPOCH1_VERSION" "$EPOCH2_VERSION" <<'PY'
+python3 - "$SRC" "$STAGE" "$OUT_DIR" "$ALT" "$EXPECTED_NETWORK" "$EPOCH2_HEIGHT" "$EPOCH1_VERSION" "$EPOCH2_VERSION" "$SOURCE_KIND" "$EXPORT_HEIGHT" "$EXPORT_TIP_HASH" "$EXPORT_GENERATION" "$EXPORT_STATE_REVISION" "$EXPORT_COMMITTED_AT_UNIX" "$EXPORT_RECOVERED_FROM_PREVIOUS" <<'PY'
+import atexit
 import collections
 import hashlib
 import json
@@ -90,6 +138,13 @@ expected_network = sys.argv[5]
 epoch2_height = int(sys.argv[6])
 epoch1_version = int(sys.argv[7])
 epoch2_version = int(sys.argv[8])
+source_kind = sys.argv[9]
+export_height = int(sys.argv[10])
+export_tip_hash = sys.argv[11].strip().lower()
+export_generation = int(sys.argv[12])
+export_state_revision = int(sys.argv[13])
+export_committed_at_unix = int(sys.argv[14])
+export_recovered_from_previous = sys.argv[15].lower() == "true"
 
 stage.mkdir(parents=True, exist_ok=True)
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -253,6 +308,12 @@ tip_hash = previous_hash
 now = int(time.time())
 latest = list(latest_blocks)
 
+if source_kind == "fce" and (height != export_height or tip_hash != export_tip_hash):
+    raise ValueError(
+        "export identity mismatch: "
+        f"report #{export_height} {export_tip_hash}, bytes #{height} {tip_hash}"
+    )
+
 
 def write_text(path, text, encoding="utf-8"):
     path.write_text(text, encoding=encoding)
@@ -266,6 +327,11 @@ tip = {
     "tip_hash": tip_hash,
     "chain_sha256": chain_sha,
     "published_at_unix": now,
+    "source": source_kind,
+    "generation": export_generation,
+    "state_revision": export_state_revision,
+    "committed_at_unix": export_committed_at_unix,
+    "recovered_from_previous": export_recovered_from_previous,
 }
 write_text(stage / "tip.json", json.dumps(tip, separators=(",", ":")) + "\n")
 write_text(
@@ -302,51 +368,187 @@ for window in (64, 256, 1024, 2048, 4096):
     if obj["tip_height"] != height or obj["tip_hash"] != tip_hash:
         raise ValueError(f"tail-{window}.json tip mismatch")
 
-# Publish every generation file atomically. tip.json is the final commit marker.
-non_tip_names = [
-    "chain.json",
-    "chain.json.sha256",
-    "tail-64.json",
-    "tail-64.json.sha256",
-    "tail-256.json",
-    "tail-256.json.sha256",
-    "tail-1024.json",
-    "tail-1024.json.sha256",
-    "tail-2048.json",
-    "tail-2048.json.sha256",
-    "tail-4096.json",
-    "tail-4096.json.sha256",
-]
-for name in non_tip_names:
-    os.replace(stage / name, out_dir / name)
+# All existing URLs resolve through ONE generation pointer. A failed alias
+# preparation or pointer switch cannot expose a mixture of new and old files.
+# Separate HTTP requests can still straddle a successful switch: consumers must
+# compare the advertised tip/hash/checksum and retry an inconsistent fetch.
+artifact_names = ["chain.json", "chain.json.sha256", "tip.json", "tip.json.sha256"]
+for window in (64, 256, 1024, 2048, 4096):
+    artifact_names.extend([f"tail-{window}.json", f"tail-{window}.json.sha256"])
+alt_sha_name = "canonical-chain.json.sha256"
+write_text(stage / alt_sha_name, f"{chain_sha}  canonical-chain.json\n", "ascii")
 
-# canonical-chain.json is the same canonical byte stream as snapshots/chain.json.
-alt_tmp = alt_path.with_name(alt_path.name + f".{os.getpid()}.tmp")
-try:
-    if alt_tmp.exists():
-        alt_tmp.unlink()
-    try:
-        os.link(out_dir / "chain.json", alt_tmp)
-    except OSError:
-        shutil.copyfile(out_dir / "chain.json", alt_tmp)
-    os.replace(alt_tmp, alt_path)
-finally:
-    if alt_tmp.exists():
-        alt_tmp.unlink()
-
+out_dir = out_dir.resolve()
+alt_path = Path(os.path.abspath(alt_path))
 alt_sha_path = alt_path.with_suffix(alt_path.suffix + ".sha256")
-alt_sha_tmp = alt_sha_path.with_name(alt_sha_path.name + f".{os.getpid()}.tmp")
-write_text(alt_sha_tmp, f"{chain_sha}  canonical-chain.json\n", "ascii")
-os.replace(alt_sha_tmp, alt_sha_path)
+generations = out_dir / ".generations"
+current = out_dir / ".current"
+public = [(out_dir / name, name) for name in artifact_names]
+public.extend([(alt_path, "chain.json"), (alt_sha_path, alt_sha_name)])
+if len({str(path) for path, _ in public}) != len(public):
+    raise ValueError("snapshot and canonical artifact paths must be distinct")
 
-os.replace(stage / "tip.json.sha256", out_dir / "tip.json.sha256")
-os.replace(stage / "tip.json", out_dir / "tip.json")
+# Reject the exact historical ALT-directory failure before changing public
+# files. Also reject non-regular legacy files and a foreign pointer layout.
+for path, _ in public:
+    if path.exists() and not path.is_file():
+        raise ValueError(f"publication target is not a regular file: {path}")
+    if path.is_symlink() and not path.exists():
+        # Missing links are permitted only when they already have our expected
+        # target (e.g. recovery from an interrupted first installation).
+        target_name = next(name for item, name in public if item == path)
+        expected = os.path.relpath(current / target_name, path.parent)
+        if os.readlink(path) != expected:
+            raise ValueError(f"publication target is an unexpected broken symlink: {path}")
+if generations.is_symlink() or (generations.exists() and not generations.is_dir()):
+    raise ValueError("invalid snapshot generation directory")
+generations.mkdir(exist_ok=True)
+if current.is_symlink():
+    old_generation = current.resolve(strict=True)
+    if old_generation.parent != generations or not old_generation.is_dir():
+        raise ValueError("snapshot pointer does not reference a managed generation")
+elif current.exists():
+    raise ValueError("snapshot .current must be a managed symlink")
+else:
+    old_generation = None
 
-for path in list(out_dir.glob("*.json")) + list(out_dir.glob("*.sha256")) + [alt_path, alt_sha_path]:
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.chmod(path, 0o644)
-    except FileNotFoundError:
-        pass
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def prepared_link(path, target):
+    tmp = path.with_name(path.name + f".hf130-{os.getpid()}-{time.time_ns()}.tmp")
+    os.symlink(os.path.relpath(target, path.parent), tmp)
+    return tmp
+
+
+# A unique immutable generation is complete and durable before it is selected.
+new_generation = generations / f"gen-{time.time_ns()}-{height}-{chain_sha[:16]}"
+new_generation.mkdir(mode=0o755)
+
+
+def discard_uncommitted_generation():
+    try:
+        if current.resolve(strict=False) != new_generation:
+            shutil.rmtree(new_generation)
+    except OSError as error:
+        print(f"snapshot uncommitted generation cleanup deferred: {error}", file=sys.stderr)
+
+
+atexit.register(discard_uncommitted_generation)
+for name in artifact_names + [alt_sha_name]:
+    os.replace(stage / name, new_generation / name)
+    os.chmod(new_generation / name, 0o644)
+    with (new_generation / name).open("rb") as file_obj:
+        os.fsync(file_obj.fileno())
+fsync_dir(new_generation)
+fsync_dir(generations)
+
+# During first-install migration, .current initially exposes copies of exactly
+# the old public bytes. Replacing a legacy file with its alias therefore changes
+# no observable payload, even if a later ALT replacement fails. Missing files
+# stay missing until the final commit. The legacy canonical file is normally
+# identical to chain.json; refuse a pre-existing mismatch rather than rewrite it
+# as a side effect of migration.
+if old_generation is None:
+    old_generation = generations / f"legacy-{time.time_ns()}"
+    old_generation.mkdir(mode=0o755)
+    for path, name in public:
+        if not path.exists():
+            continue
+        saved = old_generation / name
+        if saved.exists():
+            # chain and canonical aliases intentionally share one generation
+            # payload. Their pre-migration bytes must agree.
+            if path.stat().st_size != saved.stat().st_size:
+                raise ValueError("legacy canonical chain differs from snapshot chain")
+            with path.open("rb") as a, saved.open("rb") as b:
+                while True:
+                    left, right = a.read(1024 * 1024), b.read(1024 * 1024)
+                    if left != right:
+                        raise ValueError("legacy canonical chain differs from snapshot chain")
+                    if not left:
+                        break
+        else:
+            try:
+                if path.is_symlink():
+                    raise OSError("copy legacy symlink contents")
+                os.link(path, saved)
+            except OSError:
+                shutil.copyfile(path, saved)
+            with saved.open("rb") as file_obj:
+                os.fsync(file_obj.fileno())
+    fsync_dir(old_generation)
+    fsync_dir(generations)
+    initial_link = prepared_link(current, old_generation)
+    try:
+        os.replace(initial_link, current)
+        fsync_dir(out_dir)
+    finally:
+        if initial_link.is_symlink():
+            initial_link.unlink()
+
+# Prepare all aliases first (including ALT's parent/filesystem), before any
+# replacement. Normally no aliases change after the initial migration.
+aliases = []
+try:
+    for path, name in public:
+        expected = os.path.relpath(current / name, path.parent)
+        if path.is_symlink() and os.readlink(path) == expected:
+            continue
+        if (current / name).exists() and path.exists():
+            # A managed publication must not import an out-of-band edit back
+            # into its current generation. Repair it only by a new commit.
+            if old_generation.name.startswith("gen-"):
+                raise ValueError(f"managed snapshot alias was replaced externally: {path}")
+        aliases.append((prepared_link(path, current / name), path))
+    for tmp, path in aliases:
+        os.replace(tmp, path)
+    for parent in {path.parent for path, _ in public}:
+        fsync_dir(parent)
+    next_link = prepared_link(current, new_generation)
+    try:
+        os.replace(next_link, current)
+        # After this rename the entire generation is committed. A directory
+        # fsync failure must be reported, but does not revert an already visible
+        # coherent generation or remove files that readers can now reference.
+        fsync_dir(out_dir)
+    finally:
+        if next_link.is_symlink():
+            next_link.unlink()
+finally:
+    for tmp, _ in aliases:
+        if tmp.is_symlink():
+            tmp.unlink()
+
+# Maintenance is after commit. Keep the selected and previous generation plus
+# the newest third generation; already-open HTTP responses retain their inode.
+# Never turn a successful coherent publication into a failed service result
+# merely because old-generation deletion was unavailable.
+try:
+    retained = {new_generation, old_generation}
+    known = sorted(
+        (path for path in generations.iterdir()
+         if path.is_dir() and not path.is_symlink()
+         and (path.name.startswith("gen-") or path.name.startswith("legacy-"))),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for candidate in known:
+        if len(retained) >= 3:
+            break
+        retained.add(candidate)
+    for obsolete in known:
+        if obsolete not in retained:
+            shutil.rmtree(obsolete)
+    fsync_dir(generations)
+except OSError as error:
+    print(f"snapshot generation cleanup deferred: {error}", file=sys.stderr)
 
 print(
     f"published snapshot height={height} tip={tip_hash} "

@@ -1,0 +1,13 @@
+[Unit]
+Description=Publish QUB mainnet snapshots every minute (HF130)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=1s
+RandomizedDelaySec=5s
+Persistent=true
+Unit=qub-mainnet-snapshot-publish.service
+
+[Install]
+WantedBy=timers.target

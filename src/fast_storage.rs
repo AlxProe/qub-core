@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +38,7 @@ static FAST_COMMITS: AtomicU64 = AtomicU64::new(0);
 static FAST_BYTES_READ: AtomicU64 = AtomicU64::new(0);
 static FAST_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static FAST_LEGACY_EXPORTS: AtomicU64 = AtomicU64::new(0);
+static FAST_LEGACY_EXPORT_FAILURES: AtomicU64 = AtomicU64::new(0);
 static FAST_LAST_LOAD_MILLIS: AtomicU64 = AtomicU64::new(0);
 static FAST_MAX_LOAD_MILLIS: AtomicU64 = AtomicU64::new(0);
 static FAST_LAST_COMMIT_MILLIS: AtomicU64 = AtomicU64::new(0);
@@ -155,10 +156,25 @@ pub struct FastStorageStats {
     pub process_bytes_read: u64,
     pub process_bytes_written: u64,
     pub process_legacy_exports: u64,
+    pub process_legacy_export_failures: u64,
+    pub legacy_export_running: bool,
     pub last_load_millis: u64,
     pub max_load_millis: u64,
     pub last_commit_millis: u64,
     pub max_commit_millis: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainJsonExportReport {
+    pub height: u32,
+    pub tip_hash: Hash256,
+    pub bytes: u64,
+    pub source: String,
+    pub storage_engine: String,
+    pub generation: u64,
+    pub state_revision: u64,
+    pub committed_at_unix: u64,
+    pub recovered_from_previous: bool,
 }
 
 struct FastStorageLease {
@@ -464,6 +480,25 @@ fn lock_owner_alive(path: &Path) -> bool {
     }
 }
 
+fn initialize_created_lease<W: Write>(path: PathBuf, mut file: W) -> Result<FastStorageLease> {
+    // Ownership starts at create_new, before any fallible initialization. A
+    // disk-full/write/flush failure must not strand WRITE.lock in a live node.
+    let lease = FastStorageLease { path };
+    let initialized = (|| -> std::io::Result<()> {
+        writeln!(
+            file,
+            "pid={} created_at_unix={}",
+            std::process::id(),
+            now_secs()
+        )?;
+        file.flush()
+    })();
+    // Close the handle before removing a failed lease, including on Windows.
+    drop(file);
+    initialized?;
+    Ok(lease)
+}
+
 fn acquire_lease(paths: &NodePaths) -> Result<FastStorageLease> {
     fs::create_dir_all(&paths.fast_storage_dir)?;
     for _ in 0..2 {
@@ -472,17 +507,8 @@ fn acquire_lease(paths: &NodePaths) -> Result<FastStorageLease> {
             .write(true)
             .open(&paths.fast_storage_lock_file)
         {
-            Ok(mut file) => {
-                writeln!(
-                    file,
-                    "pid={} created_at_unix={}",
-                    std::process::id(),
-                    now_secs()
-                )?;
-                file.flush()?;
-                return Ok(FastStorageLease {
-                    path: paths.fast_storage_lock_file.clone(),
-                });
+            Ok(file) => {
+                return initialize_created_lease(paths.fast_storage_lock_file.clone(), file);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 let stale = fs::metadata(&paths.fast_storage_lock_file)
@@ -604,9 +630,18 @@ fn read_pointer_state_with_recovery(
     settings: &Settings,
 ) -> Result<(FastStoragePointer, FastStorageState, u64, bool)> {
     let current_result = (|| -> Result<(FastStoragePointer, FastStorageState, u64)> {
-        let pointer = read_pointer_path(paths, settings, &paths.fast_pointer_file)?;
-        let (state, bytes) = read_state(paths, settings, &pointer)?;
-        Ok((pointer, state, bytes))
+        let mut last_error = None;
+        for _ in 0..4 {
+            let pointer = read_pointer_path(paths, settings, &paths.fast_pointer_file)?;
+            match read_state(paths, settings, &pointer) {
+                Ok((state, bytes)) => return Ok((pointer, state, bytes)),
+                Err(err) => last_error = Some(err),
+            }
+            // A concurrent commit+cleanup may have retired the selected state
+            // before its file was opened. Re-capture CURRENT before falling
+            // back to PREVIOUS; never return a fabricated/stale identity.
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("committed state unavailable")))
     })();
 
     match current_result {
@@ -635,13 +670,11 @@ fn read_pointer_state_with_recovery(
 }
 
 fn read_blocks(
-    paths: &NodePaths,
     settings: &Settings,
     pointer: &FastStoragePointer,
     state: &FastStorageState,
+    file: File,
 ) -> Result<Vec<Block>> {
-    let path = safe_child(paths, &pointer.blocks_file)?;
-    let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let metadata = file.metadata()?;
     if metadata.len() < pointer.journal_bytes {
         bail!(
@@ -749,8 +782,12 @@ fn load_fast_chain_from_pointer_path(
     full_validate: bool,
 ) -> Result<(ChainState, FastStorageIdentity)> {
     let pointer = read_pointer_path(paths, settings, pointer_path)?;
+    // Pin the journal before potentially lengthy state deserialization. Once
+    // open it survives Unix unlink; Windows denies deletion of an open file.
+    // If either open loses a cleanup race, load_fast_chain retries CURRENT.
+    let journal = File::open(safe_child(paths, &pointer.blocks_file)?)?;
     let (state, _) = read_state(paths, settings, &pointer)?;
-    let blocks = read_blocks(paths, settings, &pointer, &state)?;
+    let blocks = read_blocks(settings, &pointer, &state, journal)?;
     let chain = chain_from_state(blocks, state, settings, full_validate)?;
     Ok((chain, pointer.identity()))
 }
@@ -760,12 +797,27 @@ fn load_fast_chain_once(
     paths: &NodePaths,
     full_validate: bool,
 ) -> Result<(ChainState, FastStorageIdentity, bool)> {
-    match load_fast_chain_from_pointer_path(
-        settings,
-        paths,
-        &paths.fast_pointer_file,
-        full_validate,
-    ) {
+    let mut current_result = load_fast_chain_from_pointer_path(
+        settings, paths, &paths.fast_pointer_file, full_validate,
+    );
+    for _ in 0..3 {
+        super::p2p::hf132_check_sync_budget()?;
+        let missing_file = current_result.as_ref().err().map(|err| {
+            err.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+                .map(|io| io.kind() == std::io::ErrorKind::NotFound).unwrap_or(false))
+        }).unwrap_or(false);
+        if !missing_file {
+            break;
+        }
+        // A retired file is a capture race, not evidence CURRENT is corrupt.
+        current_result = load_fast_chain_from_pointer_path(
+            settings, paths, &paths.fast_pointer_file, full_validate,
+        );
+    }
+    // Cooperative cancellation is not evidence that CURRENT is corrupt.
+    // Propagate it before recovery can load/replay PREVIOUS instead.
+    super::p2p::hf132_check_sync_budget()?;
+    match current_result {
         Ok((chain, identity)) => {
             FAST_LOADS.fetch_add(1, Ordering::Relaxed);
             Ok((chain, identity, false))
@@ -798,6 +850,7 @@ pub(crate) fn load_fast_chain(
     let started = Instant::now();
     let mut last_error = None;
     for attempt in 0..4u64 {
+        super::p2p::hf132_check_sync_budget()?;
         match load_fast_chain_once(settings, paths, full_validate) {
             Ok((chain, identity, used_previous)) => {
                 if used_previous {
@@ -813,6 +866,7 @@ pub(crate) fn load_fast_chain(
                 return Ok((chain, identity));
             }
             Err(err) => {
+                super::p2p::hf132_check_sync_budget()?;
                 last_error = Some(err);
                 if attempt < 3 {
                     std::thread::sleep(Duration::from_millis(15 + attempt * 25));
@@ -911,26 +965,20 @@ fn write_state_and_pointer(
         atomic_replace_json(&paths.fast_previous_pointer_file, previous, true)?;
     }
     atomic_replace_json(&paths.fast_pointer_file, &pointer, true)?;
-    cleanup_old_state_files(paths, &pointer)?;
-    cleanup_old_journal_files(paths, &pointer)?;
+    // HF130: CURRENT is the durable commit point. There must be no cleanup,
+    // status serialization, or export I/O between this rename and live publish.
+    // The caller enqueues maintenance only after publishing the committed chain.
     Ok(pointer)
 }
 
-fn cleanup_old_state_files(paths: &NodePaths, current: &FastStoragePointer) -> Result<()> {
-    let mut keep = HashSet::<String>::new();
-    keep.insert(current.state_file.clone());
-    if paths.fast_previous_pointer_file.exists() {
-        if let Ok(previous) = serde_json::from_reader::<_, FastStoragePointer>(BufReader::new(
-            File::open(&paths.fast_previous_pointer_file)?,
-        )) {
-            keep.insert(previous.state_file);
-        }
-    }
-    let mut states = fs::read_dir(&paths.fast_storage_dir)?
+fn old_file_candidates(paths: &NodePaths, prefix: &str, suffix: &str, retain: usize) -> Result<Vec<PathBuf>> {
+    // Directory walking, metadata I/O and sorting never hold the canonical
+    // storage mutex. Eligibility is checked again under the writer lease.
+    let mut files = fs::read_dir(&paths.fast_storage_dir)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("state-") && name.ends_with(".json") {
+            if name.starts_with(prefix) && name.ends_with(suffix) {
                 let modified = entry
                     .metadata()
                     .ok()
@@ -942,55 +990,136 @@ fn cleanup_old_state_files(paths: &NodePaths, current: &FastStoragePointer) -> R
             }
         })
         .collect::<Vec<_>>();
-    states.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, name, _) in states.iter().take(4) {
-        keep.insert(name.clone());
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(files.into_iter().skip(retain).map(|(_, _, path)| path).collect())
+}
+
+fn cleanup_candidates_if_idle(settings: &Settings, paths: &NodePaths, candidates: &[PathBuf]) -> Result<bool> {
+    // Normal saves already hold this mutex before taking the on-disk lease.
+    // Try-lock makes maintenance yield to a queued/active canonical writer.
+    let Ok(_storage) = super::storage_lock().try_lock() else {
+        return Ok(false);
+    };
+    let _lease = acquire_lease(paths)?;
+    let current = read_pointer_path(paths, settings, &paths.fast_pointer_file)?;
+    let mut keep = HashSet::<String>::new();
+    keep.insert(current.state_file.clone());
+    keep.insert(current.blocks_file.clone());
+    if paths.fast_previous_pointer_file.exists() {
+        // A corrupt/unreadable PREVIOUS makes cleanup fail closed. Never guess
+        // which immutable files a recovery reader may still need.
+        let previous = read_pointer_path(paths, settings, &paths.fast_previous_pointer_file)?;
+        keep.insert(previous.state_file);
+        keep.insert(previous.blocks_file);
     }
-    for (_, name, path) in states {
-        if !keep.contains(&name) {
+    // Bound the number of filesystem mutations per lease. Open reader handles
+    // remain valid on Unix; Windows may refuse deletion, which is harmless.
+    for path in candidates.iter().take(8) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !keep.contains(name) {
             let _ = fs::remove_file(path);
         }
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct PostCommitWorkers {
+    running: HashSet<PathBuf>,
+    pending: HashSet<PathBuf>,
+}
+
+static CLI_INLINE_STORAGE_MAINTENANCE: AtomicBool = AtomicBool::new(false);
+
+/// Select once at finite CLI startup, before any chain access or worker starts.
+/// Such commands finish metadata/cleanup after live publication in their own
+/// thread. Full compatibility exports remain explicit. GUI and long-running
+/// services keep the default detached maintenance/export policy.
+pub fn use_inline_storage_maintenance_for_cli() {
+    CLI_INLINE_STORAGE_MAINTENANCE.store(true, Ordering::SeqCst);
+}
+
+fn post_commit_workers() -> &'static StdMutex<PostCommitWorkers> {
+    static WORKERS: OnceLock<StdMutex<PostCommitWorkers>> = OnceLock::new();
+    WORKERS.get_or_init(|| StdMutex::new(PostCommitWorkers::default()))
+}
+
+fn run_post_commit_maintenance(settings: &Settings) -> Result<()> {
+    let paths = NodePaths::from_settings(settings);
+    #[cfg(test)]
+    hf130_maintenance_tests::before_maintenance(&paths)?;
+
+    // Capture/serialize status without the storage mutex. status-fast reads
+    // CURRENT/state itself, so this compatibility cache is never authoritative.
+    let (pointer, _) = read_pointer_with_recovery(&paths, settings)?;
+    if let Err(err) = write_status_from_pointer(&paths, &pointer) {
+        eprintln!("warning: HF130 detached status refresh failed: {err:#}");
+    }
+    let mut candidates = old_file_candidates(&paths, "state-", ".json", 4)?;
+    candidates.extend(old_file_candidates(&paths, "blocks-", ".jsonl", 3)?);
+    if !candidates.is_empty() {
+        cleanup_candidates_if_idle(settings, &paths, &candidates)?;
     }
     Ok(())
 }
 
-fn cleanup_old_journal_files(paths: &NodePaths, current: &FastStoragePointer) -> Result<()> {
-    let mut keep = HashSet::<String>::new();
-    keep.insert(current.blocks_file.clone());
-    if paths.fast_previous_pointer_file.exists() {
-        if let Ok(previous) = serde_json::from_reader::<_, FastStoragePointer>(BufReader::new(
-            File::open(&paths.fast_previous_pointer_file)?,
-        )) {
-            keep.insert(previous.blocks_file);
-        }
-    }
+/// Call only after the committed chain has been published to the live owner
+/// (or queued there). The default detached scheduler performs no filesystem
+/// I/O. Finite CLI commands instead finish one maintenance pass before exit;
+/// errors remain non-fatal because CURRENT has already committed.
+pub(crate) fn schedule_post_commit_maintenance(settings: &Settings) {
+    schedule_post_commit_maintenance_in_mode(
+        settings,
+        CLI_INLINE_STORAGE_MAINTENANCE.load(Ordering::SeqCst),
+    );
+}
 
-    let mut journals = fs::read_dir(&paths.fast_storage_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("blocks-") && name.ends_with(".jsonl") {
-                let modified = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(UNIX_EPOCH);
-                Some((modified, name, entry.path()))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    journals.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, name, _) in journals.iter().take(3) {
-        keep.insert(name.clone());
+fn schedule_post_commit_maintenance_in_mode(settings: &Settings, inline: bool) {
+    if inline {
+        if let Err(err) = run_post_commit_maintenance(settings) {
+            eprintln!("warning: HF130 CLI storage maintenance failed; CURRENT remains committed: {err:#}");
+        }
+        return;
     }
-    for (_, name, path) in journals {
-        if !keep.contains(&name) {
-            let _ = fs::remove_file(path);
+    let key = NodePaths::from_settings(settings).fast_storage_dir;
+    {
+        let Ok(mut workers) = post_commit_workers().lock() else {
+            return;
+        };
+        if !workers.running.insert(key.clone()) {
+            workers.pending.insert(key);
+            return;
         }
     }
-    Ok(())
+    let worker_key = key.clone();
+    let settings = settings.clone();
+    let spawn = thread::Builder::new()
+        .name("qub-post-commit".to_string())
+        .spawn(move || loop {
+            if let Err(err) = run_post_commit_maintenance(&settings) {
+                eprintln!("warning: HF130 detached storage maintenance failed; CURRENT remains committed: {err:#}");
+            }
+            // Even the legacy scheduler reads pointer/status files, so it also
+            // belongs in this detached worker, never the caller's save path.
+            schedule_legacy_export(&settings);
+            let Ok(mut workers) = post_commit_workers().lock() else {
+                break;
+            };
+            if workers.pending.remove(&worker_key) {
+                continue;
+            }
+            workers.running.remove(&worker_key);
+            break;
+        });
+    if let Err(err) = spawn {
+        if let Ok(mut workers) = post_commit_workers().lock() {
+            workers.running.remove(&key);
+            workers.pending.remove(&key);
+        }
+        eprintln!("warning: HF130 could not start detached storage maintenance: {err}");
+    }
 }
 
 fn initialize_fast_storage(
@@ -1009,9 +1138,6 @@ fn initialize_fast_storage(
     let blocks_path = safe_child(paths, &blocks_file)?;
     let journal_bytes = write_full_journal(&blocks_path, &chain.blocks)?;
     let state = state_from_chain(chain, generation, 1, journal_bytes)?;
-    let pointer = write_state_and_pointer(paths, None, blocks_file, state)?;
-    FAST_COMMITS.fetch_add(1, Ordering::Relaxed);
-    write_status_from_pointer(paths, &pointer)?;
     if legacy_is_current {
         let legacy = LegacyExportStatus {
             schema_version: 1,
@@ -1021,9 +1147,9 @@ fn initialize_fast_storage(
             exported_at_unix: now_secs(),
         };
         let _ = atomic_replace_json(&paths.fast_legacy_export_status_file, &legacy, true);
-    } else {
-        export_chain_json_to(settings, paths, &paths.chain_file)?;
     }
+    let pointer = write_state_and_pointer(paths, None, blocks_file, state)?;
+    FAST_COMMITS.fetch_add(1, Ordering::Relaxed);
     Ok(pointer.identity())
 }
 
@@ -1150,8 +1276,6 @@ fn commit_chain_with_policy(
     let state = state_from_chain(chain, generation, state_revision, journal_bytes)?;
     let pointer = write_state_and_pointer(paths, current.as_ref(), blocks_file, state)?;
     FAST_COMMITS.fetch_add(1, Ordering::Relaxed);
-    write_status_from_pointer(paths, &pointer)?;
-    maybe_refresh_legacy_export(settings, paths, chain, &pointer)?;
     let millis = elapsed_millis(started);
     FAST_LAST_COMMIT_MILLIS.store(millis, Ordering::Relaxed);
     record_max(&FAST_MAX_COMMIT_MILLIS, millis);
@@ -1225,7 +1349,7 @@ fn write_status_from_pointer(paths: &NodePaths, pointer: &FastStoragePointer) ->
         bail!("status state network mismatch");
     }
     let status = fast_status_from_pointer(paths, pointer, &state, body.len() as u64);
-    let _ = atomic_replace_json(&paths.chain_status_file, &status, true);
+    atomic_replace_json(&paths.chain_status_file, &status, true)?;
     Ok(())
 }
 
@@ -1279,6 +1403,22 @@ pub fn load_committed_chain(settings: &Settings, full_validate: bool) -> Result<
     load_committed_chain_with_identity(settings, full_validate).map(|(chain, _)| chain)
 }
 
+/// HF129 lightweight Explorer overlay for a mempool-only FCE revision. It reads
+/// the exact immutable state file but never replays/deserializes the block
+/// journal, preventing ordinary mempool churn from stalling every chain route.
+pub fn load_committed_mempool_with_identity(
+    settings: &Settings,
+) -> Result<(Vec<Transaction>, Option<FastStorageIdentity>)> {
+    let paths = NodePaths::from_settings(settings);
+    paths.ensure_dirs()?;
+    if paths.fast_storage_exists() {
+        let (pointer, state, _, _) = read_pointer_state_with_recovery(&paths, settings)?;
+        return Ok((state.mempool, Some(pointer.identity())));
+    }
+    let chain = load_committed_chain(settings, false)?;
+    Ok((chain.mempool.as_ref().clone(), None))
+}
+
 pub fn fast_storage_identity(settings: &Settings) -> Result<Option<FastStorageIdentity>> {
     let paths = NodePaths::from_settings(settings);
     if !paths.fast_storage_exists() {
@@ -1316,6 +1456,8 @@ pub fn fast_storage_stats(settings: &Settings) -> Result<FastStorageStats> {
         process_bytes_read: FAST_BYTES_READ.load(Ordering::Relaxed),
         process_bytes_written: FAST_BYTES_WRITTEN.load(Ordering::Relaxed),
         process_legacy_exports: FAST_LEGACY_EXPORTS.load(Ordering::Relaxed),
+        process_legacy_export_failures: FAST_LEGACY_EXPORT_FAILURES.load(Ordering::Relaxed),
+        legacy_export_running: legacy_export_running_for(&paths),
         last_load_millis: FAST_LAST_LOAD_MILLIS.load(Ordering::Relaxed),
         max_load_millis: FAST_MAX_LOAD_MILLIS.load(Ordering::Relaxed),
         last_commit_millis: FAST_LAST_COMMIT_MILLIS.load(Ordering::Relaxed),
@@ -1346,28 +1488,197 @@ fn should_refresh_legacy_export(
             >= HF123_LEGACY_EXPORT_INTERVAL_SECS
 }
 
-fn maybe_refresh_legacy_export(
+#[derive(Default)]
+struct LegacyExportWorkers {
+    running: HashSet<PathBuf>,
+    pending: HashSet<PathBuf>,
+}
+
+fn legacy_export_workers() -> &'static StdMutex<LegacyExportWorkers> {
+    static WORKERS: OnceLock<StdMutex<LegacyExportWorkers>> = OnceLock::new();
+    WORKERS.get_or_init(|| StdMutex::new(LegacyExportWorkers::default()))
+}
+
+fn legacy_export_running_for(paths: &NodePaths) -> bool {
+    legacy_export_workers()
+        .lock()
+        .map(|workers| workers.running.contains(&paths.fast_storage_dir))
+        .unwrap_or(false)
+}
+
+fn try_acquire_legacy_export_lease(paths: &NodePaths) -> Result<Option<FastStorageLease>> {
+    fs::create_dir_all(&paths.fast_storage_dir)?;
+    let path = paths.fast_storage_dir.join("LEGACY-EXPORT.lock");
+    for attempt in 0..2 {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(mut file) => {
+            // Own the lease immediately. If initializing or flushing the lock
+            // file fails, Drop removes it instead of leaving a false permanent
+            // exporter owner behind.
+            let lease = FastStorageLease { path: path.clone() };
+            writeln!(
+                file,
+                "pid={} created_at_unix={}",
+                std::process::id(),
+                now_secs()
+            )?;
+            file.flush()?;
+            return Ok(Some(lease));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stale = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .map(|age| age.as_secs() >= HF123_STORAGE_LOCK_STALE_SECS)
+                .unwrap_or(false);
+            if stale && !lock_owner_alive(&path) {
+                if attempt == 0 {
+                    fs::remove_file(&path).with_context(|| {
+                        format!("remove stale legacy export lease {}", path.display())
+                    })?;
+                    continue;
+                }
+            }
+            // A different QUB process using this data directory is already
+            // exporting. Do not wait and, critically, do not take WRITE.lock.
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn run_legacy_export_once(
     settings: &Settings,
     paths: &NodePaths,
-    chain: &ChainState,
-    pointer: &FastStoragePointer,
-) -> Result<()> {
-    if should_refresh_legacy_export(settings, paths, pointer) {
-        export_chain_json_to(settings, paths, &paths.chain_file)?;
-        let status = LegacyExportStatus {
-            schema_version: 1,
-            network: settings.network.name.clone(),
-            height: chain.height(),
-            tip_hash: chain.tip_hash(),
-            exported_at_unix: now_secs(),
-        };
-        atomic_replace_json(&paths.fast_legacy_export_status_file, &status, true)?;
-        FAST_LEGACY_EXPORTS.fetch_add(1, Ordering::Relaxed);
+) -> (Result<ChainJsonExportReport>, bool) {
+    match try_acquire_legacy_export_lease(paths) {
+        Ok(Some(_export_lease)) => (
+            export_chain_json_to(settings, paths, &paths.chain_file).and_then(|report| {
+                let status = LegacyExportStatus {
+                    schema_version: 1,
+                    network: settings.network.name.clone(),
+                    height: report.height,
+                    tip_hash: report.tip_hash,
+                    exported_at_unix: now_secs(),
+                };
+                atomic_replace_json(&paths.fast_legacy_export_status_file, &status, true)?;
+                Ok(report)
+            }),
+            false,
+        ),
+        Ok(None) => (
+            Err(anyhow::anyhow!(
+                "legacy export is already active in another process"
+            )),
+            true,
+        ),
+        Err(err) => (Err(err), false),
     }
-    Ok(())
+}
+
+/// HF129/v1.8.5 best-effort compatibility export scheduler.
+///
+/// Canonical durability is CURRENT + its immutable journal/state. `chain.json`
+/// exists only for older tools, so its full-chain serialization must never sit
+/// on the canonical storage mutex or delay publication of the live owner.
+pub(crate) fn schedule_legacy_export(settings: &Settings) {
+    if CLI_INLINE_STORAGE_MAINTENANCE.load(Ordering::SeqCst) {
+        return;
+    }
+    let paths = NodePaths::from_settings(settings);
+    let pointer = match read_pointer_with_recovery(&paths, settings) {
+        Ok((pointer, _)) => pointer,
+        Err(_) => return,
+    };
+    if !should_refresh_legacy_export(settings, &paths, &pointer) {
+        return;
+    }
+
+    let key = paths.fast_storage_dir.clone();
+    {
+        let Ok(mut workers) = legacy_export_workers().lock() else {
+            return;
+        };
+        if workers.running.contains(&key) {
+            workers.pending.insert(key);
+            return;
+        }
+        workers.running.insert(key.clone());
+    }
+
+    let settings = settings.clone();
+    let spawn = thread::Builder::new()
+        .name("qub-legacy-export".to_string())
+        .spawn(move || {
+            let paths = NodePaths::from_settings(&settings);
+            // A detached compatibility export is best effort, but one transient
+            // I/O failure or another process's lease must not drop the work
+            // forever when there is no subsequent block save to retrigger it.
+            // Retry in this detached thread with a bounded backoff; canonical
+            // CURRENT/live publication is completely independent of this loop.
+            // The final delay crosses the 15-minute stale-lease threshold, so a
+            // crashed external exporter is recovered even if no later block save
+            // occurs to schedule another worker.
+            let retry_delays = [1u64, 3, 10, 30, HF123_STORAGE_LOCK_STALE_SECS + 5];
+            let (mut result, mut coalesced_external) =
+                run_legacy_export_once(&settings, &paths);
+            for delay_secs in retry_delays {
+                if result.is_ok() {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(delay_secs));
+                (result, coalesced_external) = run_legacy_export_once(&settings, &paths);
+            }
+
+            match result {
+                Ok(_) => {
+                    FAST_LEGACY_EXPORTS.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    if !coalesced_external {
+                        FAST_LEGACY_EXPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "warning: HF129 detached legacy chain.json export failed; canonical CURRENT remains live: {err:#}"
+                        );
+                    }
+                }
+            }
+
+            let pending = legacy_export_workers()
+                .lock()
+                .map(|mut workers| {
+                    workers.running.remove(&key);
+                    workers.pending.remove(&key)
+                })
+                .unwrap_or(false);
+            if pending {
+                schedule_legacy_export(&settings);
+            }
+        });
+    if let Err(err) = spawn {
+        if let Ok(mut workers) = legacy_export_workers().lock() {
+            workers.running.remove(&paths.fast_storage_dir);
+            workers.pending.remove(&paths.fast_storage_dir);
+        }
+        FAST_LEGACY_EXPORT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "warning: HF129 could not start detached legacy export worker; canonical CURRENT remains live: {err}"
+        );
+    }
 }
 
 pub fn export_chain_json(settings: &Settings, output_path: &Path) -> Result<(u32, Hash256, u64)> {
+    export_chain_json_report(settings, output_path)
+        .map(|report| (report.height, report.tip_hash, report.bytes))
+}
+
+pub fn export_chain_json_report(
+    settings: &Settings,
+    output_path: &Path,
+) -> Result<ChainJsonExportReport> {
     let paths = NodePaths::from_settings(settings);
     if paths.fast_storage_exists() {
         export_chain_json_to(settings, &paths, output_path)
@@ -1376,7 +1687,17 @@ pub fn export_chain_json(settings: &Settings, output_path: &Path) -> Result<(u32
             .with_context(|| format!("read {}", paths.chain_file.display()))?;
         atomic_replace_bytes(output_path, &raw, true)?;
         let chain = super::load_or_init_chain_for_ui_fast(settings)?;
-        Ok((chain.height(), chain.tip_hash(), raw.len() as u64))
+        Ok(ChainJsonExportReport {
+            height: chain.height(),
+            tip_hash: chain.tip_hash(),
+            bytes: raw.len() as u64,
+            source: "legacy".to_string(),
+            storage_engine: "legacy-chain-json".to_string(),
+            generation: 0,
+            state_revision: 0,
+            committed_at_unix: 0,
+            recovered_from_previous: false,
+        })
     }
 }
 
@@ -1384,11 +1705,9 @@ fn export_chain_json_to(
     settings: &Settings,
     paths: &NodePaths,
     output_path: &Path,
-) -> Result<(u32, Hash256, u64)> {
-    let (pointer, state, _, _) =
-        read_pointer_state_with_recovery(paths, settings)?;
-    let blocks_path = safe_child(paths, &pointer.blocks_file)?;
-    let file = File::open(&blocks_path)?;
+) -> Result<ChainJsonExportReport> {
+    let (pointer, state, recovered_from_previous, file) =
+        open_export_commit(settings, paths)?;
     if file.metadata()?.len() < pointer.journal_bytes {
         bail!("Fast Chain Engine journal shorter than committed prefix");
     }
@@ -1446,7 +1765,35 @@ fn export_chain_json_to(
         let _ = fs::remove_file(&tmp);
     }
     let bytes = result?;
-    Ok((pointer.committed_height, pointer.tip_hash, bytes))
+    Ok(ChainJsonExportReport {
+        height: pointer.committed_height,
+        tip_hash: pointer.tip_hash,
+        bytes,
+        source: "fce".to_string(),
+        storage_engine: HF123_FAST_STORAGE_MAGIC.to_string(),
+        generation: pointer.generation,
+        state_revision: pointer.state_revision,
+        committed_at_unix: pointer.committed_at_unix,
+        recovered_from_previous,
+    })
+}
+
+fn open_export_commit(
+    settings: &Settings,
+    paths: &NodePaths,
+) -> Result<(FastStoragePointer, FastStorageState, bool, File)> {
+    let mut last_error = None;
+    for _ in 0..4 {
+        let (pointer, state, _, recovered) = read_pointer_state_with_recovery(paths, settings)?;
+        match File::open(safe_child(paths, &pointer.blocks_file)?) {
+            Ok(journal) => return Ok((pointer, state, recovered, journal)),
+            Err(err) => last_error = Some(err),
+        }
+        // State is already owned in memory. If its journal was retired before
+        // open, retry a whole captured commit; never mix a newer file with it.
+    }
+    Err(last_error.map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("committed export journal unavailable")))
 }
 
 fn live_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<StdMutex<ChainState>>>> {
@@ -1491,6 +1838,23 @@ pub fn live_chain_snapshot(settings: &Settings) -> Option<ChainState> {
     let chain = live_chain_arc(settings)?;
     let snapshot = chain.lock().ok()?.clone();
     Some(snapshot)
+}
+
+/// Capture the copy-on-write live view without waiting for its writer. A busy
+/// owner is distinct from an absent owner: UI callers must retry instead of
+/// falling through to an expensive disk load or consensus replay.
+pub fn try_live_chain_snapshot(settings: &Settings) -> Result<Option<ChainState>> {
+    let Some(chain) = live_chain_arc(settings) else {
+        return Ok(None);
+    };
+    let result = match chain.try_lock() {
+        Ok(snapshot) => Ok(Some(snapshot.clone())),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            bail!("live chain snapshot is busy; retry after the active writer")
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => bail!("live chain mutex poisoned"),
+    };
+    result
 }
 
 fn apply_live_candidate_locked(
@@ -1716,4 +2080,501 @@ pub(crate) fn fast_storage_file_prefix_hash(
     let (pointer, _) = read_pointer_with_recovery(&paths, settings)?;
     let path = safe_child(&paths, &pointer.blocks_file)?;
     Ok(Some(hash_file_prefix(&path, pointer.journal_bytes)?))
+}
+
+#[cfg(test)]
+mod hf131_lease_tests {
+    use super::*;
+
+    struct FaultyLeaseFile {
+        file: File,
+        fail_write: bool,
+    }
+
+    impl Write for FaultyLeaseFile {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                return Err(std::io::Error::other("HF131 injected lease write failure"));
+            }
+            self.file.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("HF131 injected lease flush failure"))
+        }
+    }
+
+    fn failed_initialization_releases_owned_lease(fail_write: bool) {
+        let path = std::env::temp_dir().join(format!(
+            "qub-hf131-lease-{}-{}.lock",
+            std::process::id(),
+            now_nanos_u64()
+        ));
+        let file = OpenOptions::new().create_new(true).write(true).open(&path).unwrap();
+        let result = initialize_created_lease(path.clone(), FaultyLeaseFile { file, fail_write });
+        let error = match result {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("injected initialization error was ignored"),
+        };
+        assert!(error.contains(if fail_write { "write failure" } else { "flush failure" }));
+        assert!(!path.exists(), "failed initializer stranded its writer lease");
+
+        // The next writer can acquire this exact path immediately; it does not
+        // need a fifteen-minute timeout or manual deletion of an owned lock.
+        let file = OpenOptions::new().create_new(true).write(true).open(&path).unwrap();
+        let lease = initialize_created_lease(path.clone(), file).unwrap();
+        assert!(path.exists());
+        assert!(lock_owner_alive(&path));
+        drop(lease);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn hf131_writer_lease_write_failure_releases_path() {
+        failed_initialization_releases_owned_lease(true);
+    }
+
+    #[test]
+    fn hf131_writer_lease_flush_failure_releases_path() {
+        failed_initialization_releases_owned_lease(false);
+    }
+}
+
+#[cfg(test)]
+mod hf130_maintenance_tests {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    struct TestHook {
+        entered: Sender<()>,
+        resume: StdMutex<Option<Receiver<()>>>,
+        fail: bool,
+    }
+
+    fn hooks() -> &'static StdMutex<HashMap<PathBuf, Arc<TestHook>>> {
+        static HOOKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<TestHook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    pub(super) fn before_maintenance(paths: &NodePaths) -> Result<()> {
+        let hook = hooks().lock().unwrap().get(&paths.fast_storage_dir).cloned();
+        if let Some(hook) = hook {
+            let resume = hook.resume.lock().unwrap().take();
+            if let Some(resume) = resume {
+                let _ = hook.entered.send(());
+                let _ = resume.recv();
+            }
+            if hook.fail {
+                bail!("HF130 injected post-CURRENT maintenance failure");
+            }
+        }
+        Ok(())
+    }
+
+    struct BlockMaintenance {
+        key: PathBuf,
+        entered: Receiver<()>,
+        resume: Option<Sender<()>>,
+    }
+
+    impl BlockMaintenance {
+        fn new(settings: &Settings, fail: bool) -> Self {
+            let key = NodePaths::from_settings(settings).fast_storage_dir;
+            let (entered_tx, entered) = mpsc::channel();
+            let (resume, resume_rx) = mpsc::channel();
+            hooks().lock().unwrap().insert(key.clone(), Arc::new(TestHook {
+                entered: entered_tx,
+                resume: StdMutex::new(Some(resume_rx)),
+                fail,
+            }));
+            Self { key, entered, resume: Some(resume) }
+        }
+
+        fn wait_until_blocked(&self) {
+            self.entered.recv_timeout(Duration::from_secs(5))
+                .expect("detached maintenance did not reach the injected delay");
+        }
+    }
+
+    impl Drop for BlockMaintenance {
+        fn drop(&mut self) {
+            // Disconnect releases a blocked worker even when an assertion panics.
+            self.resume.take();
+            hooks().lock().unwrap().remove(&self.key);
+        }
+    }
+
+    struct Fixture(Settings);
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let mut settings: Settings = toml::from_str(include_str!("../config/regtest.toml")).unwrap();
+            settings.node.data_dir = std::env::temp_dir().join(format!(
+                "qub-hf130-{name}-{}-{}", std::process::id(), now_nanos_u64(),
+            )).display().to_string();
+            // Match node startup: the data directory exists before the live
+            // owner is registered. On Windows canonicalize adds the verbatim
+            // path prefix only once the directory exists; registering earlier
+            // would store a different registry key from the first save lookup.
+            NodePaths::from_settings(&settings).ensure_dirs().unwrap();
+            Self(settings)
+        }
+
+        fn assert_live_owner(&self, expected: &Arc<StdMutex<ChainState>>) {
+            let registered = live_chain_arc(&self.0)
+                .expect("test fixture lost its registered live owner");
+            assert!(Arc::ptr_eq(&registered, expected), "test fixture selected another live owner");
+        }
+
+        fn wait_for_workers(&self) {
+            let key = NodePaths::from_settings(&self.0).fast_storage_dir;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let maintenance = post_commit_workers().lock().unwrap().running.contains(&key);
+                let export = legacy_export_running_for(&NodePaths::from_settings(&self.0));
+                if !maintenance && !export {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "detached storage workers did not finish");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            unregister_live_chain(&self.0);
+            // Avoid deleting a directory out from under a failed/slow worker.
+            let key = NodePaths::from_settings(&self.0).fast_storage_dir;
+            let running = post_commit_workers().lock().unwrap().running.contains(&key)
+                || legacy_export_running_for(&NodePaths::from_settings(&self.0));
+            if !running {
+                let _ = fs::remove_dir_all(&self.0.node.data_dir);
+            }
+        }
+    }
+
+    fn extend(settings: &Settings, chain: &mut ChainState, count: usize) {
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let key = wallet.create_key(settings, "HF130 test", 0).unwrap();
+        let miner = Address::parse_with_prefix(&key.address, &settings.network.address_prefix).unwrap();
+        for _ in 0..count {
+            let block = mine_next_block(chain, settings, &miner, MiningOptions {
+                duty_cycle_percent: 100,
+                max_hashes: Some(5_000_000),
+            }).unwrap();
+            chain.connect_block(block, settings).unwrap();
+        }
+    }
+
+    fn cleanup_for_test(settings: &Settings, paths: &NodePaths, candidates: &[PathBuf]) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cleanup_candidates_if_idle(settings, paths, candidates)? {
+            assert!(Instant::now() < deadline, "test could not obtain idle storage mutex");
+            thread::yield_now();
+        }
+        Ok(())
+    }
+
+    fn save_with_deadline(settings: &Settings, chain: &ChainState) {
+        let settings = settings.clone();
+        let chain = chain.clone();
+        let (completed, result) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = completed.send(save_chain(&settings, &chain));
+        });
+        result.recv_timeout(Duration::from_secs(5))
+            .expect("canonical save waited for blocked post-commit maintenance")
+            .unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn hf130_live_publish_precedes_delayed_maintenance() {
+        let fixture = Fixture::new("live-before-maintenance");
+        let settings = &fixture.0;
+        let genesis = ChainState::new_with_genesis(settings).unwrap();
+        let live = Arc::new(StdMutex::new(genesis.clone()));
+        register_live_chain(settings, &live);
+        fixture.assert_live_owner(&live);
+        let mut candidate = genesis;
+        extend(settings, &mut candidate, 1);
+        let blocked = BlockMaintenance::new(settings, false);
+        save_with_deadline(settings, &candidate);
+        blocked.wait_until_blocked();
+        fixture.assert_live_owner(&live);
+        assert_eq!(live.lock().unwrap().tip_hash(), candidate.tip_hash());
+        assert_eq!(fast_storage_identity(settings).unwrap().unwrap().tip_hash, candidate.tip_hash());
+        let paths = NodePaths::from_settings(settings);
+        assert!(!paths.chain_status_file.exists(), "status should still be blocked");
+        // A new durable commit also proceeds while the old maintenance pass is
+        // delayed; the old pass must eventually capture the newer CURRENT.
+        extend(settings, &mut candidate, 1);
+        save_with_deadline(settings, &candidate);
+        fixture.assert_live_owner(&live);
+        assert_eq!(live.lock().unwrap().tip_hash(), candidate.tip_hash());
+        drop(blocked);
+        fixture.wait_for_workers();
+        let (status, _) = load_fast_status(settings, &paths).unwrap();
+        assert_eq!(status.tip_hash, candidate.tip_hash());
+    }
+
+    #[test]
+    fn hf130_post_current_maintenance_error_does_not_fail_save() {
+        let fixture = Fixture::new("maintenance-error");
+        let settings = &fixture.0;
+        let genesis = ChainState::new_with_genesis(settings).unwrap();
+        let live = Arc::new(StdMutex::new(genesis.clone()));
+        register_live_chain(settings, &live);
+        fixture.assert_live_owner(&live);
+        let mut candidate = genesis;
+        extend(settings, &mut candidate, 1);
+        let blocked = BlockMaintenance::new(settings, true);
+        save_with_deadline(settings, &candidate);
+        blocked.wait_until_blocked();
+        fixture.assert_live_owner(&live);
+        assert_eq!(live.lock().unwrap().tip_hash(), candidate.tip_hash());
+        assert_eq!(load_committed_chain(settings, true).unwrap().tip_hash(), candidate.tip_hash());
+        drop(blocked);
+        fixture.wait_for_workers();
+        assert_eq!(fast_storage_identity(settings).unwrap().unwrap().tip_hash, candidate.tip_hash());
+    }
+
+    #[test]
+    fn hf130_inline_cli_maintenance_failure_retains_committed_tip() {
+        let fixture = Fixture::new("inline-cli-maintenance-error");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let mut chain = ChainState::new_with_genesis(settings).unwrap();
+        extend(settings, &mut chain, 1);
+        initialize_new_chain(settings, &paths, &chain).unwrap();
+        let mut failure = BlockMaintenance::new(settings, true);
+        // Select the real inline branch without changing process-global mode
+        // while the other library tests execute concurrently.
+        drop(failure.resume.take());
+        schedule_post_commit_maintenance_in_mode(settings, true);
+        failure.wait_until_blocked();
+        assert_eq!(load_committed_chain(settings, true).unwrap().tip_hash(), chain.tip_hash());
+        assert!(!post_commit_workers().lock().unwrap().running.contains(&paths.fast_storage_dir));
+        assert!(!legacy_export_running_for(&paths));
+        assert!(!paths.fast_storage_lock_file.exists());
+        assert!(!paths.fast_storage_dir.join("LEGACY-EXPORT.lock").exists());
+    }
+
+    #[test]
+    fn hf130_cleanup_rechecks_current_previous() {
+        let fixture = Fixture::new("cleanup-pointers");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let chain = ChainState::new_with_genesis(settings).unwrap();
+        initialize_new_chain(settings, &paths, &chain).unwrap();
+        let old = read_pointer_path(&paths, settings, &paths.fast_pointer_file).unwrap();
+        for _ in 0..6 {
+            commit_chain(settings, &paths, &chain).unwrap();
+        }
+        let current = read_pointer_path(&paths, settings, &paths.fast_pointer_file).unwrap();
+        let previous = read_pointer_path(&paths, settings, &paths.fast_previous_pointer_file).unwrap();
+        let candidates = vec![
+            safe_child(&paths, &old.state_file).unwrap(),
+            safe_child(&paths, &current.state_file).unwrap(),
+            safe_child(&paths, &previous.state_file).unwrap(),
+            safe_child(&paths, &current.blocks_file).unwrap(),
+        ];
+        cleanup_for_test(settings, &paths, &candidates).unwrap();
+        assert!(!candidates[0].exists());
+        assert!(candidates[1..].iter().all(|path| path.exists()));
+        fs::write(&paths.fast_previous_pointer_file, b"invalid pointer").unwrap();
+        let leftover = paths.fast_storage_dir.join("state-obsolete.json");
+        fs::write(&leftover, b"keep on uncertain recovery identity").unwrap();
+        assert!(cleanup_for_test(settings, &paths, &[leftover.clone()]).is_err());
+        assert!(leftover.exists());
+    }
+
+    #[test]
+    fn hf130_open_journal_survives_cleanup() {
+        let fixture = Fixture::new("reader-lifetime");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let genesis = ChainState::new_with_genesis(settings).unwrap();
+        let mut first = genesis.clone();
+        extend(settings, &mut first, 1);
+        initialize_new_chain(settings, &paths, &first).unwrap();
+        let (pointer, state, _, journal) = open_export_commit(settings, &paths).unwrap();
+        let mut second = genesis.clone();
+        extend(settings, &mut second, 2);
+        commit_chain(settings, &paths, &second).unwrap();
+        let mut third = genesis;
+        extend(settings, &mut third, 3);
+        commit_chain(settings, &paths, &third).unwrap();
+        let retired = safe_child(&paths, &pointer.blocks_file).unwrap();
+        cleanup_for_test(settings, &paths, &[retired]).unwrap();
+        let blocks = read_blocks(settings, &pointer, &state, journal).unwrap();
+        assert_eq!(blocks.last().unwrap().block_hash(), first.tip_hash());
+        assert_eq!(load_fast_chain(settings, &paths, true).unwrap().0.tip_hash(), third.tip_hash());
+    }
+
+    #[test]
+    fn hf130_cleanup_yields_to_canonical_writer() {
+        let fixture = Fixture::new("cleanup-yield");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let chain = ChainState::new_with_genesis(settings).unwrap();
+        initialize_new_chain(settings, &paths, &chain).unwrap();
+        let obsolete = paths.fast_storage_dir.join("state-obsolete.json");
+        fs::write(&obsolete, b"pending cleanup").unwrap();
+        let writer = super::super::storage_lock().lock().unwrap();
+        assert!(!cleanup_candidates_if_idle(settings, &paths, &[obsolete.clone()]).unwrap());
+        assert!(obsolete.exists());
+        drop(writer);
+        cleanup_for_test(settings, &paths, &[obsolete.clone()]).unwrap();
+        assert!(!obsolete.exists());
+    }
+
+    #[test]
+    fn hf132_ui_snapshot_defers_while_live_owner_is_busy() {
+        let fixture = Fixture::new("hf132-ui-busy");
+        let settings = &fixture.0;
+        let chain = ChainState::new_with_genesis(settings).unwrap();
+        let live = Arc::new(StdMutex::new(chain.clone()));
+        register_live_chain(settings, &live);
+        let held = live.lock().unwrap();
+        let snapshot = try_live_chain_snapshot(settings);
+        assert!(snapshot.unwrap_err().to_string().contains("snapshot is busy"));
+        let loaded = super::super::load_or_init_chain_for_ui_fast(settings);
+        assert!(loaded.unwrap_err().to_string().contains("snapshot is busy"));
+        assert!(!NodePaths::from_settings(settings).fast_storage_exists(),
+            "busy live owner must not fall through to disk initialization");
+        drop(held);
+        let loaded = super::super::load_or_init_chain_for_ui_fast(settings).unwrap();
+        assert!(Arc::ptr_eq(&loaded.blocks, &chain.blocks));
+        assert!(Arc::ptr_eq(&loaded.utxos, &chain.utxos));
+    }
+
+    #[test]
+    fn hf132_committed_readers_do_not_wait_for_storage_writer() {
+        let fixture = Fixture::new("hf132-reader-lock");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let mut chain = ChainState::new_with_genesis(settings).unwrap();
+        extend(settings, &mut chain, 2);
+        initialize_new_chain(settings, &paths, &chain).unwrap();
+        let expected = chain.tip_hash();
+        let writer = super::super::storage_lock().lock().unwrap();
+        let copied_settings = settings.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let result = (|| -> Result<(Hash256, Hash256)> {
+                let ui = super::super::load_or_init_chain_for_ui_fast(&copied_settings)?;
+                let verified = super::super::load_or_init_chain(&copied_settings)?;
+                Ok((ui.tip_hash(), verified.tip_hash()))
+            })();
+            let _ = sender.send(result);
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        // Release before asserting, so even a regression can finish its worker.
+        drop(writer);
+        reader.join().unwrap();
+        assert_eq!(result.expect("committed read queued behind storage writer").unwrap(),
+            (expected, expected));
+    }
+
+    #[test]
+    fn hf132_ui_genesis_initialization_defers_to_storage_writer() {
+        let fixture = Fixture::new("hf132-initialize-busy");
+        let settings = &fixture.0;
+        let writer = super::super::storage_lock().lock().unwrap();
+        let result = super::super::load_or_init_chain_for_ui_fast(settings);
+        drop(writer);
+        assert!(result.unwrap_err().to_string().contains("initialization is busy"));
+        assert!(!NodePaths::from_settings(settings).fast_storage_exists());
+    }
+
+    #[test]
+    fn hf132_validated_candidate_adoption_matches_public_replay() {
+        let fixture = Fixture::new("hf132-validated-adoption");
+        let settings = &fixture.0;
+        let genesis = ChainState::new_with_genesis(settings).unwrap();
+        let mut local = genesis.clone();
+        extend(settings, &mut local, 1);
+        let mut sibling = genesis.clone();
+        extend(settings, &mut sibling, 1);
+        assert_ne!(local.tip_hash(), sibling.tip_hash());
+        let mut stronger = sibling.clone();
+        extend(settings, &mut stronger, 1);
+        for candidate in [genesis, local.clone(), sibling, stronger] {
+            for prefer_equal in [false, true] {
+                let mut replayed = local.clone();
+                let mut retained = local.clone();
+                let replay_result = replayed.try_adopt_peer_chain(
+                    candidate.blocks.as_ref().clone(), settings, prefer_equal).unwrap();
+                let retained_result = retained.try_adopt_validated_peer_chain(
+                    candidate.clone(), settings, prefer_equal).unwrap();
+                assert_eq!(retained_result, replay_result);
+                assert_eq!(retained.blocks, replayed.blocks);
+                assert_eq!(retained.utxos, replayed.utxos);
+                assert_eq!(retained.mempool, replayed.mempool);
+            }
+        }
+    }
+
+    #[test]
+    fn hf132_verified_disk_baseline_rejects_ui_only_utxo_state() {
+        let fixture = Fixture::new("hf132-validated-baseline");
+        let settings = &fixture.0;
+        let paths = NodePaths::from_settings(settings);
+        let mut chain = ChainState::new_with_genesis(settings).unwrap();
+        extend(settings, &mut chain, 1);
+        assert!(!chain.utxos.is_empty());
+        // A structurally coherent, checksummed persisted state is still not a
+        // consensus-validated baseline. Reproduce a wrong UTXO snapshot without
+        // corrupting the pointer checksum or block history.
+        chain.utxos = Arc::new(HashMap::new());
+        initialize_new_chain(settings, &paths, &chain).unwrap();
+        let original_pointer = fs::read(&paths.fast_pointer_file).unwrap();
+        let ui = super::super::load_or_init_chain_for_ui_fast(settings).unwrap();
+        assert_eq!(ui.height(), 1);
+        let verified = super::super::load_or_init_chain(settings);
+        assert!(format!("{:#}", verified.unwrap_err()).contains("UTXO mismatch after replay"));
+        assert_eq!(fs::read(&paths.fast_pointer_file).unwrap(), original_pointer);
+        assert!(!paths.fast_previous_pointer_file.exists());
+        assert!(!paths.fast_storage_lock_file.exists());
+    }
+
+    #[test]
+    fn hf132_validated_adoption_restores_local_tx_and_discards_peer_mempool() {
+        let fixture = Fixture::new("hf132-peer-mempool");
+        let settings = &fixture.0;
+        let mut wallet = WalletFile::new(&settings.network.name);
+        let address = Address::parse_with_prefix(
+            &wallet.create_key(settings, "funder", 0).unwrap().address,
+            &settings.network.address_prefix).unwrap();
+        let mut recipient_wallet = WalletFile::new(&settings.network.name);
+        let recipient = Address::parse_with_prefix(
+            &recipient_wallet.create_key(settings, "recipient", 0).unwrap().address,
+            &settings.network.address_prefix).unwrap();
+        let options = MiningOptions { duty_cycle_percent: 100, max_hashes: Some(5_000_000) };
+        let mut base = ChainState::new_with_genesis(settings).unwrap();
+        for _ in 0..3 {
+            let block = mine_next_block(&base, settings, &address, options).unwrap();
+            base.connect_block(block, settings).unwrap();
+        }
+        let local_tx = wallet.create_signed_transaction(&base, settings, &recipient,
+            Amount::from_str("1.00").unwrap(), Amount::from_str("0.00001").unwrap()).unwrap();
+        let peer_tx = wallet.create_signed_transaction(&base, settings, &recipient,
+            Amount::from_str("2.00").unwrap(), Amount::from_str("0.00001").unwrap()).unwrap();
+        let mut stale = base.clone();
+        stale.accept_transaction_to_mempool(local_tx.clone(), settings).unwrap();
+        let block = mine_next_block(&stale, settings, &address, options).unwrap();
+        stale.connect_block(block, settings).unwrap();
+        assert!(!stale.tx_in_mempool(local_tx.txid()));
+        let mut stronger = base;
+        extend(settings, &mut stronger, 2);
+        stronger.accept_transaction_to_mempool(peer_tx.clone(), settings).unwrap();
+        let mut public = stale.clone();
+        assert!(public.try_adopt_peer_chain(stronger.blocks.as_ref().clone(), settings, false).unwrap());
+        assert!(stale.try_adopt_validated_peer_chain(stronger, settings, false).unwrap());
+        assert_eq!(stale.mempool, public.mempool);
+        assert!(stale.tx_in_mempool(local_tx.txid()));
+        assert!(!stale.tx_in_mempool(peer_tx.txid()));
+    }
 }

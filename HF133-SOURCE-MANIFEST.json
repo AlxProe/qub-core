@@ -1,0 +1,908 @@
+{
+  "schema": "QUB-HF133-SOURCE-1",
+  "release": "HF133-v186",
+  "product_version": "1.8.6",
+  "preparation_revision": "daa-r4-h100000-native-candidate",
+  "files": {
+    ".cargo/config.toml": {
+      "bytes": 320,
+      "sha256": "da208f4d67e6b3de3a4b6920395694bfe8574f738b000ac1c817135a4b7d0a96"
+    },
+    ".gitattributes": {
+      "bytes": 163,
+      "sha256": "1cb86a75c0f0fb021223423fffd2666de008a06b20606a5aa5c61c7d616c16bc"
+    },
+    ".gitignore": {
+      "bytes": 148,
+      "sha256": "e3dfb06f30dcc2494e2c3686e3947626d39dd1caca94eefe22542e142087c67e"
+    },
+    "Cargo.lock": {
+      "bytes": 118859,
+      "sha256": "5dde61b1cbf5e73537356491265f44f33f94d128fa443f5d96597aad3b023b29"
+    },
+    "Cargo.toml": {
+      "bytes": 1451,
+      "sha256": "802ba2ef7c9f4c2a9bd7b68e60b70a12eed7d744496eaa1300a4487098f2c0c6"
+    },
+    "HF121-R3-REVIEW.md": {
+      "bytes": 3637,
+      "sha256": "74170a8d6b28abcb47dd8268bdcbeec2aa9831b40d37315ff9da717e4ee8654a"
+    },
+    "HF122-v179-DEPLOY-RUNBOOK.md": {
+      "bytes": 40211,
+      "sha256": "b8994fc3bc71c60a41631944c200ea101a41357268c65cdf8b5ccc5e388f311d"
+    },
+    "HF122-v179-SECURITY-REVIEW.md": {
+      "bytes": 7913,
+      "sha256": "857d985205ba848215a269ceb496c4bfd0ab9dfb268b1486e0d5a7fa90f81293"
+    },
+    "HF123-v180-DEPLOY-RUNBOOK.md": {
+      "bytes": 35174,
+      "sha256": "9af9d07743ae797b080c6de565f2f15bb52b853ef7287e01f7efdecb8cad4ef8"
+    },
+    "HF123-v180-ENTERPRISE-REVIEW.md": {
+      "bytes": 6163,
+      "sha256": "5694d1ce5f7e3ea16d083dec408165c343bcc685a15b4df9348c0ed48ca8ce8c"
+    },
+    "HF123-v180-EXPLORER-API-HOTFIX-r3.md": {
+      "bytes": 1089,
+      "sha256": "7d33dfb260f551e251f828123c69c950bd2e60494192ba87a4529eda15a01d61"
+    },
+    "HF124-v181-DEPLOY-RUNBOOK.md": {
+      "bytes": 44539,
+      "sha256": "1fddc43645dc48c25e9c3c5bc7dbfffcb16158231ea689cb6aa6d620dd8cf146"
+    },
+    "HF124-v181-RELIABILITY-REVIEW.md": {
+      "bytes": 9269,
+      "sha256": "d56bd8ce9cfe05baa6325a9e340c6d3a8a3a3e1f52cf413f38ae5bd7de339baf"
+    },
+    "HF125-v182-DEPLOY-RUNBOOK.md": {
+      "bytes": 40729,
+      "sha256": "8611f20c767cce2225ba1e55d8d6a8d8eb20fd537eac1dbeb9ea5622a3484a6f"
+    },
+    "HF125-v182-RELIABILITY-REVIEW.md": {
+      "bytes": 6333,
+      "sha256": "66416f48b448a49d1847b319bf3708e1c062d953c4106c9fd9c45d9d61263aa9"
+    },
+    "HF126-v182-DEPLOY-RUNBOOK.md": {
+      "bytes": 44139,
+      "sha256": "6e0b0df528357ed822eb1d7b558e27b72dcb6ab0ea19743326b541b10a429ecd"
+    },
+    "HF126-v182-RELIABILITY-REVIEW.md": {
+      "bytes": 5771,
+      "sha256": "ba1daafea3de290f338a6b4451d53da8b43314e23e54f90a2b977f80e351c2dd"
+    },
+    "HF127-v183-COMPILEFIX-r2.md": {
+      "bytes": 1144,
+      "sha256": "bbfc47297ef4dfdfd741c1ad926f6734b2e3a533939b450035bf32961a74739f"
+    },
+    "HF127-v183-DEPLOY-RUNBOOK.md": {
+      "bytes": 53040,
+      "sha256": "030ddaabd32b6a6d32d48f93057fb558b21efc9264be7291b781b651a868589c"
+    },
+    "HF127-v183-RELIABILITY-REVIEW.md": {
+      "bytes": 6431,
+      "sha256": "c326a37dc9441d7dbefc8cfeca51eb33f17a9500fc3a35c646422d6efaac4754"
+    },
+    "HF128-v184-DEPLOY-RUNBOOK.md": {
+      "bytes": 70686,
+      "sha256": "86164e475417e4d3eacd2abe8cd776ddc68796860c9bbdafa6245e429ca50465"
+    },
+    "HF128-v184-RELIABILITY-REVIEW.md": {
+      "bytes": 9611,
+      "sha256": "977940c8b4b9cbb23c87ffe282e7ab286e0f98e00e11ffe84aea7e2c15d82eb7"
+    },
+    "HF128-v184-r2-CANARY-RECOVERY.md": {
+      "bytes": 4409,
+      "sha256": "afe8d7a5d6e2290bca7a4a9d23f336490a8861793fb9de5b790632335da47f6b"
+    },
+    "HF128-v184-r3-WINDOWS-RELEASE-CORRECTION.md": {
+      "bytes": 1330,
+      "sha256": "68e4af15753e866c6a038c303915896c6fd4fce554a35f87c53b90a050f5aad7"
+    },
+    "HF129-v185-DEPLOY-RUNBOOK.md": {
+      "bytes": 54208,
+      "sha256": "43824f33f4522630aef9c83189e140294c6f50811efc69797b48ca726827d41e"
+    },
+    "HF129-v185-RELIABILITY-REVIEW.md": {
+      "bytes": 11361,
+      "sha256": "72bca83c865f88ead5810cdc4c12ea9f01124e6f4bf24e8e653a6f71b11ad9e0"
+    },
+    "HF129-v185-TELEGRAM-POST.txt": {
+      "bytes": 1742,
+      "sha256": "b5431b649b138e83f4c8472cf4e6246b444ebc0bdc2cbcdc85e1fc40c5447b2e"
+    },
+    "HF129-v185-TEST-REPORT.md": {
+      "bytes": 7742,
+      "sha256": "9dc4cb808b6fd987e258e749e282d9a190687bfb5937f89c246bba5dd5476ebe"
+    },
+    "HF130-v185-DEPLOY-RUNBOOK.md": {
+      "bytes": 75509,
+      "sha256": "477292d69ca9e843a665fc0f25e356e93018edb4c4d45cdd9e8ba621ed726e25"
+    },
+    "HF130-v185-RELIABILITY-REVIEW.md": {
+      "bytes": 8084,
+      "sha256": "9f200b89e9fb99f391415f056967777d85544685ad2b4f2bab30e15b827d35a2"
+    },
+    "HF130-v185-RUNBOOK-COMPARISON.md": {
+      "bytes": 8691,
+      "sha256": "ee0c13ece2c2ca9d9379f39b298f55ad1c601a74645e48696b09e799c39207b5"
+    },
+    "HF130-v185-TELEGRAM-POST.txt": {
+      "bytes": 1542,
+      "sha256": "a44ec77758b1680ee8913d5ef25d151d9338e4486d880a941bb0760e4adfdc32"
+    },
+    "HF130-v185-TEST-REPORT.md": {
+      "bytes": 4375,
+      "sha256": "985798a28731e1268fa77b836d43593861481461c1314c91577c3e0e855eeda7"
+    },
+    "HF131-v185-DEPLOY-RUNBOOK.md": {
+      "bytes": 62393,
+      "sha256": "2ee7ec4d6f300a2702861614ca2d8dbf1dbe5b25913e0f63fa594c920f002144"
+    },
+    "HF131-v185-RELIABILITY-REVIEW.md": {
+      "bytes": 6907,
+      "sha256": "3b5d425996a4425792c57622b09205a54f9bf00a3bad588bdc869b03827c59ed"
+    },
+    "HF131-v185-TELEGRAM-POST.txt": {
+      "bytes": 920,
+      "sha256": "ca6060fa659e0fb05580bcc46455019513830f8c205eb91ad86ecbb58adafab7"
+    },
+    "HF131-v185-TEST-REPORT.md": {
+      "bytes": 5738,
+      "sha256": "4ec84178d6ad4f20d2bc8f62d4fcc2e7977a5b3f0f9bcda97c293cd9ddbac4d1"
+    },
+    "HF132-v185-DEPLOY-RUNBOOK.md": {
+      "bytes": 65703,
+      "sha256": "4bdb16022df7ee1724cb2a550ebb3ba3a74e3059569a8667454741956e789255"
+    },
+    "HF132-v185-RELIABILITY-REVIEW.md": {
+      "bytes": 7018,
+      "sha256": "e7b5b4561c98597cf0177447d4b538a94d659616009b252dc670d646fffade78"
+    },
+    "HF132-v185-TELEGRAM-POST.txt": {
+      "bytes": 903,
+      "sha256": "070521bbc60f51ddc3c4e81922c3b9b0d8933eca48fbfa0788ba069e9b6009a7"
+    },
+    "HF132-v185-TEST-REPORT.md": {
+      "bytes": 7658,
+      "sha256": "823b49a483c58ce92e226788339e229e661e926679eb0bd29b2ea1d37ebc0b0b"
+    },
+    "HF133-CONSENSUS.md": {
+      "bytes": 5288,
+      "sha256": "fee2ce8a9e7e1f72dc062daf2cb907da1a2c6e8245dee38d0d334e7b5748bc5a"
+    },
+    "HF133-PUBLIC-RELEASE.md": {
+      "bytes": 4709,
+      "sha256": "106ae710be8696a959794c03115fe05dbe32a842fba5055dc4776c3036766e59"
+    },
+    "HF133-UPGRADE-METADATA-DRAFT.json": {
+      "bytes": 429,
+      "sha256": "f5c2f92bf5900409ec88353e9f927078c762899e25cc2bbf6ef3e7e9bec438d4"
+    },
+    "QUB-Automatic-Discovery-Production-Runbook-v1.0.0.md": {
+      "bytes": 2702,
+      "sha256": "c46ebd2db3ddc0cc828973bef63f718ebf396c99b9e233d6e1e9ae76782448fb"
+    },
+    "QUB-Explorer-v1.0.2-Runbook.md": {
+      "bytes": 3442,
+      "sha256": "3e345bd19566c8d7a06670c85811ae120f1a868652422afcfd60033e02e883f9"
+    },
+    "QUB-Explorer-v1.1.0-Runbook.md": {
+      "bytes": 4385,
+      "sha256": "9e3f35b1ef2b39203f840dbeee7a5f25377b2843cf72b91bb4d1a6b540fb2bfe"
+    },
+    "QUB-Hotfix11-LAN-Setup-Fix-v1.0.0.md": {
+      "bytes": 1859,
+      "sha256": "14f4217af8a7dc76863f3c331e576cc9239b4890395d7f52d82fdd32140e0519"
+    },
+    "QUB-Hotfix13-Mainnet-Seed-And-UX-Runbook-v1.0.0.md": {
+      "bytes": 2484,
+      "sha256": "e06ec420f464355723d42f40ee0e59ea355077e11c0a815e24b43ab1ad50f7ad"
+    },
+    "QUB-Hotfix22-v1.1.0-QNS-Explorer-Caddy-Runbook.md": {
+      "bytes": 4385,
+      "sha256": "9e3f35b1ef2b39203f840dbeee7a5f25377b2843cf72b91bb4d1a6b540fb2bfe"
+    },
+    "QUB-Hotfix23-v1.0.3-Installer-And-Autoupdate-Runbook.md": {
+      "bytes": 1449,
+      "sha256": "f5cb8b016602c5a7bd540a9247578b1e8e4c148ae80ea800b9c302b611385258"
+    },
+    "QUB-Hotfix25-v1.0.5-GUI-Performance-Runbook.md": {
+      "bytes": 1487,
+      "sha256": "d9784c3a47bd3294d18776dba8dccc572e291188cb9f8817fbc6500730df7166"
+    },
+    "QUB-Hotfix27-v1.0.7-Block-Stream-Runbook.md": {
+      "bytes": 2163,
+      "sha256": "981cb280c6382918dca2db8c9f6a619aafaa75e1c1f554987db0bb9b886911a8"
+    },
+    "QUB-Hotfix28-v1.0.8-Realtime-Miner-GUI-Runbook.md": {
+      "bytes": 1906,
+      "sha256": "72f00a5d29919a4533a84598ae66343c8f10e8ff60f82595b7b15229bf82c828"
+    },
+    "QUB-Hotfix30-v1.1.0-Manifest-Updater-Channel-Split-Runbook.md": {
+      "bytes": 2901,
+      "sha256": "c04266a73b018c12d2af6c39f2272c097267a670611c316df41a722a0660eacc"
+    },
+    "QUB-Hotfix31-v1.1.1-GPU-Alpha-Runbook.md": {
+      "bytes": 1740,
+      "sha256": "5612e188c34f7f53f6b8b803882b777a7191458e4d6c97374f62f4d856bd240a"
+    },
+    "QUB-Hotfix32-v1.1.2-OpenCL-GPU-Testnet-Runbook.md": {
+      "bytes": 1371,
+      "sha256": "dbadbe54bdc5468e99320f6806cdb3148db34b91e863548b8081c49fac1ba9af"
+    },
+    "QUB-Hotfix32D-v1.1.5-GPU-Midstate-Language-Testnet-Runbook.md": {
+      "bytes": 1003,
+      "sha256": "2ff8b6fd84d799d3f78e5c70d139ebe81b52bdc8660b9139b1c743ba640c009b"
+    },
+    "QUB-Hotfix32E-v1.1.6-GPU-Kernel-UI-Testnet-Runbook.md": {
+      "bytes": 713,
+      "sha256": "c76255d42d5a95b70850651d78f669764c38df5ed600f35cf148c7c383e679b9"
+    },
+    "QUB-Hotfix32F-v1.1.7-GPU-Device-Select-FirstSHA-Testnet-Runbook.md": {
+      "bytes": 1270,
+      "sha256": "cfbc97c18c48f8b4c37950bf313d6f1317c6c0c3d147eae328eeada9169c6349"
+    },
+    "QUB-Hotfix35-v1.2.0-Native-JIN-Testnet-Runbook.md": {
+      "bytes": 1719,
+      "sha256": "292f8733d11c0e05dfc20a1016ce6b987420235ef210c6461de9fea19f305104"
+    },
+    "QUB-Hotfix37-v1.2.2-GUI-Balances-Activity-Runbook.md": {
+      "bytes": 1316,
+      "sha256": "f742ad45b0cc554cafc863ade0ec4022dc386c2cb9aac7b8ce7be80739dbb462"
+    },
+    "QUB-Hotfix37B-v1.2.3-GUI-Recovery-Runbook.md": {
+      "bytes": 183,
+      "sha256": "52259fc592d6c8bde870a22bad5c3f737fdfd85421a3e84f921839323dff04ef"
+    },
+    "QUB-Hotfix37C-v1.2.4-GUI-Recovery-Runbook.md": {
+      "bytes": 260,
+      "sha256": "11b932b9cc9ca9dcb646c705a4a71e4b3f28688cf3fe1e7d36bef673fe2e0eea"
+    },
+    "QUB-Hotfix38-v1.2.5-JIN-Conversion-QNS-Split-Runbook.md": {
+      "bytes": 3900,
+      "sha256": "49c63828d4e9aab46415d1fd88d46e211944189dbdd7642f1ffad8d9b4fad452"
+    },
+    "QUB-Hotfix42-v1.2.9-GUI-Scroll-Matrix-Telemetry-Runbook.md": {
+      "bytes": 892,
+      "sha256": "d840716526cadf506daa9d677329254ba8acc998f28d19b40f6ea23b13765474"
+    },
+    "QUB-Hotfix44-v1.3.0-Pooled-Mining-Runbook.md": {
+      "bytes": 4565,
+      "sha256": "5d07ed45b6c31ba11b75e14c18b884b90ade68f0cd887c112b04f7a4b948c240"
+    },
+    "QUB-Hotfix46-v1.3.1-Full-Pools-GUI-Runbook.md": {
+      "bytes": 3375,
+      "sha256": "d530be62195c20fd7330c3e0370f10d03c53bcf7d675388052a8ba44b1740291"
+    },
+    "QUB-Hotfix47-v1.3.2-Pool-First-GUI-Runbook.md": {
+      "bytes": 2649,
+      "sha256": "93fe5e7680245b7304225792421b31cfaf9ab4af54e12d0023977431a680a167"
+    },
+    "QUB-Hotfix49-v1.3.3-Fork-Safety-Runbook.md": {
+      "bytes": 1658,
+      "sha256": "68a27fd8b8ab1c030b98e0735e828a655b9c0bea3be7c2326e5eb569bc159036"
+    },
+    "QUB-Hotfix8-Install-And-LAN-Runbook-v1.0.0.md": {
+      "bytes": 4686,
+      "sha256": "f99ff8cc1c07372891b722c21d3d79ad7b0b4a475a1be2631e4dec086e630d2b"
+    },
+    "QUB-LAN-Rehearsal-Runbook-v1.0.0.md": {
+      "bytes": 1640,
+      "sha256": "1f1f403e0cb2da396c201c98a155a17526dc05706117ab950dc4cd3e0ecef4fc"
+    },
+    "QUB-Mainnet-Release-Readiness-v1.0.0.md": {
+      "bytes": 2227,
+      "sha256": "a30447217e2488526968d7a14b3ed93590074f46483d8fdbd01d10953beba57c"
+    },
+    "QUB-Production-Go-Live-Runbook-v1.0.0.md": {
+      "bytes": 2760,
+      "sha256": "2e6736090ca75749e82e5be881a9d469cc980bdf913b34a1d352c9511fd5e1ce"
+    },
+    "QUB-Public-Release-Checksums-and-Signing-v1.0.0.md": {
+      "bytes": 2338,
+      "sha256": "832e760935ee07e9fb1e9d425c8c4a7e4fcb2cd83900a23f1461c09061e10b49"
+    },
+    "QUB-Seed-Node-Runbook-v1.0.0.md": {
+      "bytes": 3224,
+      "sha256": "fbbc0e727de3d5e5d66f792ecb31084e2ecb1ab4c6564b594c5c37bd93cb2c2f"
+    },
+    "QUB-Windows-Code-Signing-v1.0.0.md": {
+      "bytes": 1706,
+      "sha256": "0f8502c6054dfb72553881e2381c8862f1ec9e920700eb34ffa2fb9eddc762ed"
+    },
+    "README-FAST-CHAIN-ENGINE.md": {
+      "bytes": 4151,
+      "sha256": "70ea26dabfbdd1c4b43763b4442e545123ed272f2e3c2e0f782cce1557abe5e3"
+    },
+    "README-MINER-WINDOWS.md": {
+      "bytes": 2735,
+      "sha256": "265b1cfa370e9abec2ed213ca237a1d5197a36792cea2bce927c0edf4fecfcc6"
+    },
+    "README-RPC-MINER.md": {
+      "bytes": 5004,
+      "sha256": "2f71d09753b0ae8440d648af144d9e38e4b765a807175b8fbbc8b7befcf938cc"
+    },
+    "README.md": {
+      "bytes": 4648,
+      "sha256": "19079a6e3bf3c07955455564df8b166d9db93d439b71dbf88af2ad57da4f7224"
+    },
+    "RELEASE_NOTES-v1.7.6-HF118.md": {
+      "bytes": 1433,
+      "sha256": "511d6220752050f1964b57ab2890c0779229ec0884f94653d6de8ca8c3aa696e"
+    },
+    "RELEASE_NOTES-v1.7.6-HF119.md": {
+      "bytes": 2140,
+      "sha256": "bbaf8bccd3ee95b84211382d1dcbff222092c88085a8dc53ef7cc7ac036dcf9d"
+    },
+    "RELEASE_NOTES-v1.7.7-HF120.md": {
+      "bytes": 1443,
+      "sha256": "a9acddca7272204c8b4add486fe119cb7107779ebaece279860c4ebdb74f56af"
+    },
+    "RELEASE_NOTES-v1.7.8-HF121.md": {
+      "bytes": 3016,
+      "sha256": "0bb6063f9721178efb3ff9fb1e1821e1f2e255c1a359fa9ac384bbad754d9006"
+    },
+    "RELEASE_NOTES-v1.7.9-HF122.md": {
+      "bytes": 3569,
+      "sha256": "2f4f204ec8684ffc4ecee3cff0eee73554c469da16dff73aa5b1dc6225e2f9a2"
+    },
+    "RELEASE_NOTES-v1.8.0-HF123.md": {
+      "bytes": 2747,
+      "sha256": "9d3beb230c4c3a50739c52db39f9060563b2edac3c503957b332130321612565"
+    },
+    "RELEASE_NOTES-v1.8.1-HF124.md": {
+      "bytes": 4139,
+      "sha256": "47f08a3fc511bb051910b83250dd6275edb4025b82c880ba1e122e9187ca192b"
+    },
+    "RELEASE_NOTES-v1.8.2-HF125.md": {
+      "bytes": 3266,
+      "sha256": "2f845fb16a973ca9aaed282a1791320b96cc2ff8cad8496c3e4bae83ef4a03ae"
+    },
+    "RELEASE_NOTES-v1.8.2-HF126.md": {
+      "bytes": 3228,
+      "sha256": "a2b5af38953f3ea4f925f0942c19211952709b224ee771e73154501f8a15e883"
+    },
+    "RELEASE_NOTES-v1.8.3-HF127.md": {
+      "bytes": 4364,
+      "sha256": "dab27db4131a5e0d8d42e84255daf4e952b54401733daf5c5c6905226559d5d9"
+    },
+    "RELEASE_NOTES-v1.8.4-HF128.md": {
+      "bytes": 7470,
+      "sha256": "a73d34cd7dff91623fd64787edd36feb6a1e04d651949838ffb0639ceb4c5145"
+    },
+    "RELEASE_NOTES-v1.8.5-HF129.md": {
+      "bytes": 6594,
+      "sha256": "e1cace584de169e5831771b2f724daae4110c8784c914dc961991599c4a5fea6"
+    },
+    "RELEASE_NOTES-v1.8.5-HF130.md": {
+      "bytes": 5818,
+      "sha256": "760fb0f5cfba4ebbc7ddc51b31b58d304aa79e6aa9154b8f2d07e69ba75f8334"
+    },
+    "RELEASE_NOTES-v1.8.5-HF131.md": {
+      "bytes": 1792,
+      "sha256": "2b54a48dc35f9d6045d888262333571cad8347c051834a4520f72fcbe03eafdb"
+    },
+    "RELEASE_NOTES-v1.8.5-HF132.md": {
+      "bytes": 2543,
+      "sha256": "ba6437e0b688f433ec4491ec00d5cf366a14728358578adcb2d4061a6503f5bc"
+    },
+    "RELEASE_NOTES-v1.8.6-HF133.md": {
+      "bytes": 1280,
+      "sha256": "0ce3ce227057223964acf84441a00da722ea2bdd345a251461203ab1907b388d"
+    },
+    "assets/README.md": {
+      "bytes": 348,
+      "sha256": "596b2e633accaf54feed37f392105ffeab7ee3cec8ee9b02ef7bc79f3fe04c28"
+    },
+    "build.rs": {
+      "bytes": 2398,
+      "sha256": "0ef9ffef4a42c5f5680c69b99ea1a2394fe944bb324de3c3e4741cdf6fa13493"
+    },
+    "config/headless-mainnet.toml": {
+      "bytes": 3774,
+      "sha256": "9c419030df84b4cf97252c916270134efe2acadc2c22cb2f1a407866e89f5300"
+    },
+    "config/mainnet-launch-template.toml": {
+      "bytes": 3305,
+      "sha256": "7d3ef6d29e77a57ad348fc79364fecae6c0012b6b7fe35f97929c9dd54aad6ed"
+    },
+    "config/mainnet.toml": {
+      "bytes": 3725,
+      "sha256": "d5542bc3619650e1c946435c8433ad876fa776fb0044e1259d9ca198db2659ed"
+    },
+    "config/regtest-lan.toml": {
+      "bytes": 2849,
+      "sha256": "5b81c366825eb5d2e1b988d0013bddfcd23415fe1b3a385bd2c7ed497b31386b"
+    },
+    "config/regtest-seed-template.toml": {
+      "bytes": 3046,
+      "sha256": "fa087c4387118a993928066eef06ddee16926390bdc78162354f128d062cb198"
+    },
+    "config/regtest.toml": {
+      "bytes": 3110,
+      "sha256": "bfaba9dc5ed2c04cc747f9cca42d698ef0dba29e657b86bf6b76ebd04b7b6dfa"
+    },
+    "config/testnet.toml": {
+      "bytes": 3172,
+      "sha256": "dddb662581ba451af762e1ba066948a34a63d99ba307f0c1e9e568415643b845"
+    },
+    "deploy/digitalocean/Caddyfile.qub-explorer-api": {
+      "bytes": 606,
+      "sha256": "6eb8270359683fb6110e1619ef13a848c4fb5cbc89770561ed3d54bcf557b38b"
+    },
+    "deploy/digitalocean/Caddyfile.qub-updates": {
+      "bytes": 1269,
+      "sha256": "07a26f5e187a7d86e8f033ee4fed75d58d4f62638bbbaec75366576f5ac5ad18"
+    },
+    "deploy/digitalocean/README-explorer-caddy.md": {
+      "bytes": 873,
+      "sha256": "332e6af8bc3543be04304191824b563f80a382dcbd92fdcd5f3312ebcbf39b5b"
+    },
+    "deploy/digitalocean/README-seed-droplet.md": {
+      "bytes": 2293,
+      "sha256": "7cf63fa1ddd07d8adbc5c92e7e90b89dcf8baf8ddbac573a89d31cba2af815c8"
+    },
+    "deploy/digitalocean/generate-rpc-token.sh": {
+      "bytes": 731,
+      "sha256": "e9b6eea7f500255fd46fbb5b2acf73230174f771437ad0e187769a5907326261"
+    },
+    "deploy/digitalocean/headless-miner.env.example": {
+      "bytes": 270,
+      "sha256": "5dc73c6808a88a450da0c67e34c52a78113cfbc8572fd3fde66e1cdce3cd59cc"
+    },
+    "deploy/digitalocean/hf132-release-common.sh": {
+      "bytes": 1259,
+      "sha256": "4772cc941f5df8fa8a896bfcb3b5f4a16ab947ac3bbaaea8793f7fe53de3b487"
+    },
+    "deploy/digitalocean/install-explorer-api-service.sh": {
+      "bytes": 1338,
+      "sha256": "dc9348cd7939c0986f09318a0201c5689ddbb511895ce01fccbe4c46aa766596"
+    },
+    "deploy/digitalocean/install-hf130-explorer-api.sh": {
+      "bytes": 3331,
+      "sha256": "89b541cbc932d8d5e49287fd76079a0f804e5ac7bafb3d5429cabac4bb71f56f"
+    },
+    "deploy/digitalocean/install-hf130-seed.sh": {
+      "bytes": 8706,
+      "sha256": "c00f02f4ed2a10304779bc8ad2699a7e11da3331e31e43406cb5c67a5ec80c32"
+    },
+    "deploy/digitalocean/install-hf132-explorer-api.sh": {
+      "bytes": 3459,
+      "sha256": "58fbcba465b9434102d8be2c9b67873e74339ead1bf00b08dc0b94fa51acb93e"
+    },
+    "deploy/digitalocean/install-hf132-seed.sh": {
+      "bytes": 8992,
+      "sha256": "db49531688ca18a4dda7ffc057d03a10fd0dafa3fbf88ccb60c8db25e946fe26"
+    },
+    "deploy/digitalocean/install-seed-services.sh": {
+      "bytes": 1083,
+      "sha256": "0633a6871b4b20e5c80d5fe54a65d7e157bffa960cf186e0bce1371e8eb7e49d"
+    },
+    "deploy/digitalocean/mainnet-seed-ams3.toml": {
+      "bytes": 3453,
+      "sha256": "22177a5073f4bc9a609c0f961e9f369a6f31a37cb3be5d3d958a89b8b3829b86"
+    },
+    "deploy/digitalocean/mainnet-seed-nyc3.toml": {
+      "bytes": 3453,
+      "sha256": "caeadb9ed81108afe0a1d569a119d3017950c4e509e7f02d6e870eca3f20fdc4"
+    },
+    "deploy/digitalocean/mainnet-seed.toml": {
+      "bytes": 3741,
+      "sha256": "906d47f4a78d5a71c5bf91779cc2fcb184a34f834e44e78bf144d72be346619e"
+    },
+    "deploy/digitalocean/nginx-qub-explorer-api.conf": {
+      "bytes": 763,
+      "sha256": "f3e92cfe5029fddc6fa495eb4fb8446093416cfcbfc3f98950ec9d8be8406882"
+    },
+    "deploy/digitalocean/publish-hf130-windows-release.sh": {
+      "bytes": 4632,
+      "sha256": "387f4623e2eedf1d3246ebda590b44aa705c9bd080c6f7e3609c491eafa36bc5"
+    },
+    "deploy/digitalocean/publish-hf132-windows-release.sh": {
+      "bytes": 6294,
+      "sha256": "5732e6f63f6949b658b0d56d01fe9de259b12c2efb697ff705a2aec1c405b581"
+    },
+    "deploy/digitalocean/publish-mainnet-snapshot.sh": {
+      "bytes": 21112,
+      "sha256": "fc0cedf495e0b50272ccfd5bb99488e89b158e7b647fdea78674a3a12f564cd5"
+    },
+    "deploy/digitalocean/qub-headless-mainnet.service": {
+      "bytes": 1020,
+      "sha256": "932afb6aee2f3c87cb294aaddc474408cf045b9c08f330523cd0a8d2c87ffced"
+    },
+    "deploy/digitalocean/qub-mainnet-snapshot-publish-hf132.service": {
+      "bytes": 1107,
+      "sha256": "bbd0eb85c50eeb20f8718810615e3f9e2368ab7e3c56294527cd9c95b8b62c29"
+    },
+    "deploy/digitalocean/qub-mainnet-snapshot-publish-hf132.timer": {
+      "bytes": 245,
+      "sha256": "d4686b42b54c05474cf0e207b93ad17db9208beb364bc1deac63c9fe7ff31ec0"
+    },
+    "deploy/digitalocean/qub-mainnet-snapshot-publish.service": {
+      "bytes": 1107,
+      "sha256": "4e8909839736eca8ed5f0ee66ee8685c9767489c6818187426a71b78118c731d"
+    },
+    "deploy/digitalocean/qub-mainnet-snapshot-publish.timer": {
+      "bytes": 245,
+      "sha256": "1d8e1755a02cb511b5d09f6447c998a772a3a7485f4e0d4858d2b6a6466a6b13"
+    },
+    "deploy/digitalocean/qub-rpc-miner-solo.service.example": {
+      "bytes": 940,
+      "sha256": "5fc1e9dbd06150c90e02b1aee0783962d68cae07e36f2390512d432569d7cfba"
+    },
+    "deploy/digitalocean/qub-seed-mainnet.service": {
+      "bytes": 434,
+      "sha256": "4afc44eef10a922509f4565550c73c38f4af34e77aadc84b3309be26c15dffcd"
+    },
+    "deploy/digitalocean/qub-seed-testnet.service": {
+      "bytes": 434,
+      "sha256": "d5939d84de3b68e852d9448b73b4e4481e33535b469d9f0a44e4b0acca6fe51a"
+    },
+    "deploy/digitalocean/rollback-hf130-seed.sh": {
+      "bytes": 3114,
+      "sha256": "03c886ec12269102ab067ce45047ba49d118db74728aa6298e9cefed36854497"
+    },
+    "deploy/digitalocean/rollback-hf132-seed.sh": {
+      "bytes": 3185,
+      "sha256": "fa7e0b2b71498646051c5a63031515e1516ea2c51dfa0c7d7321381c5e3044cf"
+    },
+    "deploy/digitalocean/test-hf132-deployment.py": {
+      "bytes": 10168,
+      "sha256": "89eb1d19d83e6be5c9a0af3d775523372f9881c3669d1c8bde7e065f544f853e"
+    },
+    "deploy/digitalocean/test-publish-mainnet-snapshot.sh": {
+      "bytes": 15380,
+      "sha256": "9cce3c984471c3e1923bb58d6a86497416736aa2a3d47639de4713a704eaf772"
+    },
+    "deploy/digitalocean/testnet-seed.toml": {
+      "bytes": 2955,
+      "sha256": "8ff98c03c5c6e2981c1dc0d88059a0947ddcf9f3a4b4eb3b552120060ee6bd34"
+    },
+    "ethereum/eurj/README.md": {
+      "bytes": 833,
+      "sha256": "c8fa26cceb9fa12fcfa51c66f8adef11bc20aef8f36bbb8c4bdb4c1f74e175b8"
+    },
+    "ethereum/eurj/foundry.toml": {
+      "bytes": 176,
+      "sha256": "1bbb4402cec63111dcc2f501fc845d5e00427ef09000b93012c112d7076d67a2"
+    },
+    "ethereum/eurj/scripts/deploy-eurj-anvil.ps1": {
+      "bytes": 2322,
+      "sha256": "8bc4d74546e194c646a3683e1870fc91f256633ea8578f1c5152d9550cb0d2e6"
+    },
+    "ethereum/eurj/scripts/deploy-eurj-contracts.ps1": {
+      "bytes": 1719,
+      "sha256": "c5adebde352fc3cbc6198f2386e8be588872aeebcff331a3cfce0a06453bdaf3"
+    },
+    "ethereum/eurj/src/EURJReserveVault.sol": {
+      "bytes": 8592,
+      "sha256": "48f608904c7a8fdf3ce8a22b2b6d114078d600f158d24f283a1e072059127dbf"
+    },
+    "ethereum/eurj/src/JinexEUR.sol": {
+      "bytes": 4406,
+      "sha256": "224fe71d2d2f0fa23483bc5acbe50c8d7e584e44b000258ae64402b3b45b9137"
+    },
+    "ethereum/eurj/src/MockERC20.sol": {
+      "bytes": 1857,
+      "sha256": "89453a226cbe6a6be0c63be0643088897f56f754394d1d2d1f7119860742738a"
+    },
+    "ethereum/eurj/test/EURJPooledReserve.t.sol": {
+      "bytes": 2170,
+      "sha256": "4eaa30dc6c27166ed5fcdbb2797c25c5b36b9fba137fca4a789cc83e1dec8716"
+    },
+    "ethereum/usdj/.env.example": {
+      "bytes": 297,
+      "sha256": "08c26f1bdf51adbbbe4989953e17ed50deb079df7c39285680de12a401741dfd"
+    },
+    "ethereum/usdj/README.md": {
+      "bytes": 2508,
+      "sha256": "8932f5fc0710b672931833416d8a7198f457e3e694b6680a773ae0b6a9d5a9ac"
+    },
+    "ethereum/usdj/foundry.toml": {
+      "bytes": 176,
+      "sha256": "1bbb4402cec63111dcc2f501fc845d5e00427ef09000b93012c112d7076d67a2"
+    },
+    "ethereum/usdj/scripts/deploy-usdj-anvil.ps1": {
+      "bytes": 2461,
+      "sha256": "a830feefadf74df8f1e11fe4a8526eebaec40badb23f11829e958053c3511ab1"
+    },
+    "ethereum/usdj/scripts/deploy-usdj-bridge-anvil.ps1": {
+      "bytes": 873,
+      "sha256": "a29aa288bfc862347332bac386ac782004fe40a886a991fed0a0dfc66d1171b8"
+    },
+    "ethereum/usdj/scripts/deploy-usdj-bridge-contracts.ps1": {
+      "bytes": 958,
+      "sha256": "89dc010a07bf38feaa00a6a48a95d680a9b8789b639ab04a2567a1985e8ac709"
+    },
+    "ethereum/usdj/scripts/deploy-usdj-contracts.ps1": {
+      "bytes": 1678,
+      "sha256": "b81dbfd7956f5725189068ce9cfbed88bf4642e981f0f2dce58d0d1398009ba8"
+    },
+    "ethereum/usdj/src/JinexUSD.sol": {
+      "bytes": 4406,
+      "sha256": "1a77d13728ea59fce69f9fc8b04cc52fb76ac0f7a0d338787ffec46bb7ad12b3"
+    },
+    "ethereum/usdj/src/MockERC20.sol": {
+      "bytes": 1826,
+      "sha256": "5ac30e33bdf30a6e15d2832b953a2a82baa592e9061055c74be9961c3e193028"
+    },
+    "ethereum/usdj/src/USDJBridgeGateway.sol": {
+      "bytes": 6360,
+      "sha256": "c318f4911a9d3a283021a9c7e2d7e750f88d0a5f1d831f31db24a8040bed971e"
+    },
+    "ethereum/usdj/src/USDJReserveVault.sol": {
+      "bytes": 7893,
+      "sha256": "52c4b3e12f1acbee575a79e9e1e1f349b8ed07c6435370d9cb30dab14cc474f0"
+    },
+    "ethereum/usdj/test/USDJPooledReserve.t.sol": {
+      "bytes": 3462,
+      "sha256": "1bb816883feb15ca6bd332cd2c0c32847f4db5aca428c417175409fbc44f2820"
+    },
+    "ethereum/xauj/README.md": {
+      "bytes": 458,
+      "sha256": "49b3d6d68b89c4c9cd337019d0f738017702994015b76892350cb2218df9ebc9"
+    },
+    "ethereum/xauj/foundry.toml": {
+      "bytes": 176,
+      "sha256": "1bbb4402cec63111dcc2f501fc845d5e00427ef09000b93012c112d7076d67a2"
+    },
+    "ethereum/xauj/scripts/deploy-xauj-anvil.ps1": {
+      "bytes": 2342,
+      "sha256": "8eb6b2e8ab74493e9a58893f855555db25a03fa49047ace0bc800db212ba12cd"
+    },
+    "ethereum/xauj/scripts/deploy-xauj-contracts.ps1": {
+      "bytes": 1678,
+      "sha256": "e6050d4afcc1dced992f954dcf5dbac50fba3e2d1a301ad7fcf3d40f6c9dc49a"
+    },
+    "ethereum/xauj/src/JinexGold.sol": {
+      "bytes": 4281,
+      "sha256": "c6fe33061c0d501427a12adec95de47b24d8aed9d1515c883beedc8148e76746"
+    },
+    "ethereum/xauj/src/MockERC20.sol": {
+      "bytes": 1857,
+      "sha256": "89453a226cbe6a6be0c63be0643088897f56f754394d1d2d1f7119860742738a"
+    },
+    "ethereum/xauj/src/XAUJReserveVault.sol": {
+      "bytes": 8492,
+      "sha256": "16e2edbdaa60b053745b9f72c0c83e7e4cbef3d839c429d61314a25a8a936636"
+    },
+    "ethereum/xauj/test/XAUJPooledReserve.t.sol": {
+      "bytes": 2746,
+      "sha256": "51a748c1d0351ba7bbd4e6498a0570949cfff3e3580c057aa784d49bd38bdda2"
+    },
+    "explorer/README_DEPLOY_v0_2.md": {
+      "bytes": 417,
+      "sha256": "a92305986c72e682a19f7492dae12c129dc03cc5df28ff270e2b7f4a03e657c7"
+    },
+    "explorer/README_DEPLOY_v0_6.md": {
+      "bytes": 1803,
+      "sha256": "f0a7169382b2d9e202b2fc7c2593817f0210b9d668a51c60160ca52d674f9a7a"
+    },
+    "explorer/README_DEPLOY_v0_7.md": {
+      "bytes": 1334,
+      "sha256": "0933e2997cd936779f18b8ae3acdd70913b3279184ec1f9a0ee480ea9fe2689b"
+    },
+    "explorer/public/_headers": {
+      "bytes": 205,
+      "sha256": "320f4eb134636b5ddbbdcafdb8413c3b0874308c26fe7b25e965d1e8b21342e3"
+    },
+    "explorer/public/assets/README.md": {
+      "bytes": 186,
+      "sha256": "6adfb29fd80e7a94786312ca52b84a5ae1290fabb0956ac485c957ed1926d74e"
+    },
+    "explorer/public/index.html": {
+      "bytes": 120807,
+      "sha256": "e32bc12656e48e21bfa47063bc035578d494615ab37f41b03c7d5f55c54ab6c5"
+    },
+    "installer/QUB-Core.iss": {
+      "bytes": 3007,
+      "sha256": "12e53e14361c1aedb06c1844ca9b930593b24955d014c4e447d05d768507c32f"
+    },
+    "scripts/build-explorer-pages.ps1": {
+      "bytes": 813,
+      "sha256": "2396c540edae1170a265714802c1a1ba41c7a05288a1ada02fae44c33e70a473"
+    },
+    "scripts/build-windows-release.ps1": {
+      "bytes": 24703,
+      "sha256": "d363ee5d94ce5d3c852598f5e3aa28442fe120cfa410ed071f38b7af07120dec"
+    },
+    "scripts/export-hf130-source.py": {
+      "bytes": 1644,
+      "sha256": "d9efadb20be73cc06e5f21fe5737d88c6fbda6ccffc9508c465a23ba80b0859d"
+    },
+    "scripts/export-hf132-source.py": {
+      "bytes": 1590,
+      "sha256": "cece35d75cf3f80e3bad881451660515ec4b3153e183122eabf4ea925657a10d"
+    },
+    "scripts/hf130_source_policy.py": {
+      "bytes": 10932,
+      "sha256": "be6846ca75d71e5a17a3a7d33feb30f42509d331b03977c2c92f7b4dbe0b1c1d"
+    },
+    "scripts/hf132-check-public-state.py": {
+      "bytes": 13824,
+      "sha256": "a53de1af7b3ec05cb06c62deb7ff21e8aa5107e875fc890012ff8b59aa745a13"
+    },
+    "scripts/hf132-mainnet-smoke.py": {
+      "bytes": 20423,
+      "sha256": "cabb6eafd213221f8996bb6a325bbd47fe27e2ac522f12407491e417ddfdf511"
+    },
+    "scripts/hf132-native-build.py": {
+      "bytes": 12926,
+      "sha256": "02242968cb9669946e6b64aa763809b5419d5c74014e499d79539b8bfddd7e19"
+    },
+    "scripts/hf132-prepare.py": {
+      "bytes": 7594,
+      "sha256": "770eead0475978e6f3b3ef0edb9bd03ac2bb4ced018462a12fe491037efb26d1"
+    },
+    "scripts/hf132_source_policy.py": {
+      "bytes": 15163,
+      "sha256": "72ac221cd2582a979773656eebf52ce1ba266a6759f4158e429237818133b715"
+    },
+    "scripts/hf133_daa_reference.py": {
+      "bytes": 3325,
+      "sha256": "27997b613d1b89f53d8b683ca41548c94e83cf972d191b73c8c905c524172e25"
+    },
+    "scripts/hf133_source_policy.py": {
+      "bytes": 3917,
+      "sha256": "d5aeac24e24d0cec5f64689ba6c96ee8b639ea22bb153d6365ab686c4dc5fb54"
+    },
+    "scripts/package-hf130-source.py": {
+      "bytes": 3533,
+      "sha256": "82cfa10bd2fea8a8e0b0b1043d38ecafdfff8d0a23084a46e9d2487a111bd53b"
+    },
+    "scripts/package-hf132-source.py": {
+      "bytes": 5176,
+      "sha256": "d46bed5f744fb83bcedd60fa40c0811b63400c8ac53b05a4fb3105f2bd4350ff"
+    },
+    "scripts/test-hf122-rpc-regtest.py": {
+      "bytes": 11752,
+      "sha256": "c8ae2997ac80efc66a8feaf7161c1f10f059532d8e9a128bc27abad723e7d773"
+    },
+    "scripts/test-hf123-fast-chain-regtest.py": {
+      "bytes": 12366,
+      "sha256": "c98092c095ae397f8bf5794e787bb6a6c2d864eaece291cdb5196612fb55e77b"
+    },
+    "scripts/test-hf123-rpc-regtest.py": {
+      "bytes": 11752,
+      "sha256": "cb6e9131a98bac81f9762323e238d1dc8052b473bbb981020c17359963ee6105"
+    },
+    "scripts/test-hf125-block-relay-regtest.py": {
+      "bytes": 12626,
+      "sha256": "5d89f5943b755de5a6864b5b033d4b5eee8065d3c8cbfb7198c8027f482ef97b"
+    },
+    "scripts/test-hf126-equal-height-fork-regtest.py": {
+      "bytes": 12467,
+      "sha256": "98cac386a915c04b8b5ec80f5ff931c6e264750095695afce6f3f76b2a22a053"
+    },
+    "scripts/test-hf127-tx-delivery-regtest.py": {
+      "bytes": 15625,
+      "sha256": "8a1162ca62394c545450e5eee3c2dea02daa2492cbffd5f38f0333e185412af5"
+    },
+    "scripts/test-hf129-source-contracts.py": {
+      "bytes": 331,
+      "sha256": "ed80d073d71832c8af726941ff30384e2ffd5a4de1796ab6ae649d757470f4ae"
+    },
+    "scripts/test-hf130-native-tests.py": {
+      "bytes": 6584,
+      "sha256": "73209e128efb330353e7cceba6551da736fac77e3f6add2e112e51201189bab5"
+    },
+    "scripts/test-hf130-package-policy.py": {
+      "bytes": 7147,
+      "sha256": "0dcfe7e9e39340b44fc69e322fdf0c305d422952ab54963a5c1ab8742bc7b59e"
+    },
+    "scripts/test-hf130-source-contracts.py": {
+      "bytes": 904,
+      "sha256": "4757f69c309bb435545480e06618e1c35b8b4b0bcd26a6be877753bbe1489407"
+    },
+    "scripts/test-hf132-mainnet-smoke.py": {
+      "bytes": 14505,
+      "sha256": "4dbc5f824591a60129147f4e049fb9a22419935a98744774d50dd233e79e51af"
+    },
+    "scripts/test-hf132-native-build.py": {
+      "bytes": 9146,
+      "sha256": "5bd8e0e11819a677b1e2ea4fb051ab397d13ed71e1d7ab219a77db67387541c9"
+    },
+    "scripts/test-hf132-native-tests.py": {
+      "bytes": 10413,
+      "sha256": "75e63dc11ebfbbe36f2662d7929d17ebc374d3656f34592334d2e71bf86ba8b0"
+    },
+    "scripts/test-hf132-package-policy.py": {
+      "bytes": 14413,
+      "sha256": "6e605501a61ab73c0bf2bc1a74d8fd165d211a1477124925305dbba01ea0f6c5"
+    },
+    "scripts/test-hf132-prepare.py": {
+      "bytes": 7869,
+      "sha256": "83135c8197cdd7d4de45b74fea9fcff7fedcfa035af95fe34c040086c7a8f11c"
+    },
+    "scripts/test-hf132-public-state.py": {
+      "bytes": 10687,
+      "sha256": "d5c6b13d1290892847a318824ed6617269265e468a680ed20b7244178d1f2dd6"
+    },
+    "scripts/test-hf132-source-contracts.py": {
+      "bytes": 904,
+      "sha256": "0a1bb2944b00e6fa450a1592b8a994a2ed5e0a5fe68d3690f11ff0d504449ddb"
+    },
+    "scripts/test-hf133-model.py": {
+      "bytes": 2671,
+      "sha256": "df436891d9c725042d7b86e2cefe87efb0637f8b840045ffe0f79b389d5f60d4"
+    },
+    "scripts/test-hf133-offline.py": {
+      "bytes": 4871,
+      "sha256": "f396e9ae5e5605357af4bd616086781eb2d160955b0f937fe573d04f165331e3"
+    },
+    "scripts/verify-hf130-windows-release.ps1": {
+      "bytes": 5707,
+      "sha256": "7a170b5e2a2b8708df6dc1d1addcec1bc954938d40a603b7f1fa01043b7e7442"
+    },
+    "scripts/verify-hf132-windows-release.ps1": {
+      "bytes": 8236,
+      "sha256": "e0ddaebf019f972bbf5c995d370dac08ad393f151ef8a1a4ac8865da47c21a8b"
+    },
+    "src/bin/qub_core.rs": {
+      "bytes": 872458,
+      "sha256": "3738149e2cdf2f38b8a5dc2ae2f92a8abacecf28092993d7ae6764281cede53d"
+    },
+    "src/bin/qub_rpc_miner.rs": {
+      "bytes": 23200,
+      "sha256": "96f0acc95b38387a9de2e36da34d937d6aca70d1c3a6591558d3f9c0a8cd2ff1"
+    },
+    "src/daa_v3.rs": {
+      "bytes": 17635,
+      "sha256": "cdf85ca5526cd1f956ef984c3e03c21b87835d088b01ce2082b91673ff5b51d6"
+    },
+    "src/fast_storage.rs": {
+      "bytes": 100250,
+      "sha256": "0a0048c5fbe3304766a73d907948ed34ce1586ca1b571d3f7b9516c2ee0eac17"
+    },
+    "src/gpu_miner.rs": {
+      "bytes": 41428,
+      "sha256": "75849063733f2c2c35c9d62ad83d7fa705fab84cefb1450896a5a4da928080d9"
+    },
+    "src/lib.rs": {
+      "bytes": 392455,
+      "sha256": "2e1bd8ee99850c9b6a72912246f94d03db483630ee65b1e76490791a7bf87dea"
+    },
+    "src/main.rs": {
+      "bytes": 156211,
+      "sha256": "1dc8ebde63e0e0229d63c8f97e9829d1b431a2e65d7cfab751a24826247cdecc"
+    },
+    "src/p2p.rs": {
+      "bytes": 557871,
+      "sha256": "bf3ab055c987f3ad1f3070aa60bbf607af718e51271ce39795ab7a8db7fdb48b"
+    },
+    "src/pools.rs": {
+      "bytes": 62537,
+      "sha256": "066d5135831e7701903433140c47c388024648f55d07dfcbeac597ba2add66a3"
+    },
+    "src/rpc.rs": {
+      "bytes": 66348,
+      "sha256": "3e971f79c59e24a7226f911e1c0959515af82c7de23ceffe1c0cf8d98f1ccdb4"
+    },
+    "testdata/v1/regtest-smoke.json": {
+      "bytes": 439,
+      "sha256": "296be8895837f94aa0462e353a065f35afd804b2050c8e2dd9817bdac54b2f9d"
+    },
+    "tests/fixtures/hf133-asert-vectors.json": {
+      "bytes": 741545,
+      "sha256": "b75dd05f1b9ae28613f0717a2def51863d6ba996cc8df056d55d1b9082ee7951"
+    },
+    "tests/fixtures/hf133-mainnet-headers.json": {
+      "bytes": 48148,
+      "sha256": "55b7dfe578ba92b4aacf9ff058fd21f4c0fe234c42fbe4844578b9e88e631380"
+    },
+    "tests/fixtures/hf133-preserved-source.json": {
+      "bytes": 656,
+      "sha256": "931fc17cea3d33e612b9cc12803214b40f1a87e838495af5ddd1f075f4b4037b"
+    },
+    "tests/fixtures/hf133-required-native-tests.json": {
+      "bytes": 1013,
+      "sha256": "cd8b2fd6c873364884c3d4524a50ccf372c988718df594620c7816992b43c334"
+    },
+    "tests/v1_core.rs": {
+      "bytes": 94929,
+      "sha256": "49cec1c3e1b4049a9fd8bdad01062cc4f6a7ea6122c7d058f55090ddb1482ae4"
+    }
+  }
+}

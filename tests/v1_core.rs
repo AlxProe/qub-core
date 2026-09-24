@@ -904,8 +904,30 @@ fn hf123_fast_storage_status_metadata_and_export() {
     let paths = NodePaths::from_settings(&s);
     assert!(paths.fast_storage_exists());
     assert!(paths.fast_pointer_file.exists());
-    assert!(paths.chain_file.exists());
-    assert!(paths.chain_status_file.exists());
+
+    // HF130 publishes the committed live chain before optional disk maintenance.
+    // Observe the real workers here: calling a status loader/exporter first
+    // would manufacture the files and conceal a missing scheduled worker.
+    let maintenance_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if paths.chain_file.exists() && paths.chain_status_file.exists() {
+            let stats = fast_storage_stats(&s).unwrap();
+            if !stats.legacy_export_running {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < maintenance_deadline,
+            "detached maintenance did not produce legacy/status files: legacy={}, status={}",
+            paths.chain_file.exists(),
+            paths.chain_status_file.exists()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let legacy: PersistedChainState =
+        serde_json::from_slice(&std::fs::read(&paths.chain_file).unwrap()).unwrap();
+    assert_eq!(legacy.network, s.network.name);
+    assert_eq!(&legacy.blocks, chain.blocks.as_ref());
 
     let (cached, cached_source) = load_fast_chain_status(&s).unwrap();
     assert_eq!(cached_source, FastChainStatusSource::FastStorageMetadata);
