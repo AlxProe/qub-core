@@ -13,7 +13,7 @@ param(
     [string]$DistRoot = ''
 )
 
-throw 'HF133 candidate: this historical HF132 publisher is disabled. Run HF133-daa-r4/run-native.py first. Public packaging requires the HF133 native receipt and final activation review.'
+throw 'HF134 candidate: historical publisher disabled. Run the HF134 native verification package first; release packaging and publication require separate verified receipts.'
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

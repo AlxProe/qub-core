@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const RPC_VERSION: &str = "1.8.6";
+const RPC_VERSION: &str = "1.8.7";
 const RPC_MIN_TOKEN_BYTES: usize = 24;
 const RPC_MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const RPC_MAX_MINING_STATS_WINDOW: usize = 4096;

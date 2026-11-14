@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QUB Core 1.8.7 — Official Mainnet Download</title>
+    <meta name="description" content="Download QUB Core 1.8.7 for Windows. HF134 improves the Windows updater, synchronization and storage. Existing mainnet consensus rules are unchanged. Official installer and upgrade guide." />
+
+    <link rel="icon" type="image/png" href="assets/favicon.png" />
+    <link rel="apple-touch-icon" href="assets/favicon.png" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="QUB Core 1.8.7 — Official Download" />
+    <meta property="og:title" content="QUB Core 1.8.7 — Official Download" />
+    <meta property="og:description" content="Download QUB Core 1.8.7 for Windows. HF134 improves the Windows updater, synchronization and storage. Existing mainnet consensus rules are unchanged. Official installer and upgrade guide." />
+    <meta property="og:url" content="https://download.qubit-coin.io" />
+    <meta property="og:image" content="https://download.qubit-coin.io/assets/banner.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="QUB Core 1.8.7 — Official Download" />
+    <meta name="twitter:description" content="Download QUB Core 1.8.7 for Windows. HF134 improves the Windows updater, synchronization and storage. Existing mainnet consensus rules are unchanged. Official installer and upgrade guide." />
+    <meta name="twitter:image" content="https://download.qubit-coin.io/assets/banner.png" />
+
+    <link rel="canonical" href="https://download.qubit-coin.io/" />
+
+    <style>
+        :root {
+            --bg: #090909;
+            --panel: rgba(23, 23, 26, 0.82);
+            --panel-2: rgba(32, 32, 38, 0.78);
+            --line: rgba(255,255,255,.12);
+            --muted: #a8a8b4;
+            --text: #fff;
+            --orange: #ff9418;
+            --orange-2: #b56a10;
+            --blue: #3f62ff;
+            --cyan: #00e1ff;
+            --purple: #7b66ff;
+            --green: #28db72;
+            --red: #ff4d57;
+            --shadow: 0 24px 80px rgba(0,0,0,.45);
+            --radius: 28px;
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            margin: 0;
+            background: radial-gradient(circle at 15% 5%, rgba(255,148,24,.25), transparent 35%), radial-gradient(circle at 85% 10%, rgba(64,98,255,.20), transparent 30%), radial-gradient(circle at 50% 100%, rgba(123,102,255,.18), transparent 34%), var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        a {
+            color: inherit;
+        }
+
+            button, a.btn {
+                font: inherit;
+            }
+
+        .container {
+            width: min(1180px, calc(100% - 36px));
+            margin: 0 auto;
+        }
+
+        .nav {
+            position: sticky;
+            top: 0;
+            z-index: 20;
+            backdrop-filter: blur(18px);
+            background: rgba(9,9,9,.72);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .nav-inner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+            padding: 14px 0;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 900;
+            letter-spacing: -.03em;
+            text-decoration: none;
+        }
+
+            .brand img {
+                width: 42px;
+                height: 42px;
+                border-radius: 50%;
+            }
+
+        .nav-links {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+            .nav-links a {
+                color: var(--muted);
+                text-decoration: none;
+                font-weight: 700;
+                padding: 9px 12px;
+                border-radius: 999px;
+            }
+
+                .nav-links a:hover {
+                    color: #fff;
+                    background: rgba(255,255,255,.08);
+                }
+
+        .hero {
+            padding: 72px 0 34px;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: 1.05fr .95fr;
+            gap: 36px;
+            align-items: center;
+        }
+
+        .kicker {
+            display: inline-flex;
+            gap: 10px;
+            align-items: center;
+            color: #fff;
+            background: rgba(255,148,24,.12);
+            border: 1px solid rgba(255,148,24,.35);
+            padding: 9px 14px;
+            border-radius: 999px;
+            font-weight: 800;
+        }
+
+            .kicker .dot {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: var(--green);
+                box-shadow: 0 0 22px var(--green);
+            }
+
+        h1 {
+            font-size: clamp(42px, 7vw, 86px);
+            line-height: .93;
+            margin: 22px 0 20px;
+            letter-spacing: -.07em;
+        }
+
+        .lead {
+            color: #d8d8df;
+            font-size: clamp(18px, 2.2vw, 23px);
+            line-height: 1.55;
+            margin: 0 0 28px;
+            max-width: 680px;
+        }
+
+        .hero-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            align-items: center;
+            margin: 28px 0;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            min-height: 54px;
+            padding: 0 22px;
+            border-radius: 16px;
+            text-decoration: none;
+            font-weight: 950;
+            border: 1px solid rgba(255,255,255,.16);
+            cursor: pointer;
+            transition: transform .18s ease, background .18s ease, border .18s ease, box-shadow .18s ease;
+        }
+
+            .btn:hover {
+                transform: translateY(-2px);
+            }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--orange), #ffbe59);
+            color: #16100a;
+            box-shadow: 0 14px 42px rgba(255,148,24,.28);
+        }
+
+            .btn-primary:hover {
+                box-shadow: 0 18px 60px rgba(255,148,24,.38);
+            }
+
+        .btn-secondary {
+            background: rgba(255,255,255,.07);
+            color: #fff;
+        }
+
+            .btn-secondary:hover {
+                background: rgba(255,255,255,.11);
+            }
+
+        .btn img {
+            width: 25px;
+            height: 25px;
+            object-fit: contain;
+        }
+
+        .version-card {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 14px;
+            align-items: start;
+            margin-top: 22px;
+            padding: 18px;
+            background: rgba(255,255,255,.06);
+            border: 1px solid var(--line);
+            border-radius: 20px;
+            max-width: 680px;
+        }
+
+            .version-card img {
+                width: 42px;
+                height: 42px;
+            }
+
+            .version-card strong {
+                display: block;
+                font-size: 18px;
+            }
+
+            .version-card p {
+                margin: 6px 0 0;
+                color: var(--muted);
+                line-height: 1.5;
+            }
+
+        .visual-card {
+            position: relative;
+            padding: 18px;
+            background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.03));
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+
+            .visual-card::before {
+                content: "";
+                position: absolute;
+                inset: -80px;
+                background: radial-gradient(circle at 20% 20%, rgba(255,148,24,.20), transparent 32%), radial-gradient(circle at 80% 30%, rgba(64,98,255,.18), transparent 35%);
+                pointer-events: none;
+            }
+
+            .visual-card img {
+                position: relative;
+                width: 100%;
+                border-radius: 22px;
+                display: block;
+            }
+
+        .section {
+            padding: 54px 0;
+        }
+
+        .section-head {
+            display: flex;
+            align-items: end;
+            justify-content: space-between;
+            gap: 24px;
+            margin-bottom: 22px;
+        }
+
+        h2 {
+            font-size: clamp(30px, 4.2vw, 52px);
+            line-height: 1;
+            margin: 0;
+            letter-spacing: -.06em;
+        }
+
+        .sub {
+            color: var(--muted);
+            margin: 10px 0 0;
+            line-height: 1.55;
+            max-width: 760px;
+            font-size: 17px;
+        }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 18px;
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            padding: 22px;
+            box-shadow: var(--shadow);
+        }
+
+        .card-icon {
+            width: 54px;
+            height: 54px;
+            border-radius: 16px;
+            display: grid;
+            place-items: center;
+            background: rgba(255,255,255,.08);
+            margin-bottom: 18px;
+        }
+
+            .card-icon img {
+                width: 38px;
+                height: 38px;
+                object-fit: contain;
+            }
+
+        .card h3 {
+            margin: 0 0 10px;
+            font-size: 22px;
+            letter-spacing: -.03em;
+        }
+
+        .card p {
+            color: #c9c9d2;
+            line-height: 1.55;
+            margin: 0;
+        }
+
+        .infusion {
+            display: grid;
+            grid-template-columns: .9fr 1.1fr;
+            gap: 22px;
+            align-items: center;
+        }
+
+        .infusion-figure {
+            background: #050505;
+            border: 1px solid var(--line);
+            border-radius: 24px;
+            padding: 14px;
+            box-shadow: var(--shadow);
+        }
+
+            .infusion-figure img {
+                width: 100%;
+                display: block;
+                border-radius: 18px;
+            }
+
+        .step-list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .step {
+            display: grid;
+            grid-template-columns: 42px 1fr;
+            gap: 14px;
+            padding: 16px;
+            border: 1px solid var(--line);
+            background: rgba(255,255,255,.05);
+            border-radius: 18px;
+        }
+
+        .step-num {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            font-weight: 950;
+            background: linear-gradient(135deg, var(--orange), var(--purple));
+        }
+
+        .step p {
+            margin: 3px 0 0;
+            color: #cfcfd7;
+            line-height: 1.48;
+        }
+
+        .warning {
+            border: 1px solid rgba(255,148,24,.34);
+            background: rgba(255,148,24,.09);
+            padding: 18px;
+            border-radius: 20px;
+            color: #ffe7ca;
+            line-height: 1.55;
+        }
+
+        .download-panel {
+            background: linear-gradient(135deg, rgba(255,148,24,.14), rgba(64,98,255,.14));
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            padding: 26px;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 20px;
+            align-items: center;
+            box-shadow: var(--shadow);
+        }
+
+            .download-panel h2 {
+                font-size: clamp(28px, 3.8vw, 46px);
+            }
+
+        .meta-grid {
+            margin-top: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .pill {
+            color: #dedee8;
+            background: rgba(0,0,0,.28);
+            border: 1px solid rgba(255,255,255,.12);
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-weight: 800;
+            font-size: 14px;
+        }
+
+        .changelog {
+            display: grid;
+            gap: 12px;
+        }
+
+        .change {
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            overflow: hidden;
+            background: var(--panel);
+        }
+
+        .change-btn {
+            width: 100%;
+            color: #fff;
+            background: transparent;
+            border: 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            text-align: left;
+            padding: 18px 20px;
+            cursor: pointer;
+        }
+
+            .change-btn:hover {
+                background: rgba(255,255,255,.06);
+            }
+
+        .change-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 950;
+            font-size: 18px;
+        }
+
+            .change-title img {
+                width: 26px;
+                height: 26px;
+            }
+
+        .chev {
+            color: var(--muted);
+            transition: transform .18s ease;
+            font-size: 22px;
+        }
+
+        .change[open] .chev {
+            transform: rotate(45deg);
+        }
+
+        .change-body {
+            padding: 0 20px 18px 58px;
+            color: #cfcfd7;
+            line-height: 1.55;
+        }
+
+        .change-body ul {
+            margin: 10px 0 0;
+            padding-left: 18px;
+        }
+
+        .footer {
+            padding: 44px 0 60px;
+            color: var(--muted);
+            border-top: 1px solid var(--line);
+            margin-top: 44px;
+        }
+
+        .footer-grid {
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .small {
+            font-size: 14px;
+            color: var(--muted);
+            line-height: 1.5;
+        }
+
+        @media (max-width: 900px) {
+            .hero-grid, .infusion, .download-panel {
+                grid-template-columns: 1fr;
+            }
+
+            .cards {
+                grid-template-columns: 1fr;
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            .hero {
+                padding-top: 42px;
+            }
+
+            .download-panel {
+                text-align: left;
+            }
+        }
+
+        /* HF133 release and upgrade information. No scripts are required. */
+        :focus-visible { outline: 3px solid #ffbe59; outline-offset: 5px; }
+        section[id], main[id] { scroll-margin-top: 94px; }
+        .hero-grid > *, .download-panel > *, .footer-grid > * { min-width: 0; }
+        .btn { text-align: center; padding-block: 13px; }
+        .btn img, .kicker .dot, .change-title img { flex-shrink: 0; }
+        .kicker { font-size: 14px; }
+        .version-card { border-color: rgba(255,148,24,.42); background: rgba(255,148,24,.08); }
+        .version-card p { color: #e0d5c6; }
+        .version-card a { text-underline-offset: 3px; }
+        .release-links { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 18px; }
+        .release-links a, .text-link { color: #ffbe59; text-underline-offset: 4px; }
+        .upgrade-intro { margin: 0 0 22px; }
+        .upgrade-intro strong { color: #fff; }
+        .upgrade-steps { list-style: none; padding: 0; margin: 0; counter-reset: upgrade; }
+        .upgrade-steps li { counter-increment: upgrade; }
+        .upgrade-steps li::before {
+            content: counter(upgrade); display: grid; place-items: center;
+            width: 38px; height: 38px; border-radius: 50%; margin-bottom: 18px;
+            background: rgba(255,148,24,.16); color: #ffbe59; font-weight: 900;
+            border: 1px solid rgba(255,148,24,.35);
+        }
+        .upgrade-steps h3 { font-size: 20px; }
+        .checksum { margin-top: 22px; }
+        .checksum summary { padding: 18px 20px; cursor: pointer; font-weight: 800; }
+        .checksum-content { padding: 0 20px 20px; overflow-wrap: anywhere; }
+        .checksum-content p { margin: 0 0 12px; }
+        .checksum code {
+            display: block; overflow-wrap: anywhere; padding: 16px;
+            background: rgba(0,0,0,.3); border: 1px solid var(--line);
+            border-radius: 12px; font-size: 13px; line-height: 1.7; color: #e9e9ee;
+            user-select: all;
+        }
+        .change-btn { list-style: none; }
+        .change-btn::-webkit-details-marker { display: none; }
+        .change-title { min-width: 0; }
+        .change-body p { margin: 12px 0 0; }
+        .change.latest { border-color: rgba(255,148,24,.4); }
+        .footer a { text-underline-offset: 4px; }
+        .footer-links { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; }
+        .skip-link { position: absolute; left: 18px; top: -80px; z-index: 30; background: #ffbe59; color: #111; padding: 12px 18px; border-radius: 8px; }
+        .skip-link:focus { top: 12px; }
+        @media (max-width: 900px) {
+            .nav-links { display: flex; }
+            .nav-links a:not(.nav-download) { display: none; }
+            .visual-card { max-width: 580px; margin-inline: auto; }
+            .hero-grid { gap: 28px; }
+        }
+        @media (max-width: 480px) {
+            .nav-inner { gap: 8px; }
+            .brand { gap: 8px; font-size: 14px; }
+            .brand img { width: 34px; height: 34px; }
+            .nav-links a { padding: 9px 6px; font-size: 13px; }
+            .hero-actions .btn { width: 100%; }
+            .download-panel { padding: 22px; }
+            .download-panel > .btn { width: 100%; }
+            .kicker { font-size: 12px; gap: 8px; padding: 9px 11px; }
+            .change-title { font-size: 16px; gap: 10px; }
+            .change-btn { padding: 16px; gap: 10px; }
+            .change-body { padding-left: 24px; }
+            .version-card { grid-template-columns: 1fr; }
+            .version-card > img { display: none; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            html { scroll-behavior: auto; }
+            .btn, .chev { transition: none; }
+            .btn:hover { transform: none; }
+        }
+    </style>
+</head>
+<body>
+<a class="skip-link" href="#top">Skip to content</a>
+<nav class="nav" aria-label="Main navigation">
+  <div class="container nav-inner">
+    <a class="brand" href="#top" aria-label="Qubit Coin Core home"><img src="assets/qubit-coin-logo.png" alt="" width="42" height="42" /><span>Qubit Coin Core</span></a>
+    <div class="nav-links">
+      <a class="nav-download" href="#download">Download</a>
+      <a href="#upgrade">Upgrade guide</a>
+      <a href="#infusion">Infusion</a>
+      <a href="#changelog">Changelog</a>
+    </div>
+  </div>
+</nav>
+<main id="top">
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="container hero-grid">
+      <div>
+        <div class="kicker"><span class="dot" aria-hidden="true"></span> Latest release: v1.8.7 · HF134</div>
+        <h1 id="hero-title">Mine QUB.<br />Hold JIN.</h1>
+        <p class="lead">Your desktop app for QUB and JIN. Mine solo or in a pool, manage your wallet, and sync with the Qubit mainnet.</p>
+        <div class="hero-actions">
+          <a class="btn btn-primary" href="https://download.qubit-coin.io/mainnet/windows-x64/QUB-Core-Latest.exe"><img src="assets/qubit-coin-logo.png" alt="" />Download for Windows</a>
+          <a class="btn btn-secondary" href="#upgrade">How to upgrade</a>
+        </div>
+        <div class="version-card">
+          <img src="assets/qubit-coin-logo.png" alt="" />
+          <div>
+            <strong>QUB Core 1.8.7 is available.</strong>
+            <p>Update for Windows updater, synchronization and storage fixes. Existing HF133 rules from block 100000 remain in effect. This release introduces no new chain activation.</p>
+            <p><a href="#changelog">What changes in HF134 →</a></p>
+          </div>
+        </div>
+      </div>
+      <div class="visual-card"><img src="assets/infusion-flow.png" alt="QUB/JIN infusion and the planned 1:1 Enjin bridge" fetchpriority="high" /><p class="small" style="position:relative;margin:14px 6px 0">Infuse/Melt is live on Qubit. The 1:1 Enjin bridge shown here is planned.</p></div>
+    </div>
+  </section>
+
+  <section id="download" class="section" aria-labelledby="download-title">
+    <div class="container">
+      <div class="download-panel">
+        <div>
+          <h2 id="download-title">Download QUB Core 1.8.7</h2>
+          <p class="sub">The official mainnet installer. Includes solo and pool mining, CPU and OpenCL GPU support, the QUB/JIN wallet, QNS, and Infuse/Melt.</p>
+          <div class="meta-grid">
+            <span class="pill">Windows x64</span><span class="pill">Mainnet</span><span class="pill">HF134</span><span class="pill">Epoch 3 · Since #100000</span>
+          </div>
+        </div>
+        <a class="btn btn-primary" href="https://download.qubit-coin.io/mainnet/windows-x64/QUB-Core-Latest.exe"><img src="assets/qubit-coin-logo.png" alt="" />Download installer</a>
+      </div>
+      <div class="release-links">
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/RELEASE_NOTES-v1.8.7-HF134.md">Full 1.8.7 release notes</a>
+        <a href="https://download.qubit-coin.io/mainnet/windows-x64/QUB-Core-v1.8.7-Windows-x64-mainnet-Setup.exe">Versioned 1.8.7 installer</a>
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/QUB-Core-v1.8.7-Windows-x64-mainnet.zip">Windows portable</a>
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/qubd-linux-x86_64">Linux x64 node</a>
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/QUB-Core-v1.8.7-HF134-Windows-Source.zip">Windows source</a>
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/QUB-Core-v1.8.7-HF134-Linux-Source.zip">Linux source</a>
+        <a href="https://download.qubit-coin.io/releases/v1.8.7-HF134/SHA256SUMS.txt">All release checksums</a>
+        <a href="#upgrade">Updating an older installation?</a>
+      </div>
+      <p class="small">Download only from <strong>download.qubit-coin.io</strong>. Keep your wallet file and private keys private.</p>
+      <details class="change checksum">
+        <summary>Verify the 1.8.7 installer · SHA-256</summary>
+        <div class="checksum-content">
+          <p class="small">For <strong>QUB-Core-v1.8.7-Windows-x64-mainnet-Setup.exe</strong> · 12,482,103 bytes. This checksum identifies this exact release; the Latest download can change with future releases.</p>
+          <code>a73eaf8f91b8a026e270a5f7afdc04ae757e1cf57bafcbfa4112f47dc8713746</code>
+          <div class="release-links"><a href="https://download.qubit-coin.io/mainnet/windows-x64/QUB-Core-v1.8.7-Windows-x64-mainnet-Setup.exe.sha256">Download checksum</a></div>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <section id="upgrade" class="section" aria-labelledby="upgrade-title">
+    <div class="container">
+      <div class="section-head"><div><h2 id="upgrade-title">Already have QUB Core?</h2><p class="sub">Install over your existing mainnet installation. No uninstall is needed.</p></div></div>
+      <p class="sub upgrade-intro"><strong>App closes but stays on 1.8.4?</strong> If the old updater closes QUB Core without installing or restarting, use the installer above and follow these steps.</p>
+      <ol class="cards upgrade-steps">
+        <li class="card"><h3>Stop mining and close Core</h3><p>Stop solo or pool mining, then fully exit QUB Core before running the installer. Keep a safe backup of your wallet.</p></li>
+        <li class="card"><h3>Run the downloaded installer</h3><p>Use your existing Qubit Coin Core installation folder. The installer updates program files and keeps your existing wallet, chain data, and settings.</p></li>
+        <li class="card"><h3>Open Core and check 1.8.7</h3><p>Open QUB Core from your usual shortcut and confirm version 1.8.7. Let synchronization finish before starting solo or pool mining.</p></li>
+      </ol>
+      <p class="small">Do not delete your data folder to upgrade. If you still see 1.8.4, check that the installer and shortcut point to the same installation folder.</p>
+    </div>
+  </section>
+
+  <section id="how-it-works" class="section" aria-labelledby="how-title">
+    <div class="container">
+      <div class="section-head"><div><h2 id="how-title">QUB, JIN and the wider ecosystem</h2><p class="sub">Mine QUB and use native JIN on the Qubit blockchain. The planned Enjin bridge is a separate part of the roadmap.</p></div></div>
+      <div class="cards">
+        <article class="card"><div class="card-icon"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /></div><h3>QUB is what you mine</h3><p>Miners secure the network and earn QUB block rewards. Core supports solo and pool mining, with CPU and supported OpenCL GPUs.</p></article>
+        <article class="card"><div class="card-icon"><img src="assets/jin.png" alt="" loading="lazy" /></div><h3>JIN is native to Core</h3><p>View and send native JIN in your QUB wallet. Infuse JIN into the QUB reserve or melt QUB to reclaim JIN using the app’s built-in actions and current conversion quote.</p></article>
+        <article class="card"><div class="card-icon"><img src="assets/enj-logo-matrix.webp" alt="" loading="lazy" /></div><h3>Enjin is on the roadmap</h3><p>A 1:1 bridge between JIN Coin on Qubit and JIN Token on Enjin Matrixchain is planned. That bridge is not available in this release.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="infusion" class="section" aria-labelledby="infusion-title">
+    <div class="container infusion">
+      <div class="infusion-figure"><img src="assets/matryoshka-infusion.png" alt="Illustration of the QUB, JIN and ENJ ecosystem" loading="lazy" /></div>
+      <div>
+        <h2 id="infusion-title">JIN infused into QUB</h2>
+        <p class="sub">Infuse and Melt are available on QUB mainnet. Use the app to review the current amounts before confirming a transaction.</p>
+        <div class="step-list" style="margin-top:18px">
+          <div class="step"><div class="step-num">1</div><div><strong>Mine or receive QUB.</strong><p>Use the wallet to hold and send QUB, or earn it through mining.</p></div></div>
+          <div class="step"><div class="step-num">2</div><div><strong>Infuse JIN.</strong><p>The Infuse action adds native JIN to the QUB reserve.</p></div></div>
+          <div class="step"><div class="step-num">3</div><div><strong>Melt QUB.</strong><p>The Melt action permanently destroys QUB and returns JIN according to the protocol’s current quote.</p></div></div>
+          <div class="step"><div class="step-num">4</div><div><strong>Follow the bridge roadmap.</strong><p>Moving JIN between Qubit and Enjin Matrixchain requires the planned bridge, which is not live in 1.8.7.</p></div></div>
+        </div>
+        <div class="warning" style="margin-top:18px">Use the built-in <strong>Infuse</strong> and <strong>Melt</strong> actions. Sending coins directly to protocol addresses does not perform a conversion.</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="changelog" class="section" aria-labelledby="changelog-title">
+    <div class="container">
+      <div class="section-head"><div><h2 id="changelog-title">What’s new</h2><p class="sub">The current release, followed by selected milestones from the early release history.</p></div></div>
+      <div class="changelog" id="changelogList">
+        <details class="change latest" open>
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" /><span>v1.8.7 · HF134 — Updater and sync reliability</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul>
+            <li><strong>Windows updates:</strong> a separate helper verifies the installer, waits for Core to close, installs and relaunches. Preparation runs outside the GUI thread.</li>
+            <li><strong>Synchronization:</strong> avoids replaying already known snapshots and reuses locally validated chain prefixes while checking replacement blocks normally.</li>
+            <li><strong>Storage:</strong> adds writer progress diagnostics and coinbase UTXO optimizations. Exact Windows and Linux source variants are published with their provenance.</li>
+            <li><strong>Compatibility:</strong> existing epoch-3 / ASERT-MTP rules from block 100000 remain unchanged. There is no new activation height.</li>
+            <li><strong>Next patch:</strong> long-running memory behavior, seed-independent mining, and faster startup/recovery remain open work.</li>
+          </ul><p><a class="text-link" href="https://download.qubit-coin.io/releases/v1.8.7-HF134/RELEASE_NOTES-v1.8.7-HF134.md">Read the complete HF134 release notes →</a></p></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" /><span>v1.8.6 · HF133 — Mainnet upgrade</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body">
+            <ul>
+              <li><strong>Required before block 100000:</strong> all wallets, solo and pool miners, and node operators must upgrade. Activation is set by block height, not a calendar date.</li>
+              <li><strong>New difficulty adjustment:</strong> ASERT-MTP activates at block 100000, with a 60-second target. It is designed to reduce repeated difficulty swings as mining power changes; individual block times will still vary.</li>
+              <li><strong>Sync and memory improvements:</strong> bounds incoming chain synchronization, releases old connection snapshots, and avoids redundant history replay and large message copies.</li>
+              <li>GPU mining, reward amounts, pool rules, QNS/JIN rules, and the existing chain data format retain their behavior.</li>
+              <li>Older releases, including 1.8.4, cannot follow the upgraded chain after activation. Do not downgrade after activation.</li>
+            </ul>
+            <p><a class="text-link" href="https://download.qubit-coin.io/releases/v1.8.6-HF133/RELEASE_NOTES-v1.8.6-HF133.md">Read the complete HF133 release notes →</a></p>
+          </div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/jin.png" alt="" loading="lazy" /><span>v1.2.0 — Native JIN support</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Adds native Jinex Coin (JIN) support on QUB.</li><li>Collapsing supply: 105,000,000 JIN with 18 decimals.</li><li>Adds JIN balance display, basic JIN send support, and JIN activity visibility.</li><li>Bridge flow is not manual yet; protocol addresses are not conversion addresses.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.1.9 — Mining stability, QR and asset packaging</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Added QR hover for public addresses and QR scan entry point in Send.</li><li>Removed in-app network switching because Mainnet and Testnet are separate apps.</li><li>Improved flags and asset packaging in release bundles.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.1.8 — Languages and Address Activity</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Added English, Greek, French, German, Spanish, Chinese, Japanese, and Korean UI language support.</li><li>Added Address Activity with transfer, mining, and QNS activity visibility.</li><li>Improved manual and automatic wallet sync UX.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.1.7 — OpenCL GPU mining</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Enabled OpenCL GPU mining on mainnet after testnet validation.</li><li>Supports AMD and Nvidia through OpenCL.</li><li>GPU telemetry shows device, workers, hashrate, and total hashes.</li><li>GPU-found candidates are CPU-verified before submit.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.1.0 — Manifest updater and channel split</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Split Mainnet and Testnet into separate installations.</li><li>Added manifest-based update channels.</li><li>Reduced accidental cross-network updates.</li><li>Prepared safer release infrastructure for future upgrades.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.0.9 — Wallet sync and GUI polish</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Added manual wallet/balance sync next to payout address.</li><li>Added optional auto wallet sync.</li><li>Improved wallet visibility when mining to payout addresses.</li><li>Added icon polish and clearer button states.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.0.8 — Realtime block stream improvements</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Improved miner telemetry and block stream refresh behavior.</li><li>Removed manual target-spacing behavior from GUI mining.</li><li>Made recent blocks and pending/confirmed mined cards more reliable.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.0.5 - v1.0.6 — GUI performance and updater hardening</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Fixed repeated audio loading and UI lag issues.</li><li>Improved auto-update/download/install/restart flow.</li><li>Reduced command-window flicker and updater noise.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.0.3 - v1.0.4 — Installer and QNS polish</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>Added installer/update packaging flow.</li><li>Improved QNS registration behavior.</li><li>Configured official download hosting and testnet distribution.</li></ul></div>
+        </details>
+        <details class="change">
+          <summary class="change-btn"><span class="change-title"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>v1.0.0 — Initial QUB Core release</span></span><span class="chev" aria-hidden="true">+</span></summary>
+          <div class="change-body"><ul><li>BTC-like 21M QUB supply model with 60 second target spacing.</li><li>Solo CPU mining, wallet creation, basic sends, P2P seed nodes, and early GUI.</li><li>Private test network used to iterate fast before wider rollout.</li></ul></div>
+        </details>
+      </div>
+    </div>
+  </section>
+</main>
+<footer class="footer">
+  <div class="container footer-grid">
+    <div><div class="brand"><img src="assets/qubit-coin-logo.png" alt="" loading="lazy" /><span>Qubit Coin Core</span></div><p class="small">v1.8.7 · HF134 · Mainnet epoch 3</p></div>
+    <div class="footer-links small"><a href="#download">Download</a><a href="#upgrade">Upgrade guide</a><a href="https://explorer.qubit-coin.io/">QUB Explorer</a></div>
+  </div>
+</footer>
+</body>
+</html>

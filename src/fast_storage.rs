@@ -264,7 +264,14 @@ fn sorted_utxos(chain: &ChainState) -> Vec<PersistedUtxo> {
             coin: coin.clone(),
         })
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| a.outpoint.key().cmp(&b.outpoint.key()));
+    // Hash256's byte order equals its fixed-width lowercase-hex display order.
+    // Keep decimal-text vout ordering, including "10" before "2", so persisted
+    // bytes stay compatible without formatting every hash or caching keys.
+    out.sort_by(|a, b| {
+        a.outpoint.txid.cmp(&b.outpoint.txid).then_with(|| {
+            a.outpoint.vout.to_string().cmp(&b.outpoint.vout.to_string())
+        })
+    });
     out
 }
 
@@ -2576,5 +2583,99 @@ mod hf130_maintenance_tests {
         assert_eq!(stale.mempool, public.mempool);
         assert!(stale.tx_in_mempool(local_tx.txid()));
         assert!(!stale.tx_in_mempool(peer_tx.txid()));
+    }
+}
+
+
+#[cfg(test)]
+mod hf134_storage_sort_tests {
+    use super::*;
+
+    // Frozen pre-optimization comparator. Decimal output indexes sort as text,
+    // so (txid, numeric vout) would silently change the persisted ordering.
+    fn legacy_sorted_utxos(chain: &ChainState) -> Vec<PersistedUtxo> {
+        let mut out = chain.utxos.iter().map(|(outpoint, coin)| PersistedUtxo {
+            outpoint: outpoint.clone(), coin: coin.clone(),
+        }).collect::<Vec<_>>();
+        out.sort_by(|a, b| a.outpoint.key().cmp(&b.outpoint.key()));
+        out
+    }
+
+    fn fixture(points: &[OutPoint]) -> ChainState {
+        let mut utxos = HashMap::new();
+        for point in points {
+            let coin = CoinRecord {
+                tx_out: TxOut { value: Amount(1), script_pubkey: ScriptBuf(vec![point.txid.0[0]]) },
+                height: point.vout, is_coinbase: point.vout % 2 == 0,
+            };
+            assert!(utxos.insert(point.clone(), coin).is_none());
+        }
+        ChainState { network: "mainnet".into(), blocks: Arc::new(Vec::new()),
+            utxos: Arc::new(utxos), mempool: Arc::new(Vec::new()) }
+    }
+
+    fn identical_json(chain: &ChainState) -> Vec<PersistedUtxo> {
+        let actual = sorted_utxos(chain);
+        assert_eq!(serde_json::to_vec(&actual).unwrap(),
+                   serde_json::to_vec(&legacy_sorted_utxos(chain)).unwrap());
+        actual
+    }
+
+    #[test]
+    fn hf134_storage_sort_preserves_decimal_boundaries() {
+        assert!(identical_json(&fixture(&[])).is_empty());
+        let indexes = [u32::MAX, 1000, 99, 10, 9, 2, 100, 1, 0];
+        let points = indexes.iter().map(|vout| OutPoint {
+            txid: Hash256::zero(), vout: *vout,
+        }).collect::<Vec<_>>();
+        identical_json(&fixture(&points[..1]));
+        let sorted = identical_json(&fixture(&points));
+        assert_eq!(sorted.iter().map(|row| row.outpoint.vout).collect::<Vec<_>>(),
+                   vec![0, 1, 10, 100, 1000, 2, u32::MAX, 9, 99]);
+    }
+
+    #[test]
+    fn hf134_storage_sort_matches_reference_across_hashes_and_insertion_orders() {
+        let indexes = [0, 1, 2, 9, 10, 11, 99, 100, 999, 1000, 65535, u32::MAX];
+        let mut points = Vec::new();
+        for first in [0u8, 1, 15, 16, 127, 128, 254, 255] {
+            for last in [0u8, 1, 15, 16, 127, 128, 254, 255] {
+                let mut bytes = [first; 32]; bytes[31] = last;
+                for vout in indexes { points.push(OutPoint { txid: Hash256(bytes), vout }); }
+            }
+        }
+        let expected = serde_json::to_vec(&identical_json(&fixture(&points))).unwrap();
+        points.reverse();
+        assert_eq!(serde_json::to_vec(&identical_json(&fixture(&points))).unwrap(), expected);
+        points.rotate_left(317);
+        assert_eq!(serde_json::to_vec(&identical_json(&fixture(&points))).unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned, previously replay-verified public mainnet snapshot"]
+    fn hf134_storage_sort_matches_all_mainnet_utxos() {
+        let loaded: PersistedChainState = serde_json::from_reader(BufReader::new(
+            File::open("/inputs/chain-mainnet-113930.json").unwrap())).unwrap();
+        assert_eq!(loaded.network, "mainnet"); assert_eq!(loaded.blocks.len(), 113_931);
+        let mut utxos = HashMap::new();
+        for row in loaded.utxos { assert!(utxos.insert(row.outpoint, row.coin).is_none()); }
+        assert_eq!(utxos.len(), 174_449);
+        let chain = ChainState { network: loaded.network, blocks: Arc::new(loaded.blocks),
+            utxos: Arc::new(utxos), mempool: Arc::new(loaded.mempool) };
+        assert_eq!(chain.tip_hash().to_string(),
+            "a595bf4a5bf46b74daa09480484d6a7b4b636aaa26a10e21d2cccb0400000000");
+        let mut actual = state_from_chain(&chain, 123, 7, 999).unwrap();
+        let actual_bytes = serde_json::to_vec(&actual).unwrap();
+        actual.utxos = legacy_sorted_utxos(&chain);
+        let legacy_bytes = serde_json::to_vec(&actual).unwrap();
+        assert!(actual_bytes == legacy_bytes, "FCE state bytes changed: actual={} legacy={}",
+                sha256_hex(&actual_bytes), sha256_hex(&legacy_bytes));
+        let evidence = serde_json::json!({"status": "PASS", "utxo_count": chain.utxos.len(),
+            "serialized_state_bytes": actual_bytes.len(), "state_sha256": sha256_hex(&actual_bytes),
+            "reference": "frozen pre-optimization string comparator",
+            "same_generation_revision_and_journal_bytes": true,
+            "all_utxos_and_full_serialized_state_identical": true});
+        fs::write("/output/sort-compatibility.json", serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        println!("SORT_COMPATIBILITY {evidence}");
     }
 }

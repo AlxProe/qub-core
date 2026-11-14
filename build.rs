@@ -41,8 +41,8 @@ fn main() {
         // the GUI, P2P/RPC identity and the installer. The updater verifies
         // installer metadata, while operators commonly use the executable
         // metadata for incident response and release diagnostics.
-        res.set("ProductVersion", "1.8.6");
-        res.set("FileVersion", "1.8.6.0");
+        res.set("ProductVersion", "1.8.7");
+        res.set("FileVersion", "1.8.7.0");
         res.compile().expect("compile windows resources");
     }
 }

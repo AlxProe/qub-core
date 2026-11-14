@@ -16,12 +16,22 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod elapsed_timer;
+pub use elapsed_timer::ElapsedTimer;
+mod coinbase_utxos;
+
+#[cfg(test)]
+mod hf134_memory_reference;
+#[cfg(test)]
+mod hf134_memory_tests;
+
 mod daa_v3;
 mod fast_storage;
 pub use daa_v3::{asert_target_bits, daa_v3_active, median_time_past, DAA_V3_HALF_LIFE_SECS, DAA_V3_MTP_WINDOW, DAA_V3_POW_LIMIT_BITS, DAA_V3_TARGET_SPACING_SECS, MAINNET_DAA_V3_ACTIVATION_HEIGHT, PROTOCOL_EPOCH_3_BLOCK_VERSION};
 pub mod p2p;
 pub mod pools;
 pub mod rpc;
+pub mod validation_progress;
 pub use fast_storage::*;
 pub use pools::*;
 
@@ -1236,12 +1246,61 @@ impl ChainState {
         if blocks.first() != Some(&genesis_block(settings)?) {
             bail!("genesis mismatch");
         }
+        p2p::hf134_writer_stage("full consensus replay", Some(0));
+        let replay = validation_progress::ReplayGuard::begin(&settings.node.data_dir, blocks.len().saturating_sub(1) as u32);
         let mut chain = Self::new_with_genesis(settings)?;
         for block in blocks.into_iter().skip(1) {
             p2p::hf132_check_sync_budget()?;
             chain.connect_block(block, settings)?;
+            if chain.height() % 100 == 0 {
+                replay.checked(chain.height());
+                p2p::hf134_writer_stage("full consensus replay", Some(chain.height()));
+            }
         }
+        p2p::hf134_writer_stage("replay complete", Some(chain.height()));
+        replay.checked(chain.height());
         Ok(chain)
+    }
+
+    /// HF134: reconstruct UTXOs for the shared, already consensus-validated
+    /// local prefix, then validate every replacement block normally. Only
+    /// internal callers holding a validated live/disk baseline may use this.
+    /// No remote UTXO, mempool, header-only match, or UI snapshot is trusted.
+    pub(crate) fn hf134_from_validated_prefix(
+        baseline: &Self, blocks: Vec<Block>, settings: &Settings,
+    ) -> Result<Self> {
+        if baseline.network != settings.network.name
+            || blocks.first() != Some(&genesis_block(settings)?) {
+            bail!("candidate network/genesis mismatch");
+        }
+        let common = baseline.blocks.iter().zip(&blocks).take_while(|(a, b)| a == b).count();
+        if common == 0 { bail!("candidate has no common genesis"); }
+        let mut prefix_blocks = blocks;
+        let suffix = prefix_blocks.split_off(common);
+        let mut candidate = if common == baseline.blocks.len() {
+            drop(prefix_blocks);
+            let mut copy = baseline.clone();
+            copy.mempool = Arc::new(Vec::new());
+            copy
+        } else {
+            // Rebuild only the UTXO effects of trusted history. Expensive
+            // signature/feature/DAA validation was already done for this exact
+            // prefix. Replay includes intra-block spends and pool-share rules.
+            let mut utxos = HashMap::new();
+            for (height, block) in baseline.blocks[..common].iter().enumerate().skip(1) {
+                p2p::hf132_check_sync_budget()?;
+                connect_block_utxos(block, &mut utxos, height as u32)?;
+                if height % 100 == 0 { p2p::hf134_writer_stage("rebuilding validated prefix UTXOs", Some(height as u32)); }
+            }
+            Self { network: baseline.network.clone(), blocks: Arc::new(prefix_blocks),
+                utxos: Arc::new(utxos), mempool: Arc::new(Vec::new()) }
+        };
+        for block in suffix {
+            p2p::hf132_check_sync_budget()?;
+            candidate.connect_block(block, settings)?;
+            p2p::hf134_writer_stage("validating replacement blocks", Some(candidate.height()));
+        }
+        Ok(candidate)
     }
 
     pub fn height(&self) -> u32 {
@@ -1353,6 +1412,8 @@ impl ChainState {
         if self.blocks.first() != Some(&genesis_block(settings)?) {
             bail!("genesis mismatch");
         }
+        let replay = validation_progress::ReplayGuard::begin(&settings.node.data_dir, self.height());
+        p2p::hf134_writer_stage("full consensus replay", Some(0));
         let mut utxos = HashMap::new();
         let mut prev = self.blocks[0].block_hash();
         for (i, block) in self.blocks.iter().enumerate().skip(1) {
@@ -1375,10 +1436,16 @@ impl ChainState {
             validate_consensus_checkpoint(settings, i as u32, block.block_hash())?;
             connect_block_utxos(block, &mut utxos, i as u32)?;
             prev = block.block_hash();
+            if i % 100 == 0 {
+                replay.checked(i as u32);
+                p2p::hf134_writer_stage("full consensus replay", Some(i as u32));
+            }
         }
         if &utxos != self.utxos.as_ref() {
             bail!("UTXO mismatch after replay");
         }
+        replay.checked(self.height());
+        p2p::hf134_writer_stage("replay complete", Some(self.height()));
         Ok(())
     }
 
@@ -1950,11 +2017,16 @@ impl ChainState {
         validate_library_block(&block, &self.blocks, &self.utxos, height, settings)?;
         validate_verified_governance_block(&block, &self.blocks, &self.utxos, height, settings)?;
         validate_consensus_checkpoint(settings, height, block.block_hash())?;
-        let mut new_utxos = self.utxos.as_ref().clone();
-        connect_block_utxos(&block, &mut new_utxos, height)?;
+        if block.transactions.len() == 1 {
+            coinbase_utxos::connect(&block.transactions[0], &mut self.utxos, height)?;
+        } else {
+            // Keep the existing transactional path for transaction-bearing blocks.
+            let mut new_utxos = self.utxos.as_ref().clone();
+            connect_block_utxos(&block, &mut new_utxos, height)?;
+            self.utxos = Arc::new(new_utxos);
+        }
         let hash = block.block_hash();
         Arc::make_mut(&mut self.blocks).push(block);
-        self.utxos = Arc::new(new_utxos);
         Arc::make_mut(&mut self.mempool).retain(|tx| !txids.contains(&tx.txid()));
         // HF76/v1.5.8: a newly-confirmed block can spend inputs or change feature
         // state used by still-pending transactions. Revalidate survivors now so
@@ -3435,16 +3507,25 @@ fn validate_block(
             bail!("extra coinbase");
         }
     }
+    validate_block_transactions(block, base_utxos, height, settings)
+}
+
+// Header/network checks stay in validate_block; this body stage is also
+// exercised directly by offline intra-block transaction differential tests.
+fn validate_block_transactions(
+    block: &Block, base_utxos: &HashMap<OutPoint, CoinRecord>,
+    height: u32, settings: &Settings,
+) -> Result<HashSet<Hash256>> {
     let mut ids = HashSet::new();
     for tx in &block.transactions {
         if !ids.insert(tx.txid()) {
             bail!("duplicate txid");
         }
     }
-    let mut scratch = base_utxos.clone();
+    let mut scratch = std::borrow::Cow::Borrowed(base_utxos);
     let mut fees = 0u128;
     for tx in block.transactions.iter().skip(1) {
-        let raw_fee = validate_tx_contextual(tx, &scratch, height, settings, true)?;
+        let raw_fee = validate_tx_contextual(tx, scratch.as_ref(), height, settings, true)?;
         let qub_melt_burn = qub_jin_melt_burn_atoms_for_fee(settings, tx, height)?;
         if raw_fee < qub_melt_burn {
             bail!("QUB melt burn exceeds transaction input-output delta");
@@ -3465,7 +3546,7 @@ fn validate_block(
             );
         }
         fees += fee as u128;
-        connect_tx_utxos(tx, &mut scratch, height, false)?;
+        connect_tx_utxos(tx, scratch.to_mut(), height, false)?;
     }
     validate_tx_stateless(&block.transactions[0], settings)?;
     let claim: u128 = block.transactions[0]
@@ -6888,6 +6969,15 @@ pub fn save_chain_verified_equal_work_reanchor(
         bail!("verified equal-work re-anchor is mainnet-only");
     }
     chain.validate_all(settings)?;
+    hf134_save_validated_equal_work_reanchor(settings, chain)
+}
+
+// Same commit/equal-work policy as the public API. P2P supplies the result of
+// full validation or hf134_from_validated_prefix, avoiding a second replay.
+pub(crate) fn hf134_save_validated_equal_work_reanchor(
+    settings: &Settings, chain: &ChainState,
+) -> Result<()> {
+    if settings.network.name != "mainnet" { bail!("verified equal-work re-anchor is mainnet-only"); }
     {
         let _guard = lock_storage_for_sync()?;
         let paths = NodePaths::from_settings(settings);
@@ -11179,3 +11269,6 @@ fn validate_blast_claim_contextual(
 pub fn v1_feature_notice(settings: &Settings) -> String {
     format!("local address mining: create/paste enabled | pooled mining: {} at #{} | JIN native coin: {} at #{} | QNS: {} at #{} | Library: {} at #{} | Verified Governance: {} at #{}", if settings.features.pooled_mining_enabled && settings.pools.enabled { "enabled" } else { "disabled" }, settings.pools.activation_height, if settings.features.jin_native_coin_enabled && settings.jin.enabled { "enabled" } else { "disabled" }, settings.jin.activation_height, if settings.qns.enabled { "enabled" } else { "disabled" }, settings.qns.activation_height, if settings.library.enabled { "enabled" } else { "disabled" }, settings.library.activation_height, if settings.verified_governance.enabled { "enabled" } else { "disabled" }, settings.verified_governance.activation_height)
 }
+
+#[cfg(test)]
+mod hf134_tests;

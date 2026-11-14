@@ -1,0 +1,63 @@
+{
+  "schema": "QUB-HF134-V187-RELEASE-PROVENANCE-1",
+  "version": "1.8.7",
+  "hotfix": "HF134",
+  "publication_status": "VERIFIED_RELEASE_ARTIFACT_IDENTITIES",
+  "user_authorized_release": true,
+  "linux": {
+    "binary": {
+      "file": "qubd-linux-x86_64",
+      "bytes": 4974704,
+      "sha256": "c7e4eed408d5bd72b5633d4da764366d7d238c2ebc33530aabd462b3da9341e4"
+    },
+    "source_archive": "QUB-Core-v1.8.7-HF134-Linux-Source.zip",
+    "source_archive_identity": {
+      "bytes": 4610508,
+      "sha256": "162e925573fd15151e8712c5d33377bc171c99cd89171a587b91b1c6d06c3d2a"
+    },
+    "validation": "Full normal mainnet startup, 39 live blocks / 1800 seconds, 108 exact AMS matches and natural export PASS on 2026-11-14.",
+    "original_candidate_archive_sha256": "bd9208b6163d7962cf027c8aaae09e12bd58429fe4f6b9ba939a885b8ebd0d7c",
+    "max_glibc_symbol": "2.34",
+    "tested_glibc_runtime": "2.35"
+  },
+  "windows": {
+    "installer": {
+      "bytes": 12482103,
+      "pe_machine": "0x014c",
+      "sha256": "a73eaf8f91b8a026e270a5f7afdc04ae757e1cf57bafcbfa4112f47dc8713746"
+    },
+    "source_archive": "QUB-Core-v1.8.7-HF134-Windows-Source.zip",
+    "source_archive_identity": {
+      "bytes": 4608953,
+      "sha256": "7ac0c1b2227c89b76f844b889d08935a7e2d97b0b591d14819d4efb1eee2e8c1"
+    },
+    "gui_sha256": "722259f635ee0cc04fbf7fbb5e2a5da5fa618bc7b6e83d528d8569e02b49bc8e",
+    "qubd_sha256": "c0311925cd4807494ff8fda11b5ef0a4ee22251ad3d39a2d8fc7a0803d698556",
+    "rpc_miner_sha256": "22bba3f67587788b0ec7b005904450eb1b203830be36efe3587bc750998bd5e3",
+    "validation": "Passed native build/targeted tests, historical mainnet replay and exact-installer Sandbox GUI gate; retain original gate scopes.",
+    "authenticode": "NotSigned; existing official-origin trust policy",
+    "portable": {
+      "bytes": 14330394,
+      "sha256": "c861ccabf48933f65565c330935d24eb9fcd6e6a923610e59139ea72832e84a1"
+    }
+  },
+  "platform_source_differences": [
+    {
+      "path": "Cargo.lock",
+      "windows_sha256": "86a536e76a0d66ee82c3dc1dfe4b725d70f13fcebe8375d32ad0918b8c988deb",
+      "linux_sha256": "9cf6ccc859f1552bd1916040d406e7e7d72767064e83825fc6bd1c60686a48b2"
+    },
+    {
+      "path": "src/fast_storage.rs",
+      "windows_sha256": "0a0048c5fbe3304766a73d907948ed34ce1586ca1b571d3f7b9516c2ee0eac17",
+      "linux_sha256": "9992017a402af01862f3da5cab7011807dd05eddd446cfdfcfe4172d062ef0f9"
+    }
+  ],
+  "unchanged_source_file_count": 439,
+  "consensus_change_in_this_release": false,
+  "hf133_activation_height": 100000,
+  "all_three_follow_up_issues_deferred_by_user": true,
+  "reproducibility_claim": "Exact tested input sources are provided; bit-for-bit compiler reproducibility is not asserted.",
+  "installer_embedded_notes": "Passed installer retains its original candidate notes; current public release notes are separate release documents.",
+  "repository_root_source": "Linux exact 441-file source; Windows differences retained under release/HF134/windows-source-overrides; both exact source ZIPs are separate release assets."
+}

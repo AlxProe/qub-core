@@ -22,6 +22,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[path = "../gpu_miner.rs"]
 mod gpu_miner;
 #[cfg(target_os = "windows")]
+#[path = "qub_core/updater.rs"]
+mod hf134_updater;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::process::{Command, Stdio};
@@ -41,7 +44,7 @@ unsafe extern "system" {
 
 const APP_TITLE: &str = "Qubit Coin Core";
 const APP_TITLE_TESTNET: &str = "Qubit Coin Core Testnet";
-const APP_VERSION: &str = "v1.8.6";
+const APP_VERSION: &str = "v1.8.7";
 const BUILD_CONFIG: &str = env!("QUB_BUILD_CONFIG");
 const LOGO_PATH: &str = "assets/qubit-coin-logo.png";
 const OPENING_BANNER_PATH: &str = "assets/opening-banner.png";
@@ -144,6 +147,7 @@ struct Hf129CatchupOutcome {
     reason: String,
     writer_acquired: bool,
     writer_busy: bool,
+    active_writer: String,
     progressed: bool,
     fresh_at_tip: bool,
     before_height: u32,
@@ -289,8 +293,25 @@ fn hf130_gui_catchup_route(settings: &Settings, run_deep: bool) -> Result<Hf130G
     }
 }
 
+fn hf134_gui_startup_pending(settings: &Settings, route: Hf130GuiCatchupRoute) -> bool {
+    matches!(route, Hf130GuiCatchupRoute::PublicAuto | Hf130GuiCatchupRoute::PublicRepair)
+        && live_chain_arc(settings).is_none()
+}
+
 fn hf130_run_gui_catchup(settings: &Settings, run_deep: bool) -> Result<p2p::P2PSyncReport> {
-    match hf130_gui_catchup_route(settings, run_deep)? {
+    let route = hf130_gui_catchup_route(settings, run_deep)?;
+    // The embedded node publishes its live owner only after full validation.
+    // Starting a second replay from this GUI worker wastes CPU/memory and can
+    // hold the catch-up writer for the entire startup. CLI sync remains usable
+    // without an embedded node. GUI seed discovery is an independent reader.
+    if hf134_gui_startup_pending(settings, route) {
+        return Ok(p2p::P2PSyncReport {
+            terminal: "waiting-startup-validation".to_string(),
+            sync_reason: "startup-validation".to_string(),
+            ..Default::default()
+        });
+    }
+    match route {
         Hf130GuiCatchupRoute::PublicRepair => p2p::hf110_deep_official_repair(settings, 420_000),
         Hf130GuiCatchupRoute::PublicAuto => p2p::hf90_auto_catchup(settings, 240_000),
         Hf130GuiCatchupRoute::RegtestPeers => {
@@ -325,6 +346,7 @@ fn spawn_hf130_catchup_pulse(config_path: String, request: Hf130CatchupRequest) 
     }
     HF105_CATCHUP_STARTED_MS.store(hf85_now_ms(), Ordering::SeqCst);
     thread::spawn(move || {
+        let mut startup_deferred = false;
         // One initial pass plus one coalesced explicit manual request. Automatic
         // timers cannot create a third pass, even when a pass lasts minutes.
         for pass in 0..2 {
@@ -344,6 +366,7 @@ fn spawn_hf130_catchup_pulse(config_path: String, request: Hf130CatchupRequest) 
                     } else { reason.to_string() },
                     writer_acquired: report.writer_acquired,
                     writer_busy: report.writer_busy,
+                    active_writer: report.active_writer,
                     progressed: report.progressed,
                     fresh_at_tip: report.fresh_at_tip,
                     before_height: report.before_height,
@@ -362,15 +385,22 @@ fn spawn_hf130_catchup_pulse(config_path: String, request: Hf130CatchupRequest) 
                 },
             };
             outcome.epoch = hf85_catchup_epoch().saturating_add(1);
+            startup_deferred = outcome.terminal == "waiting-startup-validation";
             // Publish every pass, including a busy/failed manual repair. A busy
             // deadline is an outcome, not permission to restart it forever.
             hf129_publish_catchup_outcome(outcome);
+            if startup_deferred {
+                // Retain one explicit request for the normal timer after the
+                // node is ready. Never recursively retry a deferred startup.
+                if run_deep { HF130_CATCHUP_MANUAL_PENDING.store(true, Ordering::SeqCst); }
+                break;
+            }
             if !HF130_CATCHUP_MANUAL_PENDING.load(Ordering::SeqCst) { break; }
             HF105_CATCHUP_STARTED_MS.store(hf85_now_ms(), Ordering::SeqCst);
         }
         HF105_CATCHUP_IN_FLIGHT.store(false, Ordering::SeqCst);
         // Close the handoff race for a real click; do not enqueue another click.
-        if HF130_CATCHUP_MANUAL_PENDING.load(Ordering::SeqCst) {
+        if !startup_deferred && HF130_CATCHUP_MANUAL_PENDING.load(Ordering::SeqCst) {
             spawn_hf130_catchup_pulse(config_path, Hf130CatchupRequest::Automatic);
         }
     });
@@ -494,6 +524,16 @@ fn default_setup_profile() -> SetupProfile {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new(hf134_updater::HELPER_FLAG)) {
+            let code = args.next().map(PathBuf::from)
+                .map(|path| if hf134_updater::helper_main(&path).is_ok() { 0 } else { 1 }).unwrap_or(2);
+            // Helper mode never initializes a window/GPU or the node.
+            std::process::exit(code);
+        }
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("{} {}", app_title(), APP_VERSION))
         .with_inner_size([1220.0, 820.0])
@@ -1771,7 +1811,7 @@ struct QubCoreApp {
     library_state_cache: Option<LibraryState>,
     library_state_rx: Option<mpsc::Receiver<std::result::Result<LibraryState, String>>>,
     library_state_in_flight: bool,
-    library_state_last_started: Instant,
+    library_state_last_started: ElapsedTimer,
     library_state_last_loaded: Option<Instant>,
     library_state_error: Option<String>,
     library_action_rx: Option<mpsc::Receiver<LibraryActionEvent>>,
@@ -1779,7 +1819,7 @@ struct QubCoreApp {
     pool_mining_pool_id: String,
     right_balances_collapsed: bool,
     right_activity_collapsed: bool,
-    last_send_status_poll: Instant,
+    last_send_status_poll: ElapsedTimer,
     snapshot_rx: Option<mpsc::Receiver<std::result::Result<ChainSnapshot, String>>>,
     snapshot_in_flight: bool,
     last_applied_snapshot_capture_seq: u64,
@@ -1802,9 +1842,9 @@ struct QubCoreApp {
     send_qns_resolve_rx: Option<mpsc::Receiver<std::result::Result<(String, String), String>>>,
     send_qns_resolve_in_flight: bool,
     multi_qns_resolve_rx: Option<mpsc::Receiver<(usize, String, std::result::Result<String, String>)>>,
-    last_wallet_sync: Instant,
+    last_wallet_sync: ElapsedTimer,
     app_started: Instant,
-    last_refresh: Instant,
+    last_refresh: ElapsedTimer,
     hash_rate_hps: f64,
     total_hashes: u64,
     gpu_hash_rate_hps: f64,
@@ -1832,11 +1872,16 @@ struct QubCoreApp {
     p2p_node_started: bool,
     p2p_node_rx: Option<mpsc::Receiver<String>>,
     update_dialog: UpdateDialog,
+    #[cfg(target_os = "windows")]
+    update_handoff_rx: Option<mpsc::Receiver<std::result::Result<hf134_updater::Handoff, String>>>,
+    update_close_ready: bool,
+    update_auto_install_blocked: bool,
+    hf134_last_sync_log: ElapsedTimer,
     update_rx: Option<mpsc::Receiver<UpdateEvent>>,
     update_check_in_flight: bool,
     update_check_forced: bool,
     update_check_started_at: Option<Instant>,
-    last_update_check: Instant,
+    last_update_check: ElapsedTimer,
     qr_cache_address: String,
     qr_cache_texture: Option<egui::TextureHandle>,
     qr_hover_until: Option<Instant>,
@@ -1850,7 +1895,7 @@ struct QubCoreApp {
     enjin_metrics: EnjinMatrixMetrics,
     enjin_metrics_rx: Option<mpsc::Receiver<std::result::Result<EnjinMatrixMetrics, String>>>,
     enjin_metrics_in_flight: bool,
-    last_enjin_metrics_refresh: Instant,
+    last_enjin_metrics_refresh: ElapsedTimer,
     opening_banner: Option<egui::TextureHandle>,
     initial_loading: bool,
     initial_loading_started_at: Instant,
@@ -1864,13 +1909,13 @@ struct QubCoreApp {
     mining_restart_plan: Option<MiningRestartPlan>,
     next_miner_generation: u64,
     mining_plan_rejected_generation: Option<u64>,
-    hf85_last_auto_catchup_sync: Instant,
+    hf85_last_auto_catchup_sync: ElapsedTimer,
     hf85_auto_catchup_last_height: u32,
     hf85_auto_catchup_stale_since: Instant,
     hf85_seen_catchup_epoch: u64,
     hf129_retained_catchup_target_height: u32,
     hf129_retained_catchup_target_at: Option<Instant>,
-    hf88_last_peer_probe: Instant,
+    hf88_last_peer_probe: ElapsedTimer,
     hf88_last_snapshot_height: u32,
     hf88_snapshot_stale_since: Instant,
     hf88_snapshot_backoff_until: Option<Instant>,
@@ -2187,7 +2232,7 @@ impl QubCoreApp {
             library_state_cache: None,
             library_state_rx: None,
             library_state_in_flight: false,
-            library_state_last_started: Instant::now() - Duration::from_secs(60),
+            library_state_last_started: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             library_state_last_loaded: None,
             library_state_error: None,
             library_action_rx: None,
@@ -2195,7 +2240,7 @@ impl QubCoreApp {
             pool_mining_pool_id: String::new(),
             right_balances_collapsed: false,
             right_activity_collapsed: false,
-            last_send_status_poll: Instant::now() - Duration::from_secs(10),
+            last_send_status_poll: ElapsedTimer::with_elapsed(Duration::from_secs(10)),
             snapshot_rx: None,
             snapshot_in_flight: false,
             last_applied_snapshot_capture_seq: 0,
@@ -2220,10 +2265,10 @@ impl QubCoreApp {
             send_qns_resolve_rx: None,
             send_qns_resolve_in_flight: false,
             multi_qns_resolve_rx: None,
-            last_wallet_sync: Instant::now() - Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS),
+            last_wallet_sync: ElapsedTimer::with_elapsed(Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS)),
 
             app_started: Instant::now(),
-            last_refresh: Instant::now() - Duration::from_secs(10),
+            last_refresh: ElapsedTimer::with_elapsed(Duration::from_secs(10)),
             hash_rate_hps: 0.0,
             total_hashes: 0,
             gpu_hash_rate_hps: 0.0,
@@ -2251,11 +2296,16 @@ impl QubCoreApp {
             p2p_node_started: false,
             p2p_node_rx: None,
             update_dialog: UpdateDialog::default(),
+            #[cfg(target_os = "windows")]
+            update_handoff_rx: None,
+            update_close_ready: false,
+            update_auto_install_blocked: false,
+            hf134_last_sync_log: ElapsedTimer::with_elapsed(Duration::from_secs(15)),
             update_rx: None,
             update_check_in_flight: false,
             update_check_forced: false,
             update_check_started_at: None,
-            last_update_check: Instant::now() - Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS),
+            last_update_check: ElapsedTimer::with_elapsed(Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS)),
             qr_cache_address: String::new(),
             qr_cache_texture: None,
             qr_hover_until: None,
@@ -2269,7 +2319,7 @@ impl QubCoreApp {
             enjin_metrics: EnjinMatrixMetrics::default(),
             enjin_metrics_rx: None,
             enjin_metrics_in_flight: false,
-            last_enjin_metrics_refresh: Instant::now() - Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS),
+            last_enjin_metrics_refresh: ElapsedTimer::with_elapsed(Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS)),
             opening_banner: load_asset_texture(&cc.egui_ctx, OPENING_BANNER_PATH, "opening-banner"),
             initial_loading: true,
             initial_loading_started_at: Instant::now(),
@@ -2283,13 +2333,13 @@ impl QubCoreApp {
             mining_restart_plan: None,
             next_miner_generation: 1,
             mining_plan_rejected_generation: None,
-            hf85_last_auto_catchup_sync: Instant::now() - Duration::from_secs(60),
+            hf85_last_auto_catchup_sync: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             hf85_auto_catchup_last_height: 0,
             hf85_auto_catchup_stale_since: Instant::now(),
             hf85_seen_catchup_epoch: hf85_catchup_epoch(),
             hf129_retained_catchup_target_height: 0,
             hf129_retained_catchup_target_at: None,
-            hf88_last_peer_probe: Instant::now() - Duration::from_secs(60),
+            hf88_last_peer_probe: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             hf88_last_snapshot_height: 0,
             hf88_snapshot_stale_since: Instant::now(),
             hf88_snapshot_backoff_until: None,
@@ -2310,6 +2360,7 @@ impl QubCoreApp {
         app.apply_hf105_first_run_auto_restart_default();
         app.update_runtime_identity();
         if let Some(update_error) = consume_update_install_error() {
+            app.update_auto_install_blocked = true;
             app.last_error = Some(update_error.clone());
             app.status_line = update_error;
         }
@@ -2367,7 +2418,7 @@ impl QubCoreApp {
         let (tx, rx) = mpsc::channel();
         self.enjin_metrics_rx = Some(rx);
         self.enjin_metrics_in_flight = true;
-        self.last_enjin_metrics_refresh = Instant::now();
+        self.last_enjin_metrics_refresh = ElapsedTimer::now();
         thread::spawn(move || {
             let result = fetch_enjin_matrix_metrics_direct().map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
@@ -2779,6 +2830,14 @@ Personal record: {}", format_hps(current), format_hps(peak)));
     }
 
     fn sync_progress_rows(&self, label: &str) -> (String, String, String) {
+        if let Some(replay) = validation_progress::snapshot(&self.snapshot.data_dir) {
+            return (
+                "Validating saved chain".to_string(),
+                format!("Checked #{} / #{} | observed network #{}", replay.checked_height,
+                    replay.target_height, self.best_known_network_height()),
+                format!("{}s elapsed | Network catch-up continues after local validation", replay.elapsed_seconds),
+            );
+        }
         let elapsed = if self.wallet_sync_in_flight {
             self.last_wallet_sync.elapsed().as_secs()
         } else if self.snapshot_in_flight {
@@ -2818,7 +2877,10 @@ Personal record: {}", format_hps(current), format_hps(peak)));
 
     fn ui_sync_progress_bar_rows(&self, ui: &mut egui::Ui, label: &str, rows: usize) {
         let (headline, detail, meta) = self.sync_progress_rows(label);
-        ui.add(egui::ProgressBar::new(self.sync_progress_fraction()).show_percentage().text(headline));
+        let fraction = validation_progress::snapshot(&self.snapshot.data_dir)
+            .map(|replay| replay.checked_height as f32 / replay.target_height.max(1) as f32)
+            .unwrap_or_else(|| self.sync_progress_fraction());
+        ui.add(egui::ProgressBar::new(fraction).show_percentage().text(headline));
         if rows >= 3 {
             ui.small(detail);
             ui.small(meta);
@@ -2838,7 +2900,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 self.last_error = Some(format!("Refresh failed: {err:#}"));
             }
         }
-        self.last_refresh = Instant::now();
+        self.last_refresh = ElapsedTimer::now();
         self.update_runtime_identity();
     }
 
@@ -2872,7 +2934,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 self.hf129_retained_catchup_target_height = 0;
                 self.hf129_retained_catchup_target_at = None;
             }
-            self.last_refresh = Instant::now();
+            self.last_refresh = ElapsedTimer::now();
             self.update_runtime_identity();
             return;
         }
@@ -2928,11 +2990,11 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         let was_initial_loading = self.initial_loading;
         if self.initial_loading {
             self.initial_loading = false;
-            self.hf85_last_auto_catchup_sync = Instant::now() - Duration::from_secs(60);
+            self.hf85_last_auto_catchup_sync = ElapsedTimer::with_elapsed(Duration::from_secs(60));
         }
         if self.prefs.setup_complete && !self.p2p_node_started && matches!(self.snapshot.network.as_str(), "mainnet" | "testnet") {
             self.ensure_p2p_node_started();
-            self.hf85_last_auto_catchup_sync = Instant::now();
+            self.hf85_last_auto_catchup_sync = ElapsedTimer::now();
             spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), false);
             self.status_line = if was_initial_loading {
                 "QUB Core ready: local wallet/blocks are visible; QUB Core network catch-up is detached in the background.".to_string()
@@ -2943,6 +3005,33 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             self.status_line = "QUB Core ready: local wallet/blocks are visible.".to_string();
         }
         self.update_runtime_identity();
+    }
+
+    fn hf134_record_sync_status(&mut self) {
+        if self.hf134_last_sync_log.elapsed() < Duration::from_secs(15) { return; }
+        self.hf134_last_sync_log = ElapsedTimer::now();
+        let record = serde_json::json!({
+            "unix_ms": hf85_now_ms(), "version": APP_VERSION,
+            "local_height": self.snapshot.height, "local_tip": self.snapshot.best_hash,
+            "observed_height": self.best_known_network_height(),
+            "writer": p2p::hf134_sync_writer_status(),
+            "validation": validation_progress::snapshot(&self.snapshot.data_dir),
+            "gui_request_running": hf85_catchup_running(),
+            "gui_request_elapsed_secs": hf85_catchup_elapsed_secs(),
+        });
+        let path = app_write_path("data/hf134-sync.jsonl");
+        // Bounded, public chain/process diagnostics only; no wallet material.
+        let _ = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+            if std::fs::metadata(&path).map(|m| m.len() > 2 * 1024 * 1024).unwrap_or(false) {
+                let previous = path.with_extension("previous.jsonl");
+                let _ = std::fs::remove_file(&previous);
+                std::fs::rename(&path, previous)?;
+            }
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            writeln!(file, "{record}")
+        })();
     }
 
     fn maybe_start_hf85_auto_catchup_sync(&mut self) {
@@ -2965,7 +3054,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         // because the first sync worker owned both discovery and wallet loading.
         if known == 0 {
             if self.hf85_last_auto_catchup_sync.elapsed() >= Duration::from_secs(20) {
-                self.hf85_last_auto_catchup_sync = Instant::now();
+                self.hf85_last_auto_catchup_sync = ElapsedTimer::now();
                 self.status_line = "QUB Core background catch-up pulse: discovering official/peer tip after local wallet loaded.".to_string();
                 spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), false);
             }
@@ -2981,7 +3070,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             // a low-frequency official/peer pulse alive. This is the safety net
             // for users who leave QUB Core open overnight without pressing Sync.
             if self.hf85_last_auto_catchup_sync.elapsed() >= Duration::from_secs(18) {
-                self.hf85_last_auto_catchup_sync = Instant::now();
+                self.hf85_last_auto_catchup_sync = ElapsedTimer::now();
                 self.status_line = format!("QUB Core heartbeat catch-up: last visible local #{} matches the last observed height; checking peers for a fresh tip.", local);
                 spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), false);
             }
@@ -3009,7 +3098,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             else { Duration::from_secs(14) };
 
         if self.hf85_last_auto_catchup_sync.elapsed() >= interval {
-            self.hf85_last_auto_catchup_sync = Instant::now();
+            self.hf85_last_auto_catchup_sync = ElapsedTimer::now();
             self.status_line = format!(
                 "QUB Core detached catch-up: local #{} -> observed #{} ({} block(s) difference, unchanged for {}s). Mining validates its parent independently.",
                 local,
@@ -3056,6 +3145,8 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         self.hf86_force_quick_snapshot |= refresh_needed;
         self.status_line = if outcome.reason == "regtest-local-only" {
             "Regtest wallet refreshed locally. Press Sync to catch up from the configured peers.".to_string()
+        } else if outcome.terminal == "waiting-startup-validation" {
+            "Validating the saved chain before network catch-up. Sync remains queued; peer discovery continues.".to_string()
         } else if outcome.terminal == "p2p-disabled" {
             "Network Sync is disabled in the active configuration; the wallet refresh is local only.".to_string()
         } else if outcome.reason == "regtest-peer-sync" {
@@ -3081,7 +3172,8 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 outcome.after_height
             )
         } else if outcome.writer_busy {
-            "QUB Core catch-up could not acquire the active writer. No blocks were checked by this request; automatic retry remains scheduled.".to_string()
+            format!("Catch-up is waiting for the current sync worker: {}. This request checked no blocks; automatic retry remains scheduled.",
+                p2p::hf134_sync_writer_status().unwrap_or_else(|| outcome.active_writer.clone()))
         } else if !outcome.error.trim().is_empty() {
             self.last_error = Some(format!(
                 "QUB Core catch-up {} failed: {}",
@@ -3122,12 +3214,12 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 self.hf88_snapshot_backoff_until = None;
                 self.hf88_snapshot_timeout_count = 0;
                 self.hf88_last_snapshot_success = Instant::now();
-                self.last_refresh = self.hf88_last_snapshot_success;
+                self.last_refresh = self.hf88_last_snapshot_success.into();
                 self.apply_snapshot(snapshot);
                 if wallet_requested {
                     // Space automatic scans from real completion. A slow read
                     // must not make the next timer immediately start another.
-                    self.last_wallet_sync = Instant::now();
+                    self.last_wallet_sync = ElapsedTimer::now();
                     self.status_line = "Local wallet snapshot refreshed. Network Sync/Repair reports its verified result separately.".to_string();
                 }
             }
@@ -3211,7 +3303,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                 self.snapshot_rx = Some(rx);
                 self.snapshot_in_flight = true;
                 self.hf86_force_quick_snapshot = false;
-                self.last_refresh = Instant::now();
+                self.last_refresh = ElapsedTimer::now();
                 if startup_sync {
                     self.status_line = "Startup: loading local wallet/blocks first; network catch-up starts after the local view is visible...".to_string();
                 }
@@ -3418,7 +3510,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
         // reader is already running. It never drops that reader's receiver or
         // starts a duplicate scan after an arbitrary 12/45-second UI timeout.
         spawn_hf85_catchup_pulse(self.prefs.config_path.clone(), force);
-        if !self.wallet_sync_in_flight { self.last_wallet_sync = Instant::now(); }
+        if !self.wallet_sync_in_flight { self.last_wallet_sync = ElapsedTimer::now(); }
         self.wallet_sync_in_flight = true;
         if force {
             self.status_line = if self.snapshot.network == "regtest" {
@@ -3602,6 +3694,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
     }
 
     fn start_update_check(&mut self, force: bool) {
+        if self.update_dialog.status == UpdateStatus::Installing || self.update_close_ready { return; }
         if self.update_check_in_flight {
             if force {
                 self.update_dialog.open = true;
@@ -3656,11 +3749,11 @@ Personal record: {}", format_hps(current), format_hps(peak)));
             self.update_dialog.message = format!("Could not start update worker: {err}");
             self.update_dialog.open = force;
             self.last_error = Some(self.update_dialog.message.clone());
-            self.last_update_check = Instant::now();
+            self.last_update_check = ElapsedTimer::now();
             return;
         }
         self.update_rx = Some(rx);
-        self.last_update_check = Instant::now();
+        self.last_update_check = ElapsedTimer::now();
     }
 
     fn poll_updates(&mut self) {
@@ -3703,7 +3796,7 @@ Personal record: {}", format_hps(current), format_hps(peak)));
                     self.last_error = Some(format!("QUB Core {} is ready. Mining was stopped until you install the update.", version));
                 }
                 self.status_line = format!("Update {} ready. Install and restart from the Updates window.", version);
-                if self.prefs.auto_install_updates {
+                if self.prefs.auto_install_updates && !self.update_auto_install_blocked {
                     self.update_dialog.auto_install_at = Some(Instant::now() + Duration::from_secs(UPDATE_INSTALL_COUNTDOWN_SECS));
                     self.update_dialog.message = format!("{} Installing automatically in {} seconds unless you click Later.", self.update_dialog.message, UPDATE_INSTALL_COUNTDOWN_SECS);
                 }
@@ -3780,96 +3873,58 @@ Personal record: {}", format_hps(current), format_hps(peak)));
 
     fn install_downloaded_update(&mut self) -> Result<()> {
         #[cfg(not(target_os = "windows"))]
-        {
-            anyhow::bail!("Windows self-update is only available on Windows builds")
-        }
+        { anyhow::bail!("Windows self-update is only available on Windows builds") }
         #[cfg(target_os = "windows")]
         {
-            let installer = PathBuf::from(self.update_dialog.installer_path.trim());
-            if !installer.exists() {
-                anyhow::bail!("downloaded installer not found: {}", installer.display());
-            }
-            let expected_hash = self.update_dialog.installer_sha256.trim().to_ascii_lowercase();
-            if expected_hash.len() != 64
-                || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || self.update_dialog.installer_bytes == 0
-            {
-                anyhow::bail!("staged installer verification metadata is missing; run Check now again")
-            }
-            hf128_validate_update_file_size(
-                &installer,
-                Some(self.update_dialog.installer_bytes),
-                UPDATE_INSTALLER_MAX_BYTES,
-            )?;
-            let actual_hash = hf128_sha256_file(&installer)?;
-            if actual_hash != expected_hash {
-                anyhow::bail!(
-                    "staged installer changed after verification: got SHA256 {}, expected {}",
-                    actual_hash,
-                    expected_hash
-                );
-            }
-            let (installer_version, signature_status, signer) =
-                hf128_installer_metadata(&installer)?;
-            if installer_version.is_empty()
-                || compare_versions(&installer_version, &self.update_dialog.latest_version)
-                    != std::cmp::Ordering::Equal
-            {
-                anyhow::bail!(
-                    "staged installer version changed: got '{}', expected '{}'",
-                    installer_version,
-                    self.update_dialog.latest_version
-                );
-            }
-            hf128_validate_installer_signature(
-                &signature_status,
-                &signer,
-                self.update_dialog.installer_allow_unsigned,
-            )?;
+            if self.update_handoff_rx.is_some() || self.update_close_ready { return Ok(()); }
+            let request = hf134_updater::Request {
+                installer: PathBuf::from(self.update_dialog.installer_path.trim()),
+                sha256: self.update_dialog.installer_sha256.trim().to_ascii_lowercase(),
+                bytes: self.update_dialog.installer_bytes,
+                version: self.update_dialog.latest_version.clone(),
+                allow_unsigned: self.update_dialog.installer_allow_unsigned,
+                config: resolve_app_read_path(&self.prefs.config_path),
+            };
+            let (tx, rx) = mpsc::channel();
+            thread::Builder::new().name("qub-update-handoff".into()).spawn(move || {
+                let result = hf134_updater::prepare(request).map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            }).context("start update handoff worker")?;
+            self.update_handoff_rx = Some(rx);
+            self.update_dialog.auto_install_at = None;
             self.update_dialog.status = UpdateStatus::Installing;
-            self.update_dialog.message = format!("Installing QUB Core {} and restarting...", self.update_dialog.latest_version);
+            self.update_dialog.message = "Verifying update and preparing restart...".into();
             self.stop_mining();
             self.save_prefs_if_needed();
-            let current_exe = std::env::current_exe().context("current exe unavailable")?;
-            let app_dir = current_exe.parent().context("missing current exe dir")?;
-            let config_path = resolve_app_read_path(&self.prefs.config_path);
-            let launcher = app_write_path("data/updater/install-and-relaunch.cmd");
-            let restart_marker = app_write_path(HF105_POST_UPDATE_RESTART_MARKER);
-            let install_result = app_write_path(UPDATE_INSTALL_RESULT_PATH);
-            if let Some(parent) = launcher.parent() { std::fs::create_dir_all(parent)?; }
-            let script = format!(r#"@echo off
-setlocal
-ping 127.0.0.1 -n 3 >nul
-start /wait "" "{}" /SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /DIR="{}"
-set "QUB_UPDATE_RC=%ERRORLEVEL%"
-if not "%QUB_UPDATE_RC%"=="0" (
-  >"{}" echo QUB Core update installer failed with exit code %QUB_UPDATE_RC%. The previous version was relaunched; retry from Updates or install manually.
-  start "" "{}" --config "{}"
-  del "%~f0"
-  exit /b %QUB_UPDATE_RC%
-)
-if exist "{}" del /q "{}"
->"{}" echo post-update-restart
-start "" "{}" --config "{}"
-del "%~f0"
-"#,
-                installer.display(),
-                app_dir.display(),
-                install_result.display(),
-                current_exe.display(),
-                config_path.display(),
-                install_result.display(),
-                install_result.display(),
-                restart_marker.display(),
-                current_exe.display(),
-                config_path.display(),
-            );
-            std::fs::write(&launcher, script)?;
-            let mut command = Command::new("cmd.exe");
-            command.args(["/C", launcher.to_string_lossy().as_ref()]);
-            hide_command_window(&mut command);
-            command.spawn().context("spawn updater launcher")?;
-            std::process::exit(0);
+            Ok(())
+        }
+    }
+
+    fn poll_hf134_update_handoff(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if let Some(rx) = &self.update_handoff_rx {
+            let received = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Update handoff worker stopped".into())),
+            };
+            if let Some(result) = received {
+                self.update_handoff_rx = None;
+                match result.and_then(|mut handoff| handoff.arm().map_err(|e| format!("{e:#}"))) {
+                    Ok(()) => self.update_close_ready = true,
+                    Err(error) => {
+                        self.update_auto_install_blocked = true;
+                        self.update_dialog.status = UpdateStatus::Failed;
+                        self.update_dialog.message = format!("Update could not start: {error}");
+                        self.last_error = Some(self.update_dialog.message.clone());
+                    }
+                }
+            }
+        }
+        if self.update_close_ready {
+            // Return through the native event loop instead of exiting from its
+            // callback. The helper waits on our exact OS process handle.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -4732,7 +4787,7 @@ del "%~f0"
             && !self.conversion_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.conversion_dialog.txid.clone());
         }
     }
@@ -4910,7 +4965,7 @@ del "%~f0"
                         relayed_to_peers
                     );
                     self.last_success = Some(format!("{} created: {}", self.qub_jin_dialog.mode.pending_label(), shorten_hash(&txid)));
-                    self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                    self.last_send_status_poll = ElapsedTimer::with_elapsed(Duration::from_secs(10));
                     self.start_tx_status_check(txid);
                     self.start_background_snapshot_refresh();
                 }
@@ -4925,7 +4980,7 @@ del "%~f0"
             && !self.qub_jin_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.qub_jin_dialog.txid.clone());
         }
     }
@@ -5090,7 +5145,7 @@ del "%~f0"
                         )
                     };
                     self.last_success = Some(format!("Transaction created: {}", shorten_hash(&txid)));
-                    self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                    self.last_send_status_poll = ElapsedTimer::with_elapsed(Duration::from_secs(10));
                     self.start_background_snapshot_refresh();
                 }
                 SendEvent::Failed(err) => {
@@ -5104,7 +5159,7 @@ del "%~f0"
             && !self.send_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.send_dialog.txid.clone());
         }
     }
@@ -5188,7 +5243,7 @@ del "%~f0"
                 self.buy_jin_dialog.relayed_to_peers = relayed_to_peers;
                 self.buy_jin_dialog.message = format!("JIN purchase pending. txid={} local mempool={} relayed_to_peers={}. Waiting for confirmation.", shorten_hash(&txid), local_mempooltx, relayed_to_peers);
                 self.last_success = Some(format!("JIN purchase created: {}", shorten_hash(&txid)));
-                self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                self.last_send_status_poll = ElapsedTimer::with_elapsed(Duration::from_secs(10));
                 self.start_tx_status_check(txid);
                 self.start_background_snapshot_refresh();
                 self.request_buy_jin_listings(ctx, true);
@@ -5209,7 +5264,7 @@ del "%~f0"
             && !self.buy_jin_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.buy_jin_dialog.txid.clone());
         }
     }
@@ -5293,7 +5348,7 @@ del "%~f0"
             && !self.qns_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.qns_dialog.txid.clone());
         }
     }
@@ -5576,7 +5631,7 @@ del "%~f0"
             && !self.pool_dialog.txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.pool_dialog.txid.clone());
         }
     }
@@ -5619,7 +5674,7 @@ del "%~f0"
         let (tx, rx) = mpsc::channel();
         self.library_state_rx = Some(rx);
         self.library_state_in_flight = true;
-        self.library_state_last_started = Instant::now();
+        self.library_state_last_started = ElapsedTimer::now();
         self.library_state_error = None;
         thread::spawn(move || {
             let result = library_state_for_gui(&config_path).map_err(|err| format!("{err:#}"));
@@ -6488,7 +6543,7 @@ del "%~f0"
                         });
                         ui.small(format!("Local mempool txs: {} | Acknowledged peers: {}", self.qub_jin_dialog.local_mempooltx, self.qub_jin_dialog.relayed_to_peers));
                         if ui.button("Keep open / refresh status").clicked() {
-                            self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                            self.last_send_status_poll = ElapsedTimer::with_elapsed(Duration::from_secs(10));
                         }
                     }
                     SendDialogStatus::Confirmed => {
@@ -7524,7 +7579,7 @@ del "%~f0"
                 self.library_action_in_flight = false;
                 self.library_dialog.pending_txid = txid.clone();
                 self.library_dialog.message = format!("Library pending tx: {} relayed_to_peers={} local_mempool={}. It will clear after confirmation.", shorten_hash(&txid), relayed_to_peers, local_mempooltx);
-                self.last_send_status_poll = Instant::now() - Duration::from_secs(10);
+                self.last_send_status_poll = ElapsedTimer::with_elapsed(Duration::from_secs(10));
                 self.start_tx_status_check(txid);
                 self.start_background_snapshot_refresh();
             }
@@ -7543,7 +7598,7 @@ del "%~f0"
         if !self.library_dialog.pending_txid.is_empty()
             && self.last_send_status_poll.elapsed() >= Duration::from_secs(5)
         {
-            self.last_send_status_poll = Instant::now();
+            self.last_send_status_poll = ElapsedTimer::now();
             self.start_tx_status_check(self.library_dialog.pending_txid.clone());
         }
     }
@@ -7655,6 +7710,7 @@ impl eframe::App for QubCoreApp {
         self.poll_library_action(ctx);
         self.poll_tx_status();
         self.poll_updates();
+        self.poll_hf134_update_handoff(ctx);
         self.poll_wallet_sync();
         self.poll_wallet_create();
         self.poll_send_qns_resolve();
@@ -7664,6 +7720,7 @@ impl eframe::App for QubCoreApp {
         self.poll_mining_loop_sound();
         self.maybe_start_hf85_auto_catchup_sync();
         self.poll_hf85_catchup_completion();
+        self.hf134_record_sync_status();
 
         if !self.initial_loading && self.pending_start_mining_on_open {
             self.pending_start_mining_on_open = false;
@@ -10665,7 +10722,10 @@ impl QubCoreApp {
                 if preparing_recent || wallet_sync_recent || snapshot_recent || self.update_check_in_flight || self.tx_status_in_flight || self.pool_rx.is_some() {
                     ui.spinner();
                 }
-                ui.label(egui::RichText::new(&self.status_line).strong());
+                let replay_status = validation_progress::snapshot(&self.snapshot.data_dir)
+                    .map(|replay| format!("Validating saved chain: checked #{} / #{} | {}s elapsed | observed network #{}",
+                        replay.checked_height, replay.target_height, replay.elapsed_seconds, self.best_known_network_height()));
+                ui.label(egui::RichText::new(replay_status.as_deref().unwrap_or(&self.status_line)).strong());
                 if let Some(success) = &self.last_success {
                     ui.separator();
                     ui.label(success);
@@ -10753,7 +10813,8 @@ fn consume_hf86_post_update_restart_marker() -> bool {
 fn consume_update_install_error() -> Option<String> {
     let path = app_write_path(UPDATE_INSTALL_RESULT_PATH);
     let message = std::fs::read_to_string(&path).ok()?;
-    let _ = std::fs::remove_file(path);
+    // Keep a failed-update receipt until a successful helper clears it. This
+    // prevents an automatic install/crash loop after the next manual launch.
     let message = message.trim().to_string();
     (!message.is_empty()).then_some(message)
 }
@@ -15751,13 +15812,12 @@ fn hf128_curl_download(
     anyhow::bail!("Update download failed after 3 bounded attempts: {}", failures.join(" | "))
 }
 
-#[cfg(target_os = "windows")]
 fn hf128_sha256_file(path: &Path) -> Result<String> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open staged update {}", path.display()))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 1024 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -15856,7 +15916,7 @@ fn hf128_commit_verified_staged_file(
 fn hf128_installer_metadata(path: &Path) -> Result<(String, String, String)> {
     let escaped = path.display().to_string().replace('\'', "''");
     let command = format!(
-        "$item=Get-Item '{}'; $sig=Get-AuthenticodeSignature -FilePath '{}'; [pscustomobject]@{{version=[string]$item.VersionInfo.ProductVersion; signature_status=[string]$sig.Status; signer=if($sig.SignerCertificate){{$sig.SignerCertificate.Subject}}else{{''}}}} | ConvertTo-Json -Compress",
+        "$item=Get-Item -LiteralPath '{}'; $sig=Get-AuthenticodeSignature -LiteralPath '{}'; [pscustomobject]@{{version=[string]$item.VersionInfo.ProductVersion; signature_status=[string]$sig.Status; signer=if($sig.SignerCertificate){{$sig.SignerCertificate.Subject}}else{{''}}}} | ConvertTo-Json -Compress",
         escaped, escaped
     );
     let metadata = powershell_json_bounded(&command, Duration::from_secs(45))?;
@@ -16275,6 +16335,50 @@ mod hf131_mining_tests {
             assert!(hf129_authorized_restart_plan(&None, Some(&plan), 8, &resolved).is_none());
             assert!(hf129_authorized_restart_plan(&Some(resolved.clone()), Some(&plan), 9, &resolved).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod hf134_startup_sync_tests {
+    use super::*;
+
+    fn settings() -> Settings {
+        // The GUI binary uses the library's public loader, which applies the
+        // network consensus overrides and validates this source-only fixture.
+        let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/mainnet.toml");
+        let mut settings = Settings::load_from_path(&config).expect("mainnet test settings");
+        settings.p2p.enabled = true;
+        settings.mining.enabled = false;
+        settings.node.data_dir = std::env::temp_dir().join(format!("qub-hf134-gui-startup-test-{}-{}",
+            std::process::id(), rand::random::<u64>())).to_string_lossy().into_owned();
+        settings
+    }
+
+    #[test]
+    fn hf134_gui_cold_sync_defers_without_creating_chain_or_writer() {
+        let settings = settings();
+        assert!(!Path::new(&settings.node.data_dir).exists());
+        for deep in [false, true] {
+            let report = hf130_run_gui_catchup(&settings, deep).unwrap();
+            assert_eq!(report.terminal, "waiting-startup-validation");
+            assert!(!report.writer_acquired && !report.progressed && !report.fresh_at_tip);
+            assert!(validation_progress::snapshot(&settings.node.data_dir).is_none());
+            assert!(!Path::new(&settings.node.data_dir).exists(), "deferred GUI sync touched chain storage");
+        }
+    }
+
+    #[test]
+    fn hf134_gui_ready_owner_is_distinct_from_busy_owner() {
+        let settings = settings();
+        let chain = Arc::new(Mutex::new(ChainState::new_with_genesis(&settings).unwrap()));
+        register_live_chain(&settings, &chain);
+        let busy = chain.lock().unwrap();
+        assert!(!hf134_gui_startup_pending(&settings, Hf130GuiCatchupRoute::PublicAuto));
+        assert!(!hf134_gui_startup_pending(&settings, Hf130GuiCatchupRoute::PublicRepair));
+        drop(busy);
+        unregister_live_chain(&settings);
+        assert!(hf134_gui_startup_pending(&settings, Hf130GuiCatchupRoute::PublicAuto));
+        assert!(!Path::new(&settings.node.data_dir).exists());
     }
 }
 
@@ -16813,7 +16917,7 @@ mod hf132_gui_sync_tests {
             library_state_cache: None,
             library_state_rx: None,
             library_state_in_flight: false,
-            library_state_last_started: Instant::now() - Duration::from_secs(60),
+            library_state_last_started: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             library_state_last_loaded: None,
             library_state_error: None,
             library_action_rx: None,
@@ -16821,7 +16925,7 @@ mod hf132_gui_sync_tests {
             pool_mining_pool_id: String::new(),
             right_balances_collapsed: false,
             right_activity_collapsed: false,
-            last_send_status_poll: Instant::now() - Duration::from_secs(10),
+            last_send_status_poll: ElapsedTimer::with_elapsed(Duration::from_secs(10)),
             snapshot_rx: None,
             snapshot_in_flight: false,
             last_applied_snapshot_capture_seq: 0,
@@ -16846,10 +16950,10 @@ mod hf132_gui_sync_tests {
             send_qns_resolve_rx: None,
             send_qns_resolve_in_flight: false,
             multi_qns_resolve_rx: None,
-            last_wallet_sync: Instant::now() - Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS),
+            last_wallet_sync: ElapsedTimer::with_elapsed(Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS)),
 
             app_started: Instant::now(),
-            last_refresh: Instant::now() - Duration::from_secs(10),
+            last_refresh: ElapsedTimer::with_elapsed(Duration::from_secs(10)),
             hash_rate_hps: 0.0,
             total_hashes: 0,
             gpu_hash_rate_hps: 0.0,
@@ -16877,11 +16981,16 @@ mod hf132_gui_sync_tests {
             p2p_node_started: false,
             p2p_node_rx: None,
             update_dialog: UpdateDialog::default(),
+            #[cfg(target_os = "windows")]
+            update_handoff_rx: None,
+            update_close_ready: false,
+            update_auto_install_blocked: false,
+            hf134_last_sync_log: ElapsedTimer::with_elapsed(Duration::from_secs(15)),
             update_rx: None,
             update_check_in_flight: false,
             update_check_forced: false,
             update_check_started_at: None,
-            last_update_check: Instant::now() - Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS),
+            last_update_check: ElapsedTimer::with_elapsed(Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS)),
             qr_cache_address: String::new(),
             qr_cache_texture: None,
             qr_hover_until: None,
@@ -16895,7 +17004,7 @@ mod hf132_gui_sync_tests {
             enjin_metrics: EnjinMatrixMetrics::default(),
             enjin_metrics_rx: None,
             enjin_metrics_in_flight: false,
-            last_enjin_metrics_refresh: Instant::now() - Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS),
+            last_enjin_metrics_refresh: ElapsedTimer::with_elapsed(Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS)),
             opening_banner: None,
             initial_loading: false,
             initial_loading_started_at: Instant::now(),
@@ -16909,19 +17018,40 @@ mod hf132_gui_sync_tests {
             mining_restart_plan: None,
             next_miner_generation: 1,
             mining_plan_rejected_generation: None,
-            hf85_last_auto_catchup_sync: Instant::now() - Duration::from_secs(60),
+            hf85_last_auto_catchup_sync: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             hf85_auto_catchup_last_height: 0,
             hf85_auto_catchup_stale_since: Instant::now(),
             hf85_seen_catchup_epoch: hf85_catchup_epoch(),
             hf129_retained_catchup_target_height: 0,
             hf129_retained_catchup_target_at: None,
-            hf88_last_peer_probe: Instant::now() - Duration::from_secs(60),
+            hf88_last_peer_probe: ElapsedTimer::with_elapsed(Duration::from_secs(60)),
             hf88_last_snapshot_height: 0,
             hf88_snapshot_stale_since: Instant::now(),
             hf88_snapshot_backoff_until: None,
             hf88_snapshot_timeout_count: 0,
             hf88_last_snapshot_success: Instant::now(),
         }
+    }
+
+    #[test]
+    fn hf134_gui_initial_timers_are_due_and_snapshot_reset_is_fresh() {
+        let mut app = callback_app(GuiPrefs::default());
+        assert!(app.library_state_last_started.elapsed() >= Duration::from_secs(60));
+        assert!(app.last_send_status_poll.elapsed() >= Duration::from_secs(10));
+        assert!(app.last_wallet_sync.elapsed() >= Duration::from_secs(DEFAULT_WALLET_SYNC_INTERVAL_SECS));
+        assert!(app.last_refresh.elapsed() >= Duration::from_secs(10));
+        assert!(app.hf134_last_sync_log.elapsed() >= Duration::from_secs(15));
+        assert!(app.last_update_check.elapsed() >= Duration::from_secs(UPDATE_CHECK_INTERVAL_SECS));
+        assert!(app.last_enjin_metrics_refresh.elapsed() >= Duration::from_secs(ENJIN_MATRIX_METRICS_REFRESH_SECS));
+        assert!(app.hf85_last_auto_catchup_sync.elapsed() >= Duration::from_secs(60));
+        assert!(app.hf88_last_peer_probe.elapsed() >= Duration::from_secs(60));
+        app.hf88_last_snapshot_success = Instant::now();
+        app.last_refresh = app.hf88_last_snapshot_success.into();
+        let before = app.hf88_last_snapshot_success.elapsed();
+        let refresh_age = app.last_refresh.elapsed();
+        let after = app.hf88_last_snapshot_success.elapsed();
+        assert!(before <= refresh_age && refresh_age <= after);
+        assert!(app.miner.is_none() && !app.p2p_node_started);
     }
 
     #[test]
@@ -16994,8 +17124,8 @@ mod hf132_gui_sync_tests {
                 app.snapshot_rx = Some(snapshot_rx);
                 app.snapshot_in_flight = true;
                 app.wallet_sync_in_flight = true;
-                app.last_wallet_sync = Instant::now() - Duration::from_secs(1921);
-                app.last_refresh = Instant::now() - Duration::from_secs(1921);
+                app.last_wallet_sync = ElapsedTimer::with_elapsed(Duration::from_secs(1921));
+                app.last_refresh = ElapsedTimer::with_elapsed(Duration::from_secs(1921));
                 snapshot_tx.send(Ok(snapshot.clone())).unwrap();
                 app.poll_snapshot_refresh();
                 assert!(app.last_wallet_sync.elapsed() < Duration::from_secs(1), "automatic interval was not reset after real completion");
@@ -17140,5 +17270,23 @@ mod hf132_gui_sync_tests {
             assert_eq!(QubCoreApp::status_history_category(status), Some("background-sync"));
         }
         assert_eq!(QubCoreApp::status_history_category("QUB Core catch-up progressed #71487 -> #71515"), None);
+    }
+}
+
+#[cfg(test)]
+mod hf134_updater_stack_tests {
+    use super::*;
+    #[test]
+    fn hf134_installer_hash_fits_small_ui_stack() {
+        let path = std::env::temp_dir().join(format!("qub-hf134-hash-{}.bin", hf85_now_ms()));
+        let data = vec![37u8; 2 * 1024 * 1024 + 17];
+        let expected = hex::encode(Sha256::digest(&data));
+        std::fs::write(&path, data).unwrap();
+        let worker_path = path.clone();
+        // The old 1 MiB automatic buffer overflows this realistic small stack.
+        let actual = thread::Builder::new().stack_size(256 * 1024)
+            .spawn(move || hf128_sha256_file(&worker_path)).unwrap().join().unwrap().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(actual, expected);
     }
 }

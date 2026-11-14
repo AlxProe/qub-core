@@ -181,7 +181,7 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
         let mut value = serde_json::json!({
             "ok": false,
             "mode": "status-fast",
-            "version": "1.8.6",
+            "version": "1.8.7",
             "network": settings.network.name,
             "chain_file_exists": false,
             "fast_storage_exists": false,
@@ -263,7 +263,7 @@ fn status_fast_json(settings: &Settings, include_local_paths: bool) -> Result<se
     let mut value = serde_json::json!({
         "ok": true,
         "mode": "status-fast",
-        "version": "1.8.6",
+        "version": "1.8.7",
         "status_source": source_name,
         "network": status.network,
         "storage_engine": status.storage_engine,
@@ -2906,7 +2906,7 @@ fn explorer_route(
     if path.is_empty() || path == "/" || path == "/api" || path == "/api/v1" {
         return Ok(serde_json::json!({
             "service": "Qubit Coin Explorer API",
-            "version": "1.8.6",
+            "version": "1.8.7",
             "network": settings.network.name,
             "endpoints": [
                 "/api/v1/status-fast",
@@ -3754,5 +3754,5 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Option<String> {
     }
 }
 fn help(config: &str) {
-    println!("QUB Core v1.8.6\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
+    println!("QUB Core v1.8.7\nUsage: qubd --config {config} <command>\nCommands: init, info, status-fast, storage-stats, export-chain-json [path], validate, node, sync, peers, peers-raw, preflight, wallet-new, wallet-address, wallet-list, balance, mempool, relay-mempool, block-relay-status, relay-pending-block, tx-delivery-status [txid], relay-pending-txs, send <address> <amount> [fee], send-jin <address> <amount_jin> [fee] [JIN|QUB], send-multi <QUB|JIN> <addr:amount,...> [fee] [JIN|QUB], blast-create <total_qub> <per_claim_qub> <max_claims> [private_code] [fee], blast-claim <QUBBLAST1|txid|vout|code> [claimant-address], convert-jin-token <matrix-address> <amount_jin> [fee] [JIN|QUB], jin-balance [address], jin-sale-list, buy-jin <listing-id> <amount_jin> [fee], qub-jin-infusion, infuse-jin-qub <amount_jin> [fee], melt-qub-jin <amount_qub> [fee] [min_jin], mine [blocks] [address], pool-list, pool-info <pool-id>, pool-create <name> [commission_bps] [capacity_slots] [manager-address] [fee], pool-top-up <pool-id> <extra_capacity_slots> [fee], pool-set-commission <pool-id> <new_commission_bps> [fee], pool-rename <pool-id> <new-name> [fee], pool-join <pool-id> [miner-address], pool-mine <pool-id> [blocks] [miner-address], qns-resolve <name.qub>, qns-price <name.qub>, qns-list [address], qns-register <name.qub> [target-address] [fee], explorer-api [bind], rpc-api [bind]");
 }

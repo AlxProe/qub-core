@@ -1,0 +1,45 @@
+{
+  "schema": "QUB-NEXT-PATCH-BACKLOG-1",
+  "decision": "User explicitly deferred these three issues to the patch after v1.8.7 and authorized full v1.8.7 rollout.",
+  "release_scope_locked": "Reuse passed v1.8.7 artifacts. No source changes for these issues in current rollout.",
+  "issues": [
+    {
+      "id": "QUB-NEXT-1",
+      "title": "Explain and bound long-running memory growth",
+      "evidence": "R7 RSS increased from 461.125 to 1177.902 MiB across 39 live blocks / 1800 seconds, with no memory pressure events. Leak versus retention is unresolved.",
+      "acceptance": [
+        "Measure live allocations and RSS on real historical mainnet append/reorg workloads.",
+        "Preserve transactional persistence and snapshot isolation.",
+        "Demonstrate sustained bounded behavior with correct process/cgroup identity; do not extrapolate from a short zero-OOM window."
+      ]
+    },
+    {
+      "id": "QUB-NEXT-2",
+      "title": "Remove seed authority from mining",
+      "status": "Not implemented in v1.8.7",
+      "acceptance": [
+        "Use locally validated parent and cumulative-work selection across GUI solo/pool, CLI and RPC.",
+        "Official TCP/HTTP availability, height claims and ACK/quorum votes must not authorize or veto mining.",
+        "Relay accepted blocks asynchronously with bounded retry independently of next-template eligibility.",
+        "Keep PoW, signature, UTXO, stale-parent and atomicity checks. Ordinary validated peers must suffice when both seeds/HTTP are unavailable.",
+        "Describe full-network-partition and initial-sync behavior honestly."
+      ]
+    },
+    {
+      "id": "QUB-NEXT-3",
+      "title": "Reduce cold startup and recovery duration",
+      "evidence": "R7 first aligned mainnet state at about 74m20s. Original R5 recovery ready after about 102m10s; full temporary trial outage about 3h26m32s.",
+      "acceptance": [
+        "Profile replay and historical feature validation on actual mainnet data.",
+        "Reduce operational downtime without bypassing consensus validation or trusting unchecked UI snapshots.",
+        "Keep exact measured startup/recovery budgets in deployment planning."
+      ]
+    }
+  ],
+  "constraints": [
+    "No new host requested or created.",
+    "No testnet/regtest execution.",
+    "Reuse completed unchanged evidence.",
+    "Preserve Jinex/signer/wallet separation."
+  ]
+}

@@ -16,10 +16,10 @@
 #define MyAppId "{{8E24D6B6-51BE-4C5C-9C01-0B3F3A000100}"
 #endif
 
-#define MyAppVersion "1.8.6"
+#define MyAppVersion "1.8.7"
 #define MyAppPublisher "Alexander Proestakis"
 #ifndef MyAppSource
-#define MyAppSource "..\dist\QUB-Core-v1.8.6-windows-x64-mainnet"
+#define MyAppSource "..\dist\QUB-Core-v1.8.7-windows-x64-mainnet"
 #endif
 
 [Setup]
@@ -52,7 +52,7 @@ UninstallDisplayIcon={app}\QUB-Core.exe
 Source: "{#MyAppSource}\QUB-Core.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\README-MINER-WINDOWS.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\README-RPC-MINER.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "{#MyAppSource}\RELEASE_NOTES-v1.8.6-HF133.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSource}\RELEASE_NOTES-v1.8.7-HF134.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\README-FAST-CHAIN-ENGINE.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#MyAppSource}\SHA256SUMS.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSource}\config\*"; DestDir: "{app}\config"; Flags: onlyifdoesntexist recursesubdirs createallsubdirs
